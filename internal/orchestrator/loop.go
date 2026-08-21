@@ -665,8 +665,8 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 
 	// A usage limit is nobody's fault: it is neither an attempt nor a failure,
 	// so it neither drops the issue down the model ladder nor extends its
-	// back-off. Already reported to Discord via GateClosed above — do not
-	// notify again here.
+	// back-off. The gate itself was already reported via GateClosed above; this
+	// only says which run it caught.
 	var retryable errRetryable
 	if errors.As(cause, &retryable) {
 		log.Warn("run deferred by usage limit", "error", cause)
