@@ -122,11 +122,19 @@ An issue is worked only if **all** of these hold:
 - it carries the trigger label (`github.label`, default `agent-ready`) and is open
 - its repository is not in `github.exclude_repos`
 - no other issue in that repository is currently in flight
-- no previous run delivered a PR for it, and it has attempts remaining (`run.max_attempts`)
+- no previous run delivered a PR for it, and it is not currently backing off after a failure
+  (`run.retry_backoff`)
 - no open pull request already closes it
 
 Labels mirror the state (`agent-working` → `agent-done` / `agent-failed`), but the SQLite claim
 table is the source of truth — labels can be edited by humans mid-run, leases cannot.
+
+Label edits are reconciled rather than fired blindly: the issue's current labels are read first, the
+edit is reduced to what actually changes, a status label the repository does not define yet is
+created on the fly, and a rejected combined edit is retried label by label. `gh issue edit` fails
+the *whole* call on one unknown or not-actually-present label, which would otherwise leave an issue
+carrying a stale `agent-working` long after the run ended. Every failed edit is logged, recorded as
+a `labels_failed` run event, and reported to Discord.
 
 Discovery is parallel across repositories; within one repository, work is serial (one issue in
 flight at a time), controlled by `run.max_concurrent_repos`.
@@ -142,7 +150,9 @@ flight at a time), controlled by `run.max_concurrent_repos`.
    default branch.
 4. **Run Claude** — `claude -p --output-format stream-json --permission-mode bypassPermissions`,
    scoped to the worktree, with a system prompt that hands over the issue and forbids git/GitHub
-   mutation. The lease is renewed periodically while the run is in flight.
+   mutation. The lease is renewed periodically while the run is in flight. The CLI's session ID is
+   recorded against the run and the issue as soon as it is announced — before any result, so a
+   killed or timed-out run still leaves one behind — and is queryable later via `GET /sessions`.
 5. **Verify** — the repository's own test command runs (auto-detected, or from `verify.commands`).
    A failing suite does **not** block the PR — it's a draft either way, and the failure is reported
    in the PR body so a human sees it immediately.
@@ -152,8 +162,15 @@ flight at a time), controlled by `run.max_concurrent_repos`.
 7. **Cleanup** — the worktree is removed (kept on disk if `workspace.keep_failed` and the run
    failed, for post-mortem). The claim is always released, on every exit path.
 
-Failures retry up to `run.max_attempts`, starting one rung lower on the `models.json` ladder each
-time. A usage limit hit mid-run does **not** consume an attempt.
+Failures are retried indefinitely behind an exponential back-off: `run.retry_backoff` after the
+first failure, doubling with each consecutive one, capped at `run.retry_backoff_max`. Each attempt
+starts one rung lower on the `models.json` ladder, wrapping back to the top once the ladder has been
+walked. **Nothing is abandoned for failing too often** — an issue that keeps failing gets slower, not
+dropped, so it is never left stale. The trigger label remains the only thing that decides whether an
+issue is worked at all: remove `agent-ready` to stop the retries.
+
+A usage limit hit mid-run is recorded as `deferred` — neither an attempt nor a failure, so it
+neither extends the back-off nor drops the issue down the ladder.
 
 ## Configuration reference
 
@@ -184,10 +201,11 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
   },
   "run": {
     "max_concurrent_repos": 3,
-    "max_attempts": 2,
     "timeout": "45m",
     "lease": "90m",
-    "verify_timeout": "10m"
+    "verify_timeout": "10m",
+    "retry_backoff": "15m",
+    "retry_backoff_max": "24h"
   },
   "claude": {
     "binary": "claude",
@@ -229,7 +247,8 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `workspace.logs_root`                                  | where JSONL run transcripts are written                                                                                            |
 | `workspace.keep_failed`                                | keep a failed run's worktree on disk for inspection instead of deleting it                                                         |
 | `run.max_concurrent_repos`                             | how many repos can have work in flight simultaneously                                                                              |
-| `run.max_attempts`                                     | retries per issue before it's marked `agent-failed` and abandoned                                                                  |
+| `run.retry_backoff`                                    | wait before a failed issue may be claimed again; doubles with each consecutive failure                                             |
+| `run.retry_backoff_max`                                | cap on that doubling; must be `>= run.retry_backoff`                                                                               |
 | `run.timeout`                                          | wall-clock limit for one Claude invocation                                                                                         |
 | `run.lease`                                            | how long a claim is held before it's considered abandoned; **must exceed `run.timeout`**, or a still-running claim could be stolen |
 | `run.verify_timeout`                                   | wall-clock limit for the test command                                                                                              |
@@ -282,7 +301,8 @@ hardcoded in Go — this file is the only place to update one.
 - `priority` — lower runs first within a role. The head of the priority-ordered list for a role
   becomes `--model`; the rest become `--fallback-model a,b,...`.
 - A model that fails or hits a limit is put on a 30-minute cooldown, so the next attempt starts
-  lower on the ladder. Retries also start one rung lower than the attempt before them. If every
+  lower on the ladder. Retries also start one rung lower than the attempt before them, wrapping
+  back to the head once the ladder has been walked, since retries are unbounded. If every
   candidate is cooled down, the full ladder is used anyway — refusing to run at all is worse; the
   usage gate is the real brake.
 
@@ -313,9 +333,10 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | ---------------------------- | ------------------------------------------------------------------- |
 | `GET /healthz`               | liveness                                                            |
 | `GET /status`                | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
-| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link                      |
+| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps |
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
+| `GET /sessions?repo=&issue=&limit=` | Claude session IDs recorded per repo/issue, newest first     |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
 | `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
 
@@ -338,14 +359,30 @@ To enable it:
    }
    ```
 
-Once enabled, every one of these posts an embed:
+Once enabled, every one of these posts an embed. Run notifications lead with the issue's own title,
+linked, and carry the run ID and attempt number:
 
-- **Run lifecycle** — issue claimed, Claude run finished, verification result, draft PR opened,
-  run failed (will retry) or abandoned.
+- **Run claimed** — plus how many earlier attempts on that issue failed, when it is a retry.
+- **Claude finished** — model, session ID, turns, cost, tokens in/out, wall-clock duration.
+- **Verification** — passed, failed, or skipped, with the command and, on failure, the tail of the
+  test output, so the channel says what broke without opening the PR.
+- **Draft PR opened** — link, model, session ID, cost, verification status, total run duration,
+  diffstat.
+- **Run failed** — the cause and **when the next attempt is due** (retries are unbounded, so "when"
+  is the useful number).
+- **Run abandoned** — a run that was skipped rather than attempted: the issue closed, lost its
+  label, or is already covered by a PR.
+- **Run deferred** — a run the usage gate stopped. Neither an attempt nor a failure.
+- **Run cancelled** — `POST /runs/{id}/cancel`.
+- **Label update failed** — the labels on GitHub now disagree with the store, and which edit was
+  refused. Otherwise invisible.
+- **Model cooled down** — which model, until when, and why, so a run served from lower on the ladder
+  than expected is explainable.
 - **Usage gate** — closes (with reason and until-when) and clears.
 - **Pause / resume** — whenever `POST /pause` or `POST /resume` is called.
-- **Daemon start / stop** — process startup, and graceful shutdown or crash. (Skipped for `--once`
-  passes, which aren't really "the daemon.")
+- **Daemon start / stop** — startup states the trigger label, owners, poll interval, concurrency,
+  retry back-off, and whether it is a dry run; shutdown says graceful or crash. (Skipped for
+  `--once` passes, which aren't really "the daemon.")
 
 A Discord outage, timeout, or rate-limit is logged and dropped — it never blocks, delays, or fails
 an actual run. Leave `discord.enabled` false (the default) to disable it entirely; no network calls
@@ -433,7 +470,7 @@ curl localhost:8787/status            # gate/run state (from the host, not the s
 | `cmd/agent.go`          | flags, boot checks, wiring                             |
 | `internal/config`       | configuration load and validation                      |
 | `internal/models`       | models.json, ladder selection, embedded default ladder |
-| `internal/store`        | SQLite: claims, runs, gates, events                    |
+| `internal/store`        | SQLite: claims, runs, gates, events, sessions          |
 | `internal/gh`           | GitHub CLI wrapper                                     |
 | `internal/git`          | clones and worktrees                                   |
 | `internal/claude`       | headless Claude runs, stream-json parsing              |

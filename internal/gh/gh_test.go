@@ -253,3 +253,127 @@ func TestDefaultBranchAndCloneURL(t *testing.T) {
 		t.Fatal("an empty default branch must be an error, not an empty string")
 	}
 }
+
+// labelStub stands in for gh across several invocations: it records every
+// command line and answers `issue view` with a fixed set of current labels.
+// `issue edit` fails whenever it mentions failLabel, which is how the
+// per-label retry path is exercised.
+func labelStub(t *testing.T, current []string, failLabel string) (bin string, calls func() []string) {
+	t.Helper()
+	dir := t.TempDir()
+	bin = filepath.Join(dir, "gh-stub.sh")
+	callsFile := filepath.Join(dir, "calls.txt")
+
+	labels := make([]string, 0, len(current))
+	for _, l := range current {
+		labels = append(labels, `{"name":"`+l+`"}`)
+	}
+	script := "#!/bin/sh\n" +
+		"echo \"$*\" >> " + callsFile + "\n" +
+		"case \"$1 $2\" in\n" +
+		"  'issue view') echo '{\"labels\":[" + strings.Join(labels, ",") + "]}' ;;\n" +
+		"  'issue edit')\n" +
+		"    if [ -n \"" + failLabel + "\" ]; then\n" +
+		"      case \"$*\" in *" + failLabel + "*) echo \"could not update: '" + failLabel + "' not found\" >&2; exit 1 ;; esac\n" +
+		"    fi ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, func() []string {
+		data, err := os.ReadFile(callsFile)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			t.Fatalf("read calls: %v", err)
+		}
+		return strings.Split(strings.TrimSpace(string(data)), "\n")
+	}
+}
+
+// gh rejects the whole edit when asked to remove a label the issue does not
+// carry, which used to take the rest of the edit down with it.
+func TestEditLabelsReducesToTheActualChange(t *testing.T) {
+	bin, calls := labelStub(t, []string{"agent-ready", "agent-working"}, "")
+
+	err := New(bin, false).EditLabels(context.Background(), "acme/widgets", 42,
+		[]string{"agent-ready"}, []string{"agent-working", "agent-failed"})
+	if err != nil {
+		t.Fatalf("EditLabels: %v", err)
+	}
+
+	var edit string
+	for _, c := range calls() {
+		if strings.HasPrefix(c, "issue edit") {
+			edit = c
+		}
+	}
+	if edit == "" {
+		t.Fatalf("expected an issue edit, got calls %v", calls())
+	}
+	if strings.Contains(edit, "--add-label") {
+		t.Errorf("a label the issue already has must not be re-added: %q", edit)
+	}
+	if !strings.Contains(edit, "--remove-label agent-working") {
+		t.Errorf("a label the issue carries must be removed: %q", edit)
+	}
+	if strings.Contains(edit, "agent-failed") {
+		t.Errorf("a label the issue does not carry must not be removed: %q", edit)
+	}
+}
+
+func TestEditLabelsSkipsGHEntirelyWhenNothingChanges(t *testing.T) {
+	bin, calls := labelStub(t, []string{"agent-done"}, "")
+
+	if err := New(bin, false).EditLabels(context.Background(), "acme/widgets", 42,
+		[]string{"agent-done"}, []string{"agent-working"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range calls() {
+		if strings.HasPrefix(c, "issue edit") {
+			t.Fatalf("no-op edit should not shell out to `issue edit`: %v", calls())
+		}
+	}
+}
+
+// The daemon's own state labels do not exist in a fresh repository, and
+// `gh issue edit --add-label` fails outright on an unknown label.
+func TestEditLabelsCreatesMissingLabels(t *testing.T) {
+	bin, calls := labelStub(t, []string{"agent-ready"}, "")
+
+	if err := New(bin, false).EditLabels(context.Background(), "acme/widgets", 42,
+		[]string{"agent-working"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	created := false
+	for _, c := range calls() {
+		if strings.HasPrefix(c, "label create agent-working") {
+			created = true
+		}
+	}
+	if !created {
+		t.Fatalf("expected the label to be created first, got calls %v", calls())
+	}
+}
+
+// One label gh refuses must not strand the others.
+func TestEditLabelsRetriesIndividuallyAfterARejection(t *testing.T) {
+	bin, calls := labelStub(t, []string{"agent-ready", "agent-working"}, "agent-done")
+
+	err := New(bin, false).EditLabels(context.Background(), "acme/widgets", 42,
+		[]string{"agent-done"}, []string{"agent-working"})
+	if err == nil {
+		t.Fatal("the rejected label should still be reported as an error")
+	}
+	removed := false
+	for _, c := range calls() {
+		if strings.HasPrefix(c, "issue edit") && strings.Contains(c, "--remove-label agent-working") &&
+			!strings.Contains(c, "agent-done") {
+			removed = true
+		}
+	}
+	if !removed {
+		t.Fatalf("the removal should have been retried on its own, got calls %v", calls())
+	}
+}

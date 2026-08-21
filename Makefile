@@ -5,7 +5,7 @@ CONFIG  ?= config.json
 
 .PHONY: all help build config check run once dry-run \
         install uninstall print-service \
-        test coverage vet fmt fmt-check lint ci tidy clean
+        test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
 
 all: build
 
@@ -74,6 +74,14 @@ fmt-check:
 
 ## lint: vet + formatting check
 lint: vet fmt-check
+
+## staticcheck: run staticcheck (must be installed: go install honnef.co/go/tools/cmd/staticcheck@latest)
+staticcheck:
+	staticcheck $(PKG)
+
+## vulcheck: run govulncheck (must be installed: go install golang.org/x/vuln/cmd/govulncheck@latest)
+vulcheck:
+	govulncheck $(PKG)
 
 ## ci: everything CI should run — lint, then the full test suite
 ci: lint test

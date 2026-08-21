@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/ableinc/coding-agent-loop/internal/store"
 	"github.com/ableinc/coding-agent-loop/internal/verify"
@@ -13,6 +14,7 @@ type prReport struct {
 	Repo      string
 	Issue     int
 	RunID     string
+	SessionID string
 	ModelID   string
 	CostUSD   float64
 	Summary   string
@@ -60,8 +62,12 @@ func prBody(r prReport) string {
 	}
 
 	b.WriteString("---\n\n")
-	fmt.Fprintf(&b, "Opened automatically by coding-agent-loop (run `%s`, attempt %d, model `%s`, cost $%.4f). ",
+	fmt.Fprintf(&b, "Opened automatically by coding-agent-loop (run `%s`, attempt %d, model `%s`, cost $%.4f",
 		r.RunID, r.Attempt, r.ModelID, r.CostUSD)
+	if r.SessionID != "" {
+		fmt.Fprintf(&b, ", session `%s`", r.SessionID)
+	}
+	b.WriteString("). ")
 	b.WriteString("Nothing here has been reviewed by a human yet.\n")
 
 	return b.String()
@@ -83,18 +89,22 @@ func issueComment(prURL, runID string, v verify.Result) string {
 	return b.String()
 }
 
-// failureComment explains an unsuccessful attempt on the issue.
-func failureComment(runID string, attempt, maxAttempts int, reason string, willRetry bool) string {
+// failureComment explains an unsuccessful attempt on the issue, and when the
+// next one is due. Nothing is abandoned for failing too often, so the comment
+// says what actually stops the retries: taking the trigger label off.
+func failureComment(runID string, attempt int, reason string, nextAttempt time.Time, triggerLabel string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "The coding agent could not complete this issue (attempt %d of %d).\n\n", attempt, maxAttempts)
+	fmt.Fprintf(&b, "The coding agent could not complete this issue (attempt %d).\n\n", attempt)
 	b.WriteString("```\n")
 	b.WriteString(strings.TrimSpace(reason))
 	b.WriteString("\n```\n\n")
-	if willRetry {
-		b.WriteString("It will try again on a later pass.\n")
+	if nextAttempt.IsZero() {
+		b.WriteString("It will try again on a later pass.")
 	} else {
-		b.WriteString("No further attempts will be made automatically. Remove and re-add the trigger label to retry.\n")
+		fmt.Fprintf(&b, "It will try again after %s (the wait doubles with each consecutive failure).",
+			nextAttempt.UTC().Format(time.RFC1123))
 	}
+	fmt.Fprintf(&b, " Remove the `%s` label to stop it retrying.\n", triggerLabel)
 	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
 	return b.String()
 }

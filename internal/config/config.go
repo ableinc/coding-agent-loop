@@ -86,8 +86,13 @@ type RunConfig struct {
 	// MaxConcurrentRepos bounds how many repos are worked in parallel. Work
 	// within a single repo is always serial.
 	MaxConcurrentRepos int `json:"max_concurrent_repos"`
-	// MaxAttempts is the per-issue cap, counting the first try.
-	MaxAttempts int `json:"max_attempts"`
+	// RetryBackoff is how long a failed issue waits before it may be claimed
+	// again. It doubles with every consecutive failure — 15m, 30m, 1h, ... —
+	// so a permanently broken issue costs a trickle of runs rather than a
+	// worker, but is still eventually retried instead of going stale.
+	RetryBackoff Duration `json:"retry_backoff"`
+	// RetryBackoffMax caps that doubling.
+	RetryBackoffMax Duration `json:"retry_backoff_max"`
 	// Timeout bounds one Claude run.
 	Timeout Duration `json:"timeout"`
 	// Lease is how long a claim is held before another worker may steal it.
@@ -159,10 +164,11 @@ func Default() Config {
 		},
 		Run: RunConfig{
 			MaxConcurrentRepos: 3,
-			MaxAttempts:        2,
 			Timeout:            Duration(45 * time.Minute),
 			Lease:              Duration(90 * time.Minute),
 			VerifyTimeout:      Duration(10 * time.Minute),
+			RetryBackoff:       Duration(15 * time.Minute),
+			RetryBackoffMax:    Duration(24 * time.Hour),
 		},
 		Claude: ClaudeConfig{
 			Binary:            "claude",
@@ -230,8 +236,12 @@ func (c *Config) Validate() error {
 	if c.Run.MaxConcurrentRepos < 1 {
 		return fmt.Errorf("run.max_concurrent_repos must be >= 1, got %d", c.Run.MaxConcurrentRepos)
 	}
-	if c.Run.MaxAttempts < 1 {
-		return fmt.Errorf("run.max_attempts must be >= 1, got %d", c.Run.MaxAttempts)
+	if c.Run.RetryBackoff.D() <= 0 {
+		return fmt.Errorf("run.retry_backoff must be positive: it is the delay before a failed issue is retried")
+	}
+	if c.Run.RetryBackoffMax.D() < c.Run.RetryBackoff.D() {
+		return fmt.Errorf("run.retry_backoff_max (%s) must be >= run.retry_backoff (%s)",
+			c.Run.RetryBackoffMax.D(), c.Run.RetryBackoff.D())
 	}
 	if c.Run.Timeout.D() <= 0 {
 		return fmt.Errorf("run.timeout must be positive")

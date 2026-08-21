@@ -66,6 +66,7 @@ func (s *Server) routes() {
 	s.app.Get("/runs", s.listRuns)
 	s.app.Get("/runs/:id", s.getRun)
 	s.app.Get("/runs/:id/log", s.getRunLog)
+	s.app.Get("/sessions", s.listSessions)
 	s.app.Post("/pause", s.pause)
 	s.app.Post("/resume", s.resume)
 	s.app.Post("/runs/:id/cancel", s.cancelRun)
@@ -170,6 +171,24 @@ func (s *Server) listRuns(c fiber.Ctx) error {
 	return c.JSON(fiber.Map{"runs": runs, "count": len(runs)})
 }
 
+// listSessions exposes the Claude session IDs the daemon has recorded, so a
+// past session can be looked up by the issue it was spent on rather than by
+// remembering which run it belonged to.
+func (s *Server) listSessions(c fiber.Ctx) error {
+	repo := fiber.Query(c, "repo", "")
+	issue := fiber.Query(c, "issue", 0)
+	limit := fiber.Query(c, "limit", 50)
+
+	sessions, err := s.store.ListSessions(c.Context(), repo, issue, limit)
+	if err != nil {
+		return s.fail(c, http.StatusInternalServerError, err)
+	}
+	if sessions == nil {
+		sessions = []store.Session{}
+	}
+	return c.JSON(fiber.Map{"sessions": sessions, "count": len(sessions)})
+}
+
 func (s *Server) getRun(c fiber.Ctx) error {
 	id := fiber.Params(c, "id", "")
 	run, err := s.store.GetRun(c.Context(), id)
@@ -242,6 +261,7 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 		return s.fail(c, http.StatusNotFound, errors.New("run is not in flight on this process"))
 	}
 	s.log.Info("run cancelled by operator", "run", id)
+	s.discord.RunCanceled(id)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
 }
 

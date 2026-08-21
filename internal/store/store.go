@@ -25,9 +25,10 @@ const (
 	StatusVerifying = "verifying"
 	StatusPushed    = "pushed"
 	StatusPROpen    = "pr_open"   // terminal, success
-	StatusFailed    = "failed"    // terminal, may be retried as a new run
-	StatusAbandoned = "abandoned" // terminal, attempts exhausted
+	StatusFailed    = "failed"    // terminal, retried after a back-off
+	StatusAbandoned = "abandoned" // terminal, skipped: the issue is not workable as it stands
 	StatusCanceled  = "canceled"  // terminal, operator cancelled
+	StatusDeferred  = "deferred"  // terminal, stopped by the usage gate; not the issue's fault
 )
 
 // Verify outcomes recorded on a run.
@@ -47,7 +48,7 @@ const (
 // IsTerminal reports whether a run status is final.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled:
+	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred:
 		return true
 	}
 	return false
@@ -58,6 +59,7 @@ type Run struct {
 	ID           string
 	Repo         string
 	Issue        int
+	CreatedAt    time.Time
 	Attempt      int
 	ModelID      string
 	Branch       string
@@ -80,10 +82,13 @@ type Gate struct {
 	Kind         string
 	BlockedUntil time.Time
 	Reason       string
+	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
 
-// Event is one entry in a run's audit trail.
+// Event is one entry in a run's audit trail. At is both when the event
+// happened and when its row was created; the two cannot differ, so events
+// carries no separate created_at column.
 type Event struct {
 	ID     int64
 	RunID  string
@@ -92,12 +97,26 @@ type Event struct {
 	Detail string
 }
 
+// Session is one Claude Code session the daemon has driven. Sessions are kept
+// per repo and issue so a later run on a related task can be pointed at what
+// was already done, and so a transcript can be tied back to the CLI's own
+// session identifier long after the run row has scrolled out of view.
+type Session struct {
+	SessionID string
+	RunID     string
+	Repo      string
+	Issue     int
+	ModelID   string
+	CreatedAt time.Time
+}
+
 // Claim is a lease on an issue.
 type Claim struct {
 	Repo        string
 	Issue       int
 	RunID       string
 	Worker      string
+	CreatedAt   time.Time
 	LeasedUntil time.Time
 }
 
@@ -186,6 +205,36 @@ var migrations = []string{
 		detail TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);`,
+
+	// When each row came into existence, which the original schema only
+	// implied. runs.started_at is when the run began and gate.updated_at moves
+	// on every refresh, so neither answers "when was this row created"; both
+	// are used to backfill it here. events.at already is the row's creation
+	// time, so events needs no new column.
+	`ALTER TABLE runs   ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE claims ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE gate   ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+	UPDATE runs   SET created_at = started_at WHERE created_at = 0;
+	UPDATE gate   SET created_at = updated_at WHERE created_at = 0;
+	UPDATE claims SET created_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE created_at = 0;
+	CREATE INDEX IF NOT EXISTS runs_created_at ON runs(created_at DESC);`,
+
+	// Claude Code session IDs, indexed by what you would look them up by: the
+	// issue they were spent on. runs.session_id holds the same value, but only
+	// for as long as you know which run to ask about.
+	`CREATE TABLE IF NOT EXISTS sessions (
+		session_id TEXT NOT NULL,
+		run_id     TEXT NOT NULL,
+		repo       TEXT NOT NULL,
+		issue      INTEGER NOT NULL,
+		model_id   TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (session_id, run_id)
+	);
+	CREATE INDEX IF NOT EXISTS sessions_repo_issue ON sessions(repo, issue, created_at DESC);
+	CREATE INDEX IF NOT EXISTS sessions_run ON sessions(run_id);
+	INSERT OR IGNORE INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
+		SELECT session_id, id, repo, issue, model_id, created_at FROM runs WHERE session_id <> '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -213,14 +262,15 @@ func (s *Store) migrate(ctx context.Context) error {
 func (s *Store) TryClaim(ctx context.Context, repo string, issue int, runID, worker string, lease time.Duration) (bool, error) {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO claims (repo, issue, run_id, worker, leased_until)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO claims (repo, issue, run_id, worker, created_at, leased_until)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repo, issue) DO UPDATE SET
 			run_id       = excluded.run_id,
 			worker       = excluded.worker,
+			created_at   = excluded.created_at,
 			leased_until = excluded.leased_until
 		WHERE claims.leased_until <= ?`,
-		repo, issue, runID, worker, now.Add(lease).Unix(), now.Unix())
+		repo, issue, runID, worker, now.Unix(), now.Add(lease).Unix(), now.Unix())
 	if err != nil {
 		return false, fmt.Errorf("claim %s#%d: %w", repo, issue, err)
 	}
@@ -269,7 +319,8 @@ func (s *Store) RepoBusy(ctx context.Context, repo string) (bool, error) {
 // ActiveClaims lists every unexpired claim.
 func (s *Store) ActiveClaims(ctx context.Context) ([]Claim, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT repo, issue, run_id, worker, leased_until FROM claims WHERE leased_until > ? ORDER BY repo, issue`,
+		`SELECT repo, issue, run_id, worker, created_at, leased_until FROM claims
+		 WHERE leased_until > ? ORDER BY repo, issue`,
 		time.Now().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("list claims: %w", err)
@@ -279,10 +330,11 @@ func (s *Store) ActiveClaims(ctx context.Context) ([]Claim, error) {
 	var out []Claim
 	for rows.Next() {
 		var c Claim
-		var until int64
-		if err := rows.Scan(&c.Repo, &c.Issue, &c.RunID, &c.Worker, &until); err != nil {
+		var created, until int64
+		if err := rows.Scan(&c.Repo, &c.Issue, &c.RunID, &c.Worker, &created, &until); err != nil {
 			return nil, fmt.Errorf("scan claim: %w", err)
 		}
+		c.CreatedAt = time.Unix(created, 0)
 		c.LeasedUntil = time.Unix(until, 0)
 		out = append(out, c)
 	}
@@ -291,12 +343,16 @@ func (s *Store) ActiveClaims(ctx context.Context) ([]Claim, error) {
 
 // --- runs -------------------------------------------------------------------
 
-// CreateRun inserts a new run row.
+// CreateRun inserts a new run row. CreatedAt defaults to now.
 func (s *Store) CreateRun(ctx context.Context, r Run) error {
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now()
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs (id, repo, issue, attempt, model_id, branch, status, started_at, log_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Repo, r.Issue, r.Attempt, r.ModelID, r.Branch, r.Status, r.StartedAt.Unix(), r.LogPath)
+		INSERT INTO runs (id, repo, issue, attempt, model_id, branch, status, created_at, started_at, log_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Repo, r.Issue, r.Attempt, r.ModelID, r.Branch, r.Status,
+		r.CreatedAt.Unix(), r.StartedAt.Unix(), r.LogPath)
 	if err != nil {
 		return fmt.Errorf("create run %s: %w", r.ID, err)
 	}
@@ -323,9 +379,10 @@ func (s *Store) RecordUsage(ctx context.Context, runID, modelID, sessionID strin
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET
 			model_id   = CASE WHEN ? <> '' THEN ? ELSE model_id END,
-			session_id = ?, cost_usd = ?, tokens_in = ?, tokens_out = ?, num_turns = ?
+			session_id = CASE WHEN ? <> '' THEN ? ELSE session_id END,
+			cost_usd = ?, tokens_in = ?, tokens_out = ?, num_turns = ?
 		WHERE id = ?`,
-		modelID, modelID, sessionID, cost, in, out, turns, runID)
+		modelID, modelID, sessionID, sessionID, cost, in, out, turns, runID)
 	if err != nil {
 		return fmt.Errorf("record usage for run %s: %w", runID, err)
 	}
@@ -356,6 +413,78 @@ func (s *Store) SetPRURL(ctx context.Context, runID, url string) error {
 	return nil
 }
 
+// SetSessionID records the Claude session a run is using. It is called as soon
+// as the CLI announces one, so a run that is killed before it produces a result
+// still leaves its session behind.
+func (s *Store) SetSessionID(ctx context.Context, runID, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET session_id = ? WHERE id = ?`, sessionID, runID); err != nil {
+		return fmt.Errorf("set session id for run %s: %w", runID, err)
+	}
+	return nil
+}
+
+// RecordSession stores a session for later reference. Re-recording the same
+// session fills in the model once it is known, and never clears it.
+func (s *Store) RecordSession(ctx context.Context, sess Session) error {
+	if sess.SessionID == "" {
+		return nil
+	}
+	if sess.CreatedAt.IsZero() {
+		sess.CreatedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_id, run_id) DO UPDATE SET
+			model_id = CASE WHEN excluded.model_id <> '' THEN excluded.model_id ELSE sessions.model_id END`,
+		sess.SessionID, sess.RunID, sess.Repo, sess.Issue, sess.ModelID, sess.CreatedAt.Unix())
+	if err != nil {
+		return fmt.Errorf("record session %s: %w", sess.SessionID, err)
+	}
+	return nil
+}
+
+// ListSessions returns recorded sessions newest first. repo, and issue when
+// positive, narrow the result to one repository or one issue.
+func (s *Store) ListSessions(ctx context.Context, repo string, issue, limit int) ([]Session, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	query := `SELECT session_id, run_id, repo, issue, model_id, created_at FROM sessions`
+	args := []any{}
+	switch {
+	case repo != "" && issue > 0:
+		query += ` WHERE repo = ? AND issue = ?`
+		args = append(args, repo, issue)
+	case repo != "":
+		query += ` WHERE repo = ?`
+		args = append(args, repo)
+	}
+	query += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		var created int64
+		if err := rows.Scan(&sess.SessionID, &sess.RunID, &sess.Repo, &sess.Issue, &sess.ModelID, &created); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sess.CreatedAt = time.Unix(created, 0)
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
 // FailRun marks a run terminal with an error message.
 func (s *Store) FailRun(ctx context.Context, runID, status, msg string) error {
 	_, err := s.db.ExecContext(ctx,
@@ -372,18 +501,19 @@ var errNoRows = errors.New("not found")
 // ErrNotFound is returned when a lookup finds nothing.
 var ErrNotFound = errNoRows
 
-const runColumns = `id, repo, issue, attempt, model_id, branch, pr_url, status, started_at, ended_at,
+const runColumns = `id, repo, issue, attempt, model_id, branch, pr_url, status, created_at, started_at, ended_at,
 	cost_usd, tokens_in, tokens_out, num_turns, session_id, verify_status, error, log_path`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	var started, ended int64
+	var created, started, ended int64
 	err := sc.Scan(&r.ID, &r.Repo, &r.Issue, &r.Attempt, &r.ModelID, &r.Branch, &r.PRURL, &r.Status,
-		&started, &ended, &r.CostUSD, &r.TokensIn, &r.TokensOut, &r.NumTurns, &r.SessionID,
+		&created, &started, &ended, &r.CostUSD, &r.TokensIn, &r.TokensOut, &r.NumTurns, &r.SessionID,
 		&r.VerifyStatus, &r.Error, &r.LogPath)
 	if err != nil {
 		return r, err
 	}
+	r.CreatedAt = time.Unix(created, 0)
 	r.StartedAt = time.Unix(started, 0)
 	if ended > 0 {
 		r.EndedAt = time.Unix(ended, 0)
@@ -457,27 +587,46 @@ func (s *Store) InFlightRuns(ctx context.Context) ([]Run, error) {
 }
 
 // IssueState summarises prior work on an issue so the poller can decide
-// whether to pick it up again.
+// whether to pick it up again, and how long to wait first.
 type IssueState struct {
-	Attempts   int
-	Succeeded  bool
-	Abandoned  bool
-	LastPRURL  string
-	LastStatus string
+	// Attempts counts runs that actually got a chance at the issue. Runs the
+	// usage gate stopped are excluded: being rate-limited is not an attempt.
+	Attempts int
+	// Failures counts runs that ended without delivering a PR. It is the
+	// exponent of the retry back-off.
+	Failures  int
+	Succeeded bool
+	Abandoned bool
+	// LastFailureAt is when the most recent failure ended, i.e. what the
+	// back-off is measured from.
+	LastFailureAt time.Time
+	LastPRURL     string
+	LastStatus    string
 }
 
 // IssueHistory reports what previous runs did with an issue.
 func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (IssueState, error) {
 	var st IssueState
+	var succeeded, abandoned, lastFailure int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*),
-		        SUM(CASE WHEN status = ? THEN 1 ELSE 0 END),
-		        SUM(CASE WHEN status = ? THEN 1 ELSE 0 END)
+		`SELECT COALESCE(SUM(CASE WHEN status <> ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END), 0),
+		        COALESCE(MAX(CASE WHEN status IN (?, ?, ?) THEN ended_at ELSE 0 END), 0)
 		 FROM runs WHERE repo = ? AND issue = ?`,
-		StatusPROpen, StatusAbandoned, repo, issue).
-		Scan(&st.Attempts, &nullInt{&st.Succeeded}, &nullInt{&st.Abandoned})
+		StatusDeferred, StatusPROpen, StatusAbandoned,
+		StatusFailed, StatusAbandoned, StatusCanceled,
+		StatusFailed, StatusAbandoned, StatusCanceled,
+		repo, issue).
+		Scan(&st.Attempts, &succeeded, &abandoned, &st.Failures, &lastFailure)
 	if err != nil {
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
+	}
+	st.Succeeded = succeeded > 0
+	st.Abandoned = abandoned > 0
+	if lastFailure > 0 {
+		st.LastFailureAt = time.Unix(lastFailure, 0)
 	}
 
 	row := s.db.QueryRowContext(ctx,
@@ -489,32 +638,19 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 	return st, nil
 }
 
-// nullInt scans a possibly-NULL SUM() into a bool ("more than zero").
-type nullInt struct{ target *bool }
-
-func (n *nullInt) Scan(v any) error {
-	switch t := v.(type) {
-	case nil:
-		*n.target = false
-	case int64:
-		*n.target = t > 0
-	case float64:
-		*n.target = t > 0
-	default:
-		return fmt.Errorf("unexpected count type %T", v)
-	}
-	return nil
-}
-
 // --- gate -------------------------------------------------------------------
 
 // SetGate closes a gate until the given time.
 func (s *Store) SetGate(ctx context.Context, kind string, until time.Time, reason string) error {
+	// created_at is deliberately not touched on conflict: it records when this
+	// gate was first closed, which is what makes a gate that keeps being
+	// re-extended distinguishable from a fresh one.
+	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO gate (kind, blocked_until, reason, updated_at) VALUES (?, ?, ?, ?)
+		INSERT INTO gate (kind, blocked_until, reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(kind) DO UPDATE SET blocked_until = excluded.blocked_until,
 			reason = excluded.reason, updated_at = excluded.updated_at`,
-		kind, until.Unix(), reason, time.Now().Unix())
+		kind, until.Unix(), reason, now, now)
 	if err != nil {
 		return fmt.Errorf("set gate %s: %w", kind, err)
 	}
@@ -532,7 +668,8 @@ func (s *Store) ClearGate(ctx context.Context, kind string) error {
 // ActiveGates returns every gate still in effect.
 func (s *Store) ActiveGates(ctx context.Context) ([]Gate, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT kind, blocked_until, reason, updated_at FROM gate WHERE blocked_until > ? ORDER BY kind`,
+		`SELECT kind, blocked_until, reason, created_at, updated_at FROM gate
+		 WHERE blocked_until > ? ORDER BY kind`,
 		time.Now().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("list gates: %w", err)
@@ -542,11 +679,12 @@ func (s *Store) ActiveGates(ctx context.Context) ([]Gate, error) {
 	var out []Gate
 	for rows.Next() {
 		var g Gate
-		var until, updated int64
-		if err := rows.Scan(&g.Kind, &until, &g.Reason, &updated); err != nil {
+		var until, created, updated int64
+		if err := rows.Scan(&g.Kind, &until, &g.Reason, &created, &updated); err != nil {
 			return nil, fmt.Errorf("scan gate: %w", err)
 		}
 		g.BlockedUntil = time.Unix(until, 0)
+		g.CreatedAt = time.Unix(created, 0)
 		g.UpdatedAt = time.Unix(updated, 0)
 		out = append(out, g)
 	}

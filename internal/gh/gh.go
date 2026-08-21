@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -226,6 +227,22 @@ func (c *Client) ViewIssue(ctx context.Context, repo string, number int) (Issue,
 	return issue, nil
 }
 
+// IssueLabels returns the labels currently on an issue.
+func (c *Client) IssueLabels(ctx context.Context, repo string, number int) ([]string, error) {
+	var out struct {
+		Labels []Label `json:"labels"`
+	}
+	err := c.runJSON(ctx, &out, "issue", "view", strconv.Itoa(number), "--repo", repo, "--json", "labels")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(out.Labels))
+	for _, l := range out.Labels {
+		names = append(names, l.Name)
+	}
+	return names, nil
+}
+
 // DefaultBranch returns the repository's default branch name.
 func (c *Client) DefaultBranch(ctx context.Context, repo string) (string, error) {
 	var out struct {
@@ -300,10 +317,80 @@ func (c *Client) FindPRForIssue(ctx context.Context, repo string, issue int, bra
 
 // --- mutating operations ----------------------------------------------------
 
-// EditLabels adds and removes labels on an issue. Missing labels on the repo
-// make gh fail, so failures here are reported but are not usually fatal to the
-// caller.
+// EditLabels reconciles an issue's labels towards add/remove.
+//
+// It is deliberately more careful than a straight `gh issue edit`: that command
+// fails the *whole* call when a label does not exist on the repository or when a
+// `--remove-label` is not actually on the issue, which used to take the rest of
+// the edit down with it and leave an issue carrying stale state labels. So the
+// current labels are read first, the edit is reduced to what genuinely changes,
+// missing labels are created, and a rejected combined edit is retried label by
+// label so one bad name cannot strand the others.
 func (c *Client) EditLabels(ctx context.Context, repo string, number int, add, remove []string) error {
+	add, remove = cleanLabels(add), cleanLabels(remove)
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+	if c.DryRun {
+		c.logf("dry-run: would edit labels on %s#%d (add: %s, remove: %s)",
+			repo, number, labelList(add), labelList(remove))
+		return nil
+	}
+
+	// When the current labels cannot be read, fall back to applying the edit
+	// unfiltered: a stale label is worse than a redundant gh call.
+	have, err := c.IssueLabels(ctx, repo, number)
+	known := err == nil
+	if err != nil {
+		c.logf("could not read current labels of %s#%d, applying the edit unfiltered: %v", repo, number, err)
+	}
+
+	wantAdd := make([]string, 0, len(add))
+	for _, l := range add {
+		if known && containsLabel(have, l) {
+			continue
+		}
+		wantAdd = append(wantAdd, l)
+	}
+	wantRemove := make([]string, 0, len(remove))
+	for _, l := range remove {
+		if known && !containsLabel(have, l) {
+			continue
+		}
+		wantRemove = append(wantRemove, l)
+	}
+	if len(wantAdd) == 0 && len(wantRemove) == 0 {
+		return nil
+	}
+
+	for _, l := range wantAdd {
+		if err := c.ensureLabel(ctx, repo, l); err != nil {
+			c.logf("could not create label %q in %s: %v", l, repo, err)
+		}
+	}
+
+	if err := c.editLabels(ctx, repo, number, wantAdd, wantRemove); err == nil {
+		return nil
+	} else if len(wantAdd)+len(wantRemove) == 1 {
+		return err
+	}
+
+	var errs []error
+	for _, l := range wantAdd {
+		if err := c.editLabels(ctx, repo, number, []string{l}, nil); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, l := range wantRemove {
+		if err := c.editLabels(ctx, repo, number, nil, []string{l}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// editLabels is the raw `gh issue edit` call, without any reconciliation.
+func (c *Client) editLabels(ctx context.Context, repo string, number int, add, remove []string) error {
 	if len(add) == 0 && len(remove) == 0 {
 		return nil
 	}
@@ -314,12 +401,59 @@ func (c *Client) EditLabels(ctx context.Context, repo string, number int, add, r
 	for _, l := range remove {
 		args = append(args, "--remove-label", l)
 	}
-	if c.DryRun {
-		c.logf("dry-run: would run gh %s", strings.Join(args, " "))
-		return nil
-	}
 	_, err := c.run(ctx, "", args...)
 	return err
+}
+
+// ensureLabel creates a label on the repository, treating "it is already there"
+// as success. The daemon's own state labels do not exist in most repositories
+// until it puts them there.
+func (c *Client) ensureLabel(ctx context.Context, repo, name string) error {
+	_, err := c.run(ctx, "", "label", "create", name, "--repo", repo,
+		"--description", labelDescription)
+	if err == nil {
+		return nil
+	}
+	var cmdErr *CmdError
+	if errors.As(err, &cmdErr) && strings.Contains(strings.ToLower(cmdErr.Stderr), "already exists") {
+		return nil
+	}
+	return err
+}
+
+// labelDescription is set on labels the daemon has to create itself, so their
+// origin is obvious in the repository's label list.
+const labelDescription = "Managed by coding-agent-loop"
+
+// cleanLabels trims, drops empties, and removes case-insensitive duplicates.
+func cleanLabels(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, l := range in {
+		l = strings.TrimSpace(l)
+		if l == "" || seen[strings.ToLower(l)] {
+			continue
+		}
+		seen[strings.ToLower(l)] = true
+		out = append(out, l)
+	}
+	return out
+}
+
+func containsLabel(have []string, name string) bool {
+	for _, l := range have {
+		if strings.EqualFold(l, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func labelList(labels []string) string {
+	if len(labels) == 0 {
+		return "(none)"
+	}
+	return strings.Join(labels, ", ")
 }
 
 // Comment posts a comment on an issue. The body goes over stdin so it is never

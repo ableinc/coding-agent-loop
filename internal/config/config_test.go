@@ -122,3 +122,10 @@ func TestDurationRoundTrip(t *testing.T) {
 		t.Fatalf("round trip lost value: %v", back.D())
 	}
 }
+
+func TestRetryBackoffMaxMustNotBeBelowTheBase(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`))
+	if err == nil || !strings.Contains(err.Error(), "retry_backoff") {
+		t.Fatalf("want a backoff validation error, got %v", err)
+	}
+}
