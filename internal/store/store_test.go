@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -285,5 +286,107 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 			t.Fatalf("open %d: %v", i, err)
 		}
 		st.Close()
+	}
+}
+
+func TestRowsRecordWhenTheyWereCreated(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 1, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.CreatedAt.IsZero() {
+		t.Error("run should record when its row was created")
+	}
+
+	if _, err := st.TryClaim(ctx, "o/r", 1, "r1", "w", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ActiveClaims(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].CreatedAt.IsZero() {
+		t.Errorf("claim should record when it was taken: %+v", claims)
+	}
+
+	if err := st.SetGate(ctx, GatePause, time.Now().Add(time.Hour), "operator"); err != nil {
+		t.Fatal(err)
+	}
+	gates, err := st.ActiveGates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 1 || gates[0].CreatedAt.IsZero() {
+		t.Errorf("gate should record when it was first closed: %+v", gates)
+	}
+}
+
+// A gate that keeps being extended must stay distinguishable from a fresh one,
+// so re-closing it moves updated_at but never created_at.
+func TestReclosingAGateKeepsItsCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.SetGate(ctx, GateUsageLimit, time.Now().Add(time.Hour), "first"); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := st.ActiveGates(ctx)
+
+	time.Sleep(1100 * time.Millisecond) // second resolution on disk
+	if err := st.SetGate(ctx, GateUsageLimit, time.Now().Add(2*time.Hour), "again"); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := st.ActiveGates(ctx)
+
+	if !second[0].CreatedAt.Equal(first[0].CreatedAt) {
+		t.Errorf("created_at moved on re-close: %v -> %v", first[0].CreatedAt, second[0].CreatedAt)
+	}
+	if !second[0].UpdatedAt.After(first[0].UpdatedAt) {
+		t.Errorf("updated_at should move on re-close: %v -> %v", first[0].UpdatedAt, second[0].UpdatedAt)
+	}
+}
+
+// Databases written by an earlier version have no created_at column at all;
+// the migration has to add it and backfill something meaningful.
+func TestCreatedAtIsBackfilledOnUpgrade(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, migrations[0]); err != nil {
+		t.Fatalf("apply v1 schema: %v", err)
+	}
+	started := time.Now().Add(-time.Hour)
+	if _, err := old.ExecContext(ctx,
+		`INSERT INTO runs (id, repo, issue, attempt, status, started_at) VALUES ('old-run', 'o/r', 1, 1, 'pr_open', ?)`,
+		started.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	defer st.Close()
+
+	run, err := st.GetRun(ctx, "old-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.CreatedAt.Unix() != started.Unix() {
+		t.Fatalf("created_at should be backfilled from started_at, got %v want %v", run.CreatedAt, started)
 	}
 }

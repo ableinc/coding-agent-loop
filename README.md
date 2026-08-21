@@ -320,7 +320,7 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | ---------------------------- | ------------------------------------------------------------------- |
 | `GET /healthz`               | liveness                                                            |
 | `GET /status`                | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
-| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link                      |
+| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps |
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
