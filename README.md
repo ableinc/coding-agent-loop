@@ -98,7 +98,7 @@ Label an issue `agent-ready` in one of the repositories you own, and the next po
 
 ## CLI flags
 
-All flags on the built binary (`bin/agent-loop`, or via `make run` / `make once` / `make dry-run`):
+All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `make once` / `make dry-run`):
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -306,26 +306,26 @@ Run it as a dedicated unix user, not your own — `--install` below does this fo
 
 ## Deploying with systemd
 
-The unit file is embedded in the binary — `internal/install/agent-loop.service` is its only source,
+The unit file is embedded in the binary — `internal/install/coding-agent-loop.service` is its only source,
 compiled in via `go:embed`. Two ways to use it:
 
 ```sh
-sudo bin/agent-loop --install --config config.json
+sudo bin/coding-agent-loop --install --config config.json
 ```
 
 `--install` (root required):
 
-1. creates the `agent-loop` system user if it doesn't exist (no login shell, its own home);
-2. copies the running binary to `/opt/agent-loop/bin/agent-loop`;
-3. copies `--config` to `/opt/agent-loop/config.json` — **never** overwriting one already there;
-4. writes `/etc/systemd/system/agent-loop.service`;
-5. runs `systemctl daemon-reload` then `enable --now agent-loop.service`;
+1. creates the `coding-agent-loop` system user if it doesn't exist (no login shell, its own home);
+2. copies the running binary to `/opt/coding-agent-loop/bin/coding-agent-loop`;
+3. copies `--config` to `/opt/coding-agent-loop/config.json` — **never** overwriting one already there;
+4. writes `/etc/systemd/system/coding-agent-loop.service`;
+5. runs `systemctl daemon-reload` then `enable --now coding-agent-loop.service`;
 6. confirms the unit reached `active`.
 
 Re-running it is safe: it replaces the binary but leaves an existing config untouched.
 
 ```sh
-bin/agent-loop --print-service   # print the embedded unit, e.g. to review before installing
+bin/coding-agent-loop --print-service   # print the embedded unit, e.g. to review before installing
 ```
 
 `--print-service` needs no privileges; it just writes the exact unit `--install` would use to stdout.
@@ -333,16 +333,16 @@ bin/agent-loop --print-service   # print the embedded unit, e.g. to review befor
 The unit itself: `Type=simple`, restarts on failure, `KillSignal=SIGTERM` with
 `TimeoutStopSec=50m` (longer than one run timeout, so a SIGTERM drains in-flight work instead of
 killing it mid-push), and hardened with `ProtectSystem=strict`, `ProtectHome=read-only`,
-`NoNewPrivileges=true`, and `ReadWritePaths` scoped to `/opt/agent-loop` and the service user's
+`NoNewPrivileges=true`, and `ReadWritePaths` scoped to `/opt/coding-agent-loop` and the service user's
 `~/.agent-loop`.
 
 Common operations once installed:
 
 ```sh
-sudo systemctl status agent-loop      # is it running
-journalctl -u agent-loop -f           # tail logs
-sudo systemctl stop agent-loop        # drains in-flight work, then stops
-sudo systemctl restart agent-loop
+sudo systemctl status coding-agent-loop      # is it running
+journalctl -u coding-agent-loop -f           # tail logs
+sudo systemctl stop coding-agent-loop        # drains in-flight work, then stops
+sudo systemctl restart coding-agent-loop
 curl localhost:8787/status            # gate/run state (from the host, not the service user)
 ```
 
@@ -383,4 +383,4 @@ without network access or subscription usage.
 | `/status` shows `claiming_work: false` | check `gates` in the response — either a usage limit is active (wait for `blocked_until`) or someone called `POST /pause` |
 | A PR opened but tests show as failed | expected behavior, not a bug — verification failures are reported in the draft PR body rather than blocking it |
 | `--install` fails with a permissions error | it must run as root (`sudo`); it writes to `/etc/systemd/system` and `/opt` |
-| Service won't start after `--install` | `journalctl -u agent-loop -e`; most often a missing/invalid `/opt/agent-loop/config.json` |
+| Service won't start after `--install` | `journalctl -u coding-agent-loop -e`; most often a missing/invalid `/opt/coding-agent-loop/config.json` |

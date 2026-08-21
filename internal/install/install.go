@@ -1,8 +1,8 @@
 // Package install lays down the systemd unit for coding-agent-loop and starts
 // it. The unit file is embedded in the binary, so the paths in it
-// (/opt/agent-loop, the agent-loop user) are the contract this package
-// installs against — Run does not template the unit, it makes the host match
-// it.
+// (/opt/coding-agent-loop, the coding-agent-loop user) are the contract this
+// package installs against — Run does not template the unit, it makes the
+// host match it.
 package install
 
 import (
@@ -15,19 +15,20 @@ import (
 	"path/filepath"
 )
 
-//go:embed agent-loop.service
+//go:embed coding-agent-loop.service
 var ServiceUnit []byte
 
 const (
-	unitPath    = "/etc/systemd/system/agent-loop.service"
-	installRoot = "/opt/agent-loop"
-	serviceUser = "agent-loop"
-	serviceHome = "/home/agent-loop"
+	unitPath    = "/etc/systemd/system/coding-agent-loop.service"
+	installRoot = "/opt/coding-agent-loop"
+	serviceUser = "coding-agent-loop"
+	serviceHome = "/home/coding-agent-loop"
+	binaryName  = "coding-agent-loop"
 )
 
 // Options controls what Run copies into place before it writes the unit.
 type Options struct {
-	// ConfigPath is the config file to install as /opt/agent-loop/config.json.
+	// ConfigPath is the config file to install as /opt/coding-agent-loop/config.json.
 	// Skipped (with a warning) if empty or missing — the operator can drop one
 	// in later; the unit will simply fail to start until they do.
 	ConfigPath string
@@ -58,7 +59,7 @@ func Run(opts Options) error {
 		return fmt.Errorf("chown %s/.agent-loop: %w", serviceHome, err)
 	}
 
-	binDest := filepath.Join(installRoot, "bin", "agent-loop")
+	binDest := filepath.Join(installRoot, "bin", binaryName)
 	if err := copySelf(binDest); err != nil {
 		return fmt.Errorf("install binary to %s: %w", binDest, err)
 	}
@@ -77,11 +78,11 @@ func Run(opts Options) error {
 	if err := runSystemctl(log, "daemon-reload"); err != nil {
 		return err
 	}
-	if err := runSystemctl(log, "enable", "--now", "agent-loop.service"); err != nil {
+	if err := runSystemctl(log, "enable", "--now", "coding-agent-loop.service"); err != nil {
 		return err
 	}
-	if err := runSystemctl(log, "is-active", "--quiet", "agent-loop.service"); err != nil {
-		return fmt.Errorf("service did not reach active state — check `journalctl -u agent-loop`: %w", err)
+	if err := runSystemctl(log, "is-active", "--quiet", "coding-agent-loop.service"); err != nil {
+		return fmt.Errorf("service did not reach active state — check `journalctl -u coding-agent-loop`: %w", err)
 	}
 	log("service enabled and running")
 	return nil

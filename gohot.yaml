@@ -6,7 +6,7 @@ ignore:
  - .git
  - vendor
  - bin
-out: ./bin/agent-loop
+out: ./bin/coding-agent-loop
 entry: ./cmd
 debounce: 500
 envs:

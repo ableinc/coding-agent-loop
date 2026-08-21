@@ -13,7 +13,7 @@ func TestServiceUnitEmbedded(t *testing.T) {
 		t.Fatal("embedded service unit is empty")
 	}
 	got := string(ServiceUnit)
-	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/opt/agent-loop/bin/agent-loop"} {
+	for _, want := range []string{"[Unit]", "[Service]", "[Install]", "ExecStart=/opt/coding-agent-loop/bin/coding-agent-loop"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("embedded unit missing %q", want)
 		}

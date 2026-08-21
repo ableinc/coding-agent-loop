@@ -48,12 +48,12 @@ runs the repository's own tests, and opens a draft pull request for human
 review. It never merges anything.
 
 Usage:
-  agent-loop [flags]              start the daemon in the foreground
-  agent-loop --once               run one discovery pass, then exit
-  agent-loop --once --dry-run     rehearse a pass without pushing/PRs/labels
-  agent-loop --check              verify prerequisites (git, claude, gh, config) and exit
-  agent-loop --print-service      print the embedded systemd unit
-  sudo agent-loop --install       install, enable, and start the systemd unit
+  coding-agent-loop [flags]              start the daemon in the foreground
+  coding-agent-loop --once               run one discovery pass, then exit
+  coding-agent-loop --once --dry-run     rehearse a pass without pushing/PRs/labels
+  coding-agent-loop --check              verify prerequisites (git, claude, gh, config) and exit
+  coding-agent-loop --print-service      print the embedded systemd unit
+  sudo coding-agent-loop --install       install, enable, and start the systemd unit
 
 See README.md for configuration (config.json, models.json) and the control API.
 

@@ -1,4 +1,4 @@
-BINARY  := bin/agent-loop
+BINARY  := bin/coding-agent-loop
 PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './vendor/*')
 CONFIG  ?= config.json
@@ -40,10 +40,10 @@ dry-run: build
 install: build
 	sudo $(BINARY) --install --config $(CONFIG)
 
-## uninstall: stop, disable, and remove the systemd unit (requires root; leaves /opt/agent-loop in place)
+## uninstall: stop, disable, and remove the systemd unit (requires root; leaves /opt/coding-agent-loop in place)
 uninstall:
-	sudo systemctl disable --now agent-loop.service 2>/dev/null || true
-	sudo rm -f /etc/systemd/system/agent-loop.service
+	sudo systemctl disable --now coding-agent-loop.service 2>/dev/null || true
+	sudo rm -f /etc/systemd/system/coding-agent-loop.service
 	sudo systemctl daemon-reload
 
 ## print-service: print the embedded systemd unit without installing anything
