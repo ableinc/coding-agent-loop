@@ -9,6 +9,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -475,6 +476,10 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	o.event(ctx, runID, "model", fmt.Sprintf("%s (fallbacks: %s)", head.ID, orNone(fallbacks)))
 	log.Info("starting claude", "model", head.ID, "branch", branch, "attempt", attempt)
 
+	// The CLI announces its session ID on the first stream event, long before
+	// the run produces a result. Capturing it there means a run that is killed
+	// or times out still leaves a session behind to refer back to.
+	var sessionOnce sync.Once
 	result, runErr := o.opts.Runner.Run(ctx, claude.Options{
 		Binary:         cfg.Claude.Binary,
 		Prompt:         taskPrompt(cand.repo, issue),
@@ -486,6 +491,19 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		ExtraArgs:      cfg.Claude.ExtraArgs,
 		LogPath:        logPath,
 		Timeout:        cfg.Run.Timeout.D(),
+		OnEvent: func(_ string, raw json.RawMessage) {
+			var probe struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil || probe.SessionID == "" {
+				return
+			}
+			sessionOnce.Do(func() {
+				o.recordSession(ctx, log, cand, runID, probe.SessionID, head.ID)
+				o.event(ctx, runID, "session", probe.SessionID)
+				log.Info("claude session started", "session", probe.SessionID)
+			})
+		},
 	})
 
 	// Record spend even on failure: the tokens were burned either way.
@@ -498,6 +516,8 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 			result.TotalCostUSD, result.TokensIn(), result.TokensOut(), result.NumTurns); err != nil {
 			log.Warn("usage record failed", "error", err)
 		}
+		// Re-record now that the model that actually served the run is known.
+		o.recordSession(ctx, log, cand, runID, result.SessionID, usedModel)
 	}
 
 	if runErr != nil {
@@ -577,7 +597,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		Title: prTitle(issue.Title, cand.number),
 		Draft: true,
 		Body: prBody(prReport{
-			Repo: cand.repo, Issue: cand.number, RunID: runID,
+			Repo: cand.repo, Issue: cand.number, RunID: runID, SessionID: result.SessionID,
 			ModelID: result.PrimaryModel(), CostUSD: result.TotalCostUSD,
 			Summary: result.Result, DiffStat: diffstat, Verify: vres, Attempt: attempt,
 		}),
@@ -682,6 +702,24 @@ func (o *Orchestrator) scheduleRetry(ctx context.Context, log *slog.Logger, cand
 		hist.Failures, next.Format(time.RFC3339)))
 	log.Info("issue backing off", "failures", hist.Failures, "next_attempt", next.Format(time.RFC3339))
 	return next
+}
+
+// recordSession persists a Claude session ID against its run and issue. It is
+// bookkeeping, not part of the run: a failure to write it is logged, never
+// propagated.
+func (o *Orchestrator) recordSession(ctx context.Context, log *slog.Logger, cand candidate, runID, sessionID, modelID string) {
+	if sessionID == "" {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	if err := o.opts.Store.SetSessionID(ctx, runID, sessionID); err != nil {
+		log.Warn("could not record session id on the run", "session", sessionID, "error", err)
+	}
+	if err := o.opts.Store.RecordSession(ctx, store.Session{
+		SessionID: sessionID, RunID: runID, Repo: cand.repo, Issue: cand.number, ModelID: modelID,
+	}); err != nil {
+		log.Warn("could not record session", "session", sessionID, "error", err)
+	}
 }
 
 // setLabels mirrors run state onto the issue. A label edit is never fatal to a

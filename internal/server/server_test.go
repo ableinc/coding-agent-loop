@@ -221,3 +221,35 @@ func TestCancelRun(t *testing.T) {
 
 // fiberTimeout gives handlers room on a loaded machine; the default is 1s.
 var fiberTimeout = fiber.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true}
+
+func TestListSessions(t *testing.T) {
+	s, st, _ := testServer(t)
+	ctx := t.Context()
+
+	for _, sess := range []store.Session{
+		{SessionID: "sess-1", RunID: "run-1", Repo: "acme/widgets", Issue: 42, ModelID: "claude-opus-5"},
+		{SessionID: "sess-2", RunID: "run-2", Repo: "acme/widgets", Issue: 7},
+		{SessionID: "sess-3", RunID: "run-3", Repo: "acme/other", Issue: 1},
+	} {
+		if err := st.RecordSession(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, body := do(t, s, http.MethodGet, "/sessions", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /sessions = %d", code)
+	}
+	if got := body["count"].(float64); got != 3 {
+		t.Fatalf("count = %v, want 3", got)
+	}
+
+	_, body = do(t, s, http.MethodGet, "/sessions?repo=acme/widgets&issue=42", nil)
+	sessions := body["sessions"].([]any)
+	if len(sessions) != 1 {
+		t.Fatalf("filtering by issue should narrow the result, got %+v", sessions)
+	}
+	if id := sessions[0].(map[string]any)["SessionID"]; id != "sess-1" {
+		t.Fatalf("unexpected session %v", id)
+	}
+}

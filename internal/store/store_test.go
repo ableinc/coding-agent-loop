@@ -426,3 +426,101 @@ func TestIssueHistoryCountsFailuresButNotDeferrals(t *testing.T) {
 		t.Error("no run delivered a PR")
 	}
 }
+
+func TestSessionsAreRecordedAndLookedUpByIssue(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 5, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	// The session ID lands before the model that served the run is known.
+	if err := st.SetSessionID(ctx, "r1", "sess-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordSession(ctx, Session{SessionID: "sess-abc", RunID: "r1", Repo: "o/r", Issue: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordSession(ctx, Session{SessionID: "sess-abc", RunID: "r1", Repo: "o/r", Issue: 5, ModelID: "claude-opus-5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordSession(ctx, Session{SessionID: "sess-other", RunID: "r2", Repo: "o/r", Issue: 9}); err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := st.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SessionID != "sess-abc" {
+		t.Fatalf("run session id = %q", run.SessionID)
+	}
+	// A result event with no session must not wipe what is already known.
+	if err := st.RecordUsage(ctx, "r1", "claude-opus-5", "", 0.1, 10, 5, 2); err != nil {
+		t.Fatal(err)
+	}
+	if run, _ := st.GetRun(ctx, "r1"); run.SessionID != "sess-abc" {
+		t.Fatalf("session id lost on usage record: %q", run.SessionID)
+	}
+
+	forIssue, err := st.ListSessions(ctx, "o/r", 5, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forIssue) != 1 || forIssue[0].SessionID != "sess-abc" {
+		t.Fatalf("sessions for the issue = %+v", forIssue)
+	}
+	if forIssue[0].ModelID != "claude-opus-5" {
+		t.Errorf("re-recording should fill in the model, got %q", forIssue[0].ModelID)
+	}
+	if forIssue[0].CreatedAt.IsZero() {
+		t.Error("a session should record when it was seen")
+	}
+
+	forRepo, err := st.ListSessions(ctx, "o/r", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forRepo) != 2 {
+		t.Fatalf("both sessions should be listed for the repo, got %+v", forRepo)
+	}
+}
+
+// Runs recorded before there was a sessions table still carry a session ID.
+func TestExistingRunSessionsAreBackfilled(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range migrations[:2] {
+		if _, err := old.ExecContext(ctx, m); err != nil {
+			t.Fatalf("apply schema: %v", err)
+		}
+	}
+	if _, err := old.ExecContext(ctx,
+		`INSERT INTO runs (id, repo, issue, attempt, status, session_id, model_id, created_at, started_at)
+		 VALUES ('old-run', 'o/r', 3, 1, 'pr_open', 'sess-old', 'claude-opus-5', 100, 100)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	defer st.Close()
+
+	sessions, err := st.ListSessions(ctx, "o/r", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].SessionID != "sess-old" || sessions[0].RunID != "old-run" {
+		t.Fatalf("existing sessions should be carried over, got %+v", sessions)
+	}
+}

@@ -14,6 +14,7 @@ type prReport struct {
 	Repo      string
 	Issue     int
 	RunID     string
+	SessionID string
 	ModelID   string
 	CostUSD   float64
 	Summary   string
@@ -61,8 +62,12 @@ func prBody(r prReport) string {
 	}
 
 	b.WriteString("---\n\n")
-	fmt.Fprintf(&b, "Opened automatically by coding-agent-loop (run `%s`, attempt %d, model `%s`, cost $%.4f). ",
+	fmt.Fprintf(&b, "Opened automatically by coding-agent-loop (run `%s`, attempt %d, model `%s`, cost $%.4f",
 		r.RunID, r.Attempt, r.ModelID, r.CostUSD)
+	if r.SessionID != "" {
+		fmt.Fprintf(&b, ", session `%s`", r.SessionID)
+	}
+	b.WriteString("). ")
 	b.WriteString("Nothing here has been reviewed by a human yet.\n")
 
 	return b.String()

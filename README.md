@@ -150,7 +150,9 @@ flight at a time), controlled by `run.max_concurrent_repos`.
    default branch.
 4. **Run Claude** — `claude -p --output-format stream-json --permission-mode bypassPermissions`,
    scoped to the worktree, with a system prompt that hands over the issue and forbids git/GitHub
-   mutation. The lease is renewed periodically while the run is in flight.
+   mutation. The lease is renewed periodically while the run is in flight. The CLI's session ID is
+   recorded against the run and the issue as soon as it is announced — before any result, so a
+   killed or timed-out run still leaves one behind — and is queryable later via `GET /sessions`.
 5. **Verify** — the repository's own test command runs (auto-detected, or from `verify.commands`).
    A failing suite does **not** block the PR — it's a draft either way, and the failure is reported
    in the PR body so a human sees it immediately.
@@ -334,6 +336,7 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps |
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
+| `GET /sessions?repo=&issue=&limit=` | Claude session IDs recorded per repo/issue, newest first     |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
 | `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
 
@@ -451,7 +454,7 @@ curl localhost:8787/status            # gate/run state (from the host, not the s
 | `cmd/agent.go`          | flags, boot checks, wiring                             |
 | `internal/config`       | configuration load and validation                      |
 | `internal/models`       | models.json, ladder selection, embedded default ladder |
-| `internal/store`        | SQLite: claims, runs, gates, events                    |
+| `internal/store`        | SQLite: claims, runs, gates, events, sessions          |
 | `internal/gh`           | GitHub CLI wrapper                                     |
 | `internal/git`          | clones and worktrees                                   |
 | `internal/claude`       | headless Claude runs, stream-json parsing              |

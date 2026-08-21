@@ -97,6 +97,19 @@ type Event struct {
 	Detail string
 }
 
+// Session is one Claude Code session the daemon has driven. Sessions are kept
+// per repo and issue so a later run on a related task can be pointed at what
+// was already done, and so a transcript can be tied back to the CLI's own
+// session identifier long after the run row has scrolled out of view.
+type Session struct {
+	SessionID string
+	RunID     string
+	Repo      string
+	Issue     int
+	ModelID   string
+	CreatedAt time.Time
+}
+
 // Claim is a lease on an issue.
 type Claim struct {
 	Repo        string
@@ -205,6 +218,23 @@ var migrations = []string{
 	UPDATE gate   SET created_at = updated_at WHERE created_at = 0;
 	UPDATE claims SET created_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE created_at = 0;
 	CREATE INDEX IF NOT EXISTS runs_created_at ON runs(created_at DESC);`,
+
+	// Claude Code session IDs, indexed by what you would look them up by: the
+	// issue they were spent on. runs.session_id holds the same value, but only
+	// for as long as you know which run to ask about.
+	`CREATE TABLE IF NOT EXISTS sessions (
+		session_id TEXT NOT NULL,
+		run_id     TEXT NOT NULL,
+		repo       TEXT NOT NULL,
+		issue      INTEGER NOT NULL,
+		model_id   TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (session_id, run_id)
+	);
+	CREATE INDEX IF NOT EXISTS sessions_repo_issue ON sessions(repo, issue, created_at DESC);
+	CREATE INDEX IF NOT EXISTS sessions_run ON sessions(run_id);
+	INSERT OR IGNORE INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
+		SELECT session_id, id, repo, issue, model_id, created_at FROM runs WHERE session_id <> '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -349,9 +379,10 @@ func (s *Store) RecordUsage(ctx context.Context, runID, modelID, sessionID strin
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET
 			model_id   = CASE WHEN ? <> '' THEN ? ELSE model_id END,
-			session_id = ?, cost_usd = ?, tokens_in = ?, tokens_out = ?, num_turns = ?
+			session_id = CASE WHEN ? <> '' THEN ? ELSE session_id END,
+			cost_usd = ?, tokens_in = ?, tokens_out = ?, num_turns = ?
 		WHERE id = ?`,
-		modelID, modelID, sessionID, cost, in, out, turns, runID)
+		modelID, modelID, sessionID, sessionID, cost, in, out, turns, runID)
 	if err != nil {
 		return fmt.Errorf("record usage for run %s: %w", runID, err)
 	}
@@ -380,6 +411,78 @@ func (s *Store) SetPRURL(ctx context.Context, runID, url string) error {
 		return fmt.Errorf("set pr url for run %s: %w", runID, err)
 	}
 	return nil
+}
+
+// SetSessionID records the Claude session a run is using. It is called as soon
+// as the CLI announces one, so a run that is killed before it produces a result
+// still leaves its session behind.
+func (s *Store) SetSessionID(ctx context.Context, runID, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET session_id = ? WHERE id = ?`, sessionID, runID); err != nil {
+		return fmt.Errorf("set session id for run %s: %w", runID, err)
+	}
+	return nil
+}
+
+// RecordSession stores a session for later reference. Re-recording the same
+// session fills in the model once it is known, and never clears it.
+func (s *Store) RecordSession(ctx context.Context, sess Session) error {
+	if sess.SessionID == "" {
+		return nil
+	}
+	if sess.CreatedAt.IsZero() {
+		sess.CreatedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_id, run_id) DO UPDATE SET
+			model_id = CASE WHEN excluded.model_id <> '' THEN excluded.model_id ELSE sessions.model_id END`,
+		sess.SessionID, sess.RunID, sess.Repo, sess.Issue, sess.ModelID, sess.CreatedAt.Unix())
+	if err != nil {
+		return fmt.Errorf("record session %s: %w", sess.SessionID, err)
+	}
+	return nil
+}
+
+// ListSessions returns recorded sessions newest first. repo, and issue when
+// positive, narrow the result to one repository or one issue.
+func (s *Store) ListSessions(ctx context.Context, repo string, issue, limit int) ([]Session, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	query := `SELECT session_id, run_id, repo, issue, model_id, created_at FROM sessions`
+	args := []any{}
+	switch {
+	case repo != "" && issue > 0:
+		query += ` WHERE repo = ? AND issue = ?`
+		args = append(args, repo, issue)
+	case repo != "":
+		query += ` WHERE repo = ?`
+		args = append(args, repo)
+	}
+	query += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		var created int64
+		if err := rows.Scan(&sess.SessionID, &sess.RunID, &sess.Repo, &sess.Issue, &sess.ModelID, &created); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sess.CreatedAt = time.Unix(created, 0)
+		out = append(out, sess)
+	}
+	return out, rows.Err()
 }
 
 // FailRun marks a run terminal with an error message.
