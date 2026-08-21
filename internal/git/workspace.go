@@ -30,8 +30,16 @@ type Manager struct {
 	// explicitly so behaviour does not depend on the host's global gitconfig.
 	AuthorName  string
 	AuthorEmail string
-	DryRun      bool
-	Log         func(format string, args ...any)
+	// GHBinary is the absolute path to gh, used as git's credential helper
+	// for every command. This is set explicitly rather than left to
+	// whatever `git config credential.helper` happens to say, because that
+	// helper is normally invoked by the bare name "gh" — resolved on
+	// $PATH — and a systemd service's PATH does not necessarily include
+	// wherever gh was installed, even though gh itself is authenticated.
+	// Left empty, git falls back to its own configuration.
+	GHBinary string
+	DryRun   bool
+	Log      func(format string, args ...any)
 }
 
 func (m *Manager) logf(format string, args ...any) {
@@ -58,8 +66,28 @@ func (e *CmdError) Error() string {
 
 func (e *CmdError) Unwrap() error { return e.Err }
 
-func run(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+// credentialArgs returns the `-c` flags that make gh, by its known absolute
+// path, the sole git credential helper for one invocation. The first clears
+// whatever helper(s) the host's own gitconfig may or may not have set up;
+// the second installs gh by path rather than by name on $PATH, since gh
+// resolves credentials from its own auth state independent of git entirely —
+// this works regardless of whether `gh auth login` happened to also
+// configure git integration on this host. Returns nil when ghBinary is
+// unset, leaving git's own configuration untouched.
+func credentialArgs(ghBinary string) []string {
+	if ghBinary == "" {
+		return nil
+	}
+	return []string{
+		"-c", "credential.helper=",
+		"-c", "credential.helper=!'" + ghBinary + "' auth git-credential",
+	}
+}
+
+func (m *Manager) run(ctx context.Context, dir string, args ...string) (string, error) {
+	fullArgs := append(credentialArgs(m.GHBinary), args...)
+
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = dir
 	// Never let git stop for credentials or an editor: this runs unattended.
 	cmd.Env = append(os.Environ(),
@@ -109,12 +137,12 @@ func (m *Manager) EnsureRepo(ctx context.Context, repo, cloneURL string) (string
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return "", fmt.Errorf("create repos dir: %w", err)
 		}
-		if _, err := run(ctx, "", "clone", "--no-checkout", cloneURL, path); err != nil {
+		if _, err := m.run(ctx, "", "clone", "--no-checkout", cloneURL, path); err != nil {
 			return "", fmt.Errorf("clone %s: %w", repo, err)
 		}
 	}
 
-	if _, err := run(ctx, path, "fetch", "--prune", "--quiet", "origin"); err != nil {
+	if _, err := m.run(ctx, path, "fetch", "--prune", "--quiet", "origin"); err != nil {
 		return "", fmt.Errorf("fetch %s: %w", repo, err)
 	}
 	return path, nil
@@ -123,7 +151,7 @@ func (m *Manager) EnsureRepo(ctx context.Context, repo, cloneURL string) (string
 // AssertRemote checks the clone's origin actually points at the repo we think
 // we are working on, before anything is pushed to it.
 func (m *Manager) AssertRemote(ctx context.Context, dir, wantRepo string) error {
-	out, err := run(ctx, dir, "remote", "get-url", "origin")
+	out, err := m.run(ctx, dir, "remote", "get-url", "origin")
 	if err != nil {
 		return fmt.Errorf("read origin url: %w", err)
 	}
@@ -158,7 +186,7 @@ func (m *Manager) AddWorktree(ctx context.Context, repoPath, worktreePath, branc
 		return fmt.Errorf("create work dir: %w", err)
 	}
 	// -B resets the branch if a previous attempt left it behind.
-	if _, err := run(ctx, repoPath, "worktree", "add", "-B", branch, worktreePath, "origin/"+base); err != nil {
+	if _, err := m.run(ctx, repoPath, "worktree", "add", "-B", branch, worktreePath, "origin/"+base); err != nil {
 		return fmt.Errorf("add worktree for %s: %w", branch, err)
 	}
 	return nil
@@ -168,7 +196,7 @@ func (m *Manager) AddWorktree(ctx context.Context, repoPath, worktreePath, branc
 // It is safe to call when nothing is there.
 func (m *Manager) RemoveWorktree(ctx context.Context, repoPath, worktreePath string) error {
 	if _, err := os.Stat(worktreePath); err == nil {
-		if _, err := run(ctx, repoPath, "worktree", "remove", "--force", worktreePath); err != nil {
+		if _, err := m.run(ctx, repoPath, "worktree", "remove", "--force", worktreePath); err != nil {
 			// Fall back to deleting the directory: a half-created worktree
 			// should not wedge the loop forever.
 			m.logf("worktree remove failed for %s, deleting directory: %v", worktreePath, err)
@@ -177,7 +205,7 @@ func (m *Manager) RemoveWorktree(ctx context.Context, repoPath, worktreePath str
 			}
 		}
 	}
-	if _, err := run(ctx, repoPath, "worktree", "prune"); err != nil {
+	if _, err := m.run(ctx, repoPath, "worktree", "prune"); err != nil {
 		return fmt.Errorf("prune worktrees: %w", err)
 	}
 	return nil
@@ -185,7 +213,7 @@ func (m *Manager) RemoveWorktree(ctx context.Context, repoPath, worktreePath str
 
 // Status returns `git status --porcelain` output for the worktree.
 func (m *Manager) Status(ctx context.Context, worktreePath string) (string, error) {
-	out, err := run(ctx, worktreePath, "status", "--porcelain")
+	out, err := m.run(ctx, worktreePath, "status", "--porcelain")
 	if err != nil {
 		return "", err
 	}
@@ -202,7 +230,7 @@ func (m *Manager) HasWork(ctx context.Context, worktreePath, base string) (bool,
 	if strings.TrimSpace(status) != "" {
 		return true, nil
 	}
-	out, err := run(ctx, worktreePath, "rev-list", "--count", "origin/"+base+"..HEAD")
+	out, err := m.run(ctx, worktreePath, "rev-list", "--count", "origin/"+base+"..HEAD")
 	if err != nil {
 		return false, err
 	}
@@ -219,7 +247,7 @@ func (m *Manager) CommitAll(ctx context.Context, worktreePath, message string) (
 	if strings.TrimSpace(status) == "" {
 		return false, nil // agent committed its own work, or made none
 	}
-	if _, err := run(ctx, worktreePath, "add", "-A"); err != nil {
+	if _, err := m.run(ctx, worktreePath, "add", "-A"); err != nil {
 		return false, fmt.Errorf("stage changes: %w", err)
 	}
 	args := []string{
@@ -227,7 +255,7 @@ func (m *Manager) CommitAll(ctx context.Context, worktreePath, message string) (
 		"-c", "user.email=" + m.email(),
 		"commit", "--no-verify", "-m", message,
 	}
-	if _, err := run(ctx, worktreePath, args...); err != nil {
+	if _, err := m.run(ctx, worktreePath, args...); err != nil {
 		return false, fmt.Errorf("commit: %w", err)
 	}
 	return true, nil
@@ -249,7 +277,7 @@ func (m *Manager) email() string {
 
 // DiffStat summarises the branch against origin/base, for the PR body.
 func (m *Manager) DiffStat(ctx context.Context, worktreePath, base string) (string, error) {
-	out, err := run(ctx, worktreePath, "diff", "--stat", "origin/"+base+"...HEAD")
+	out, err := m.run(ctx, worktreePath, "diff", "--stat", "origin/"+base+"...HEAD")
 	if err != nil {
 		return "", err
 	}
@@ -267,7 +295,7 @@ func (m *Manager) Push(ctx context.Context, worktreePath, branch, wantRepo strin
 		return nil
 	}
 	// Explicit refspec, never a bare `git push origin`.
-	if _, err := run(ctx, worktreePath, "push", "--set-upstream", "origin", branch+":"+branch); err != nil {
+	if _, err := m.run(ctx, worktreePath, "push", "--set-upstream", "origin", branch+":"+branch); err != nil {
 		return fmt.Errorf("push %s: %w", branch, err)
 	}
 	return nil

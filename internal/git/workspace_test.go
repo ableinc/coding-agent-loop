@@ -85,6 +85,28 @@ func originRepo(t *testing.T) string {
 	return bare
 }
 
+// A systemd service's $PATH does not necessarily include wherever gh was
+// installed, even when gh itself is authenticated — so the credential
+// helper must be wired in by gh's known absolute path, not by name.
+func TestCredentialArgsUsesAbsolutePath(t *testing.T) {
+	args := credentialArgs("/opt/coding-agent-loop/bin/gh")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "!'/opt/coding-agent-loop/bin/gh' auth git-credential") {
+		t.Fatalf("credential helper should reference the absolute gh path, got: %q", joined)
+	}
+	// The first -c must clear any helper the host's own gitconfig set up,
+	// so gh is the only one consulted.
+	if args[0] != "-c" || args[1] != "credential.helper=" {
+		t.Fatalf("expected the clearing -c first, got: %q", args)
+	}
+}
+
+func TestCredentialArgsEmptyWhenGHBinaryUnset(t *testing.T) {
+	if args := credentialArgs(""); args != nil {
+		t.Fatalf("expected no -c flags when GHBinary is unset, got: %q", args)
+	}
+}
+
 func TestWorktreeLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

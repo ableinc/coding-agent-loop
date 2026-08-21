@@ -128,9 +128,18 @@ func run(f flags) error {
 	}
 	defer st.Close()
 
+	// Resolved to an absolute path so git's credential helper finds gh by
+	// that path rather than by name on $PATH — a systemd service's $PATH
+	// does not necessarily include wherever gh was installed, even though
+	// bootCheck already confirmed gh itself is reachable and authenticated.
+	ghBinary := cfg.GitHub.Binary
+	if abs, err := exec.LookPath(cfg.GitHub.Binary); err == nil {
+		ghBinary = abs
+	}
 	gitMgr := &gitpkg.Manager{
 		ReposRoot: cfg.Workspace.ReposRoot,
 		WorkRoot:  cfg.Workspace.Root,
+		GHBinary:  ghBinary,
 		DryRun:    f.dryRun,
 		Log:       func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) },
 	}
