@@ -128,6 +128,13 @@ An issue is worked only if **all** of these hold:
 Labels mirror the state (`agent-working` → `agent-done` / `agent-failed`), but the SQLite claim
 table is the source of truth — labels can be edited by humans mid-run, leases cannot.
 
+Label edits are reconciled rather than fired blindly: the issue's current labels are read first, the
+edit is reduced to what actually changes, a status label the repository does not define yet is
+created on the fly, and a rejected combined edit is retried label by label. `gh issue edit` fails
+the *whole* call on one unknown or not-actually-present label, which would otherwise leave an issue
+carrying a stale `agent-working` long after the run ended. Every failed edit is logged, recorded as
+a `labels_failed` run event, and reported to Discord.
+
 Discovery is parallel across repositories; within one repository, work is serial (one issue in
 flight at a time), controlled by `run.max_concurrent_repos`.
 

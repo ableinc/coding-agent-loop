@@ -232,6 +232,21 @@ func (n *Notifier) RunAbandoned(repo string, issue int, runID, reason string) {
 	})
 }
 
+// LabelUpdateFailed reports that the issue's labels could not be brought in
+// line with the run's state, so what GitHub shows now disagrees with the store.
+func (n *Notifier) LabelUpdateFailed(repo string, issue int, runID string, add, remove []string, err error) {
+	n.post(embed{
+		Title:       fmt.Sprintf("Label update failed: %s#%d", repo, issue),
+		Description: truncate(err.Error(), 500),
+		Color:       colorYellow,
+		Fields: []embedField{
+			{Name: "Add", Value: labelList(add), Inline: true},
+			{Name: "Remove", Value: labelList(remove), Inline: true},
+			{Name: "Run ID", Value: runID, Inline: true},
+		},
+	})
+}
+
 // GateClosed reports that the usage-limit gate closed and new claims will
 // stop until until.
 func (n *Notifier) GateClosed(reason string, until time.Time) {
@@ -283,6 +298,13 @@ func (n *Notifier) DaemonStopped(reason string) {
 		color = colorRed
 	}
 	n.post(embed{Title: "coding-agent-loop stopped", Description: reason, Color: color})
+}
+
+func labelList(labels []string) string {
+	if len(labels) == 0 {
+		return "(none)"
+	}
+	return strings.Join(labels, ", ")
 }
 
 func orNone(s string) string {

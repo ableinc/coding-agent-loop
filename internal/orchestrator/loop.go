@@ -422,7 +422,11 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusWorking); err != nil {
 		log.Warn("status update failed", "error", err)
 	}
-	_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, []string{cfg.GitHub.WorkingLabel}, nil)
+	// The outcome labels of an earlier attempt are stale the moment this one
+	// starts, so they go in the same edit that marks the issue as working.
+	o.setLabels(ctx, log, cand, runID,
+		[]string{cfg.GitHub.WorkingLabel},
+		[]string{cfg.GitHub.DoneLabel, cfg.GitHub.FailedLabel})
 	o.event(ctx, runID, "model", fmt.Sprintf("%s (fallbacks: %s)", head.ID, orNone(fallbacks)))
 	log.Info("starting claude", "model", head.ID, "branch", branch, "attempt", attempt)
 
@@ -543,11 +547,9 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, issueComment(prURL, runID, vres)); err != nil {
 		log.Warn("could not comment on issue", "error", err)
 	}
-	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number,
+	o.setLabels(ctx, log, cand, runID,
 		[]string{cfg.GitHub.DoneLabel},
-		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label}); err != nil {
-		log.Warn("could not update labels", "error", err)
-	}
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel})
 
 	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPROpen); err != nil {
 		log.Warn("status update failed", "error", err)
@@ -574,7 +576,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 			log.Error("could not record skip", "error", err)
 		}
 		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, "skipped: "+skip.reason)
-		_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, nil, []string{cfg.GitHub.WorkingLabel})
+		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
@@ -587,7 +589,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		if err := o.opts.Store.FailRun(ctx, runID, store.StatusFailed, cause.Error()); err != nil {
 			log.Error("could not record failure", "error", err)
 		}
-		_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, nil, []string{cfg.GitHub.WorkingLabel})
+		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
@@ -618,15 +620,28 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		add = append(add, cfg.GitHub.FailedLabel)
 		remove = append(remove, cfg.GitHub.Label)
 	}
-	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number, add, remove); err != nil {
-		log.Warn("could not update labels", "error", err)
-	}
+	o.setLabels(ctx, log, cand, runID, add, remove)
 	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
 		failureComment(runID, attempt, cfg.Run.MaxAttempts, cause.Error(), willRetry)); err != nil {
 		log.Warn("could not comment on issue", "error", err)
 	}
 
 	o.finishCleanup(ctx, log, cand)
+}
+
+// setLabels mirrors run state onto the issue. A label edit is never fatal to a
+// run, but it is also never silently dropped: a failure that goes unrecorded
+// leaves an issue whose labels disagree with the store, which is precisely
+// what a human reading the issue would be misled by.
+func (o *Orchestrator) setLabels(ctx context.Context, log *slog.Logger, cand candidate, runID string, add, remove []string) {
+	ctx = context.WithoutCancel(ctx)
+	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number, add, remove); err != nil {
+		log.Warn("could not update labels", "add", add, "remove", remove, "error", err)
+		o.event(ctx, runID, "labels_failed", fmt.Sprintf("add %v remove %v: %v", add, remove, err))
+		o.opts.Discord.LabelUpdateFailed(cand.repo, cand.number, runID, add, remove, err)
+		return
+	}
+	o.event(ctx, runID, "labels", fmt.Sprintf("add %v remove %v", add, remove))
 }
 
 func (o *Orchestrator) finishCleanup(ctx context.Context, log *slog.Logger, cand candidate) {
