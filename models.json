@@ -1,7 +1,29 @@
 {
   "models": [
-    { "id": "claude-opus-5",    "alias": "opus",   "roles": ["plan", "implement"], "priority": 1 },
-    { "id": "claude-sonnet-5",  "alias": "sonnet", "roles": ["plan", "implement"], "priority": 2 },
-    { "id": "claude-haiku-4-5", "alias": "haiku",  "roles": ["triage"],            "priority": 1 }
+    {
+      "id": "claude-opus-5",
+      "alias": "opus",
+      "roles": [
+        "plan"
+      ],
+      "priority": 1
+    },
+    {
+      "id": "claude-sonnet-5",
+      "alias": "sonnet",
+      "roles": [
+        "plan",
+        "implement"
+      ],
+      "priority": 2
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "alias": "haiku",
+      "roles": [
+        "triage"
+      ],
+      "priority": 1
+    }
   ]
 }
