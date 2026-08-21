@@ -43,5 +43,9 @@
   "store": {
     "path": "~/.agent-loop/state.db"
   },
+  "discord": {
+    "enabled": false,
+    "webhook_url": ""
+  },
   "models_path": "models.json"
 }

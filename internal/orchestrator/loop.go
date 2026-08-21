@@ -22,6 +22,7 @@ import (
 
 	"github.com/ableinc/coding-agent-loop/internal/claude"
 	"github.com/ableinc/coding-agent-loop/internal/config"
+	"github.com/ableinc/coding-agent-loop/internal/discord"
 	"github.com/ableinc/coding-agent-loop/internal/gate"
 	"github.com/ableinc/coding-agent-loop/internal/gh"
 	gitpkg "github.com/ableinc/coding-agent-loop/internal/git"
@@ -46,6 +47,7 @@ type Options struct {
 	Logger   *slog.Logger
 	DryRun   bool
 	WorkerID string
+	Discord  *discord.Notifier
 }
 
 // Orchestrator runs the loop.
@@ -325,6 +327,7 @@ func (o *Orchestrator) work(ctx context.Context, cand candidate) {
 		return
 	}
 	o.event(ctx, runID, "claimed", fmt.Sprintf("attempt %d as worker %s", attempt, o.opts.WorkerID))
+	o.opts.Discord.RunClaimed(cand.repo, cand.number, runID, attempt)
 
 	if err := o.execute(runCtx, log, cand, runID, branch, logPath, attempt); err != nil {
 		o.handleFailure(ctx, log, cand, runID, attempt, err)
@@ -458,6 +461,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 				log.Warn("could not cool down model", "error", err)
 			}
 			o.event(ctx, runID, "usage_limit", hit.Reason)
+			o.opts.Discord.GateClosed(hit.Reason, until)
 			return errRetryable{fmt.Errorf("usage limit reached, paused until %s: %s",
 				until.Format(time.RFC3339), hit.Reason)}
 		}
@@ -472,7 +476,9 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	if err := o.opts.Gate.RecordSuccess(ctx); err != nil {
 		log.Warn("could not clear usage gate", "error", err)
 	}
+	o.opts.Discord.GateCleared()
 	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
+	o.opts.Discord.ClaudeFinished(cand.repo, cand.number, runID, result.PrimaryModel(), result.NumTurns, result.TotalCostUSD)
 
 	hasWork, err := o.opts.Git.HasWork(ctx, worktree, meta.defaultBranch)
 	if err != nil {
@@ -499,6 +505,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		log.Warn("verify status update failed", "error", err)
 	}
 	o.event(ctx, runID, "verify", fmt.Sprintf("%s (%s)", vres.Status, orNone(vres.Command)))
+	o.opts.Discord.VerifyResult(cand.repo, cand.number, runID, vres)
 	log.Info("verification finished", "status", vres.Status, "command", vres.Command)
 
 	if err := o.opts.Git.Push(ctx, worktree, branch, cand.repo); err != nil {
@@ -546,6 +553,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		log.Warn("status update failed", "error", err)
 	}
 	o.event(ctx, runID, "pr_open", prURL)
+	o.opts.Discord.PROpened(cand.repo, cand.number, runID, result.PrimaryModel(), prURL, result.TotalCostUSD, diffstat)
 	log.Info("draft pull request opened", "url", prURL, "cost_usd", result.TotalCostUSD)
 
 	o.cleanup(ctx, log, repoPath, worktree, true)
@@ -565,12 +573,14 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		if err := o.opts.Store.FailRun(ctx, runID, store.StatusAbandoned, "skipped: "+skip.reason); err != nil {
 			log.Error("could not record skip", "error", err)
 		}
+		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, "skipped: "+skip.reason)
 		_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
 
-	// A usage limit is nobody's fault; it must not consume a retry.
+	// A usage limit is nobody's fault; it must not consume a retry. Already
+	// reported to Discord via GateClosed above — do not notify again here.
 	var retryable errRetryable
 	if errors.As(cause, &retryable) {
 		log.Warn("run paused by usage limit", "error", cause)
@@ -593,6 +603,11 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		log.Error("could not record failure", "error", err)
 	}
 	o.event(ctx, runID, "failed", cause.Error())
+	if willRetry {
+		o.opts.Discord.RunFailed(cand.repo, cand.number, runID, attempt, cfg.Run.MaxAttempts, cause.Error(), true)
+	} else {
+		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, cause.Error())
+	}
 
 	// The trigger label stays put while retries remain, since discovery is
 	// label-driven; it is removed once the issue is abandoned so the poller

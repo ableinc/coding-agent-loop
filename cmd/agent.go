@@ -18,6 +18,7 @@ import (
 
 	"github.com/ableinc/coding-agent-loop/internal/claude"
 	"github.com/ableinc/coding-agent-loop/internal/config"
+	"github.com/ableinc/coding-agent-loop/internal/discord"
 	"github.com/ableinc/coding-agent-loop/internal/gate"
 	"github.com/ableinc/coding-agent-loop/internal/gh"
 	gitpkg "github.com/ableinc/coding-agent-loop/internal/git"
@@ -131,11 +132,13 @@ func run(f flags) error {
 	runner := &claude.Runner{Log: func(format string, args ...any) { log.Debug(fmt.Sprintf(format, args...)) }}
 	gateway := gate.New(st, cfg.Claude, func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) })
 	verifier := &verify.Runner{Cfg: cfg.Verify, Timeout: cfg.Run.VerifyTimeout.D()}
+	notifier := discord.New(cfg.Discord.Enabled, cfg.Discord.WebhookURL,
+		func(format string, args ...any) { log.Warn(fmt.Sprintf(format, args...)) })
 
 	orch := orchestrator.New(orchestrator.Options{
 		Config: cfg, Store: st, Registry: registry,
 		GH: ghClient, Git: gitMgr, Runner: runner, Gate: gateway, Verify: verifier,
-		Logger: log, DryRun: f.dryRun,
+		Logger: log, DryRun: f.dryRun, Discord: notifier,
 	})
 
 	// SIGINT/SIGTERM cancels the root context; the loop then drains in-flight
@@ -152,9 +155,15 @@ func run(f flags) error {
 		return orch.RunOnce(ctx)
 	}
 
+	workerID, _ := os.Hostname()
+	if workerID == "" {
+		workerID = "coding-agent-loop"
+	}
+	notifier.DaemonStarted(workerID)
+
 	errCh := make(chan error, 2)
 	if !f.noServer {
-		srv := server.New(cfg.Server.Addr, st, gateway, orch, log)
+		srv := server.New(cfg.Server.Addr, st, gateway, orch, log, notifier)
 		go func() { errCh <- srv.Listen(ctx) }()
 	}
 	go func() { errCh <- orch.Run(ctx) }()
@@ -167,6 +176,14 @@ func run(f flags) error {
 	case <-time.After(30 * time.Second):
 		log.Warn("shutdown timed out waiting for components")
 	}
+
+	if err != nil {
+		notifier.DaemonStopped(fmt.Sprintf("crash: %v", err))
+	} else {
+		notifier.DaemonStopped("graceful shutdown")
+	}
+	notifier.Close(3 * time.Second)
+
 	return err
 }
 

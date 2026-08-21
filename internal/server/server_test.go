@@ -13,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/ableinc/coding-agent-loop/internal/config"
+	"github.com/ableinc/coding-agent-loop/internal/discord"
 	"github.com/ableinc/coding-agent-loop/internal/gate"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 )
@@ -42,7 +43,7 @@ func testServer(t *testing.T) (*Server, *store.Store, *fakeController) {
 	cfg.Claude.CredentialsPath = filepath.Join(t.TempDir(), "absent.json")
 	g := gate.New(st, cfg.Claude, nil)
 	ctrl := &fakeController{cancelOK: true, activeRepo: []string{"acme/widgets"}}
-	return New("127.0.0.1:0", st, g, ctrl, nil), st, ctrl
+	return New("127.0.0.1:0", st, g, ctrl, nil, discord.New(false, "", nil)), st, ctrl
 }
 
 func do(t *testing.T, s *Server, method, target string, body io.Reader) (int, map[string]any) {

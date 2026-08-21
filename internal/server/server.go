@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/ableinc/coding-agent-loop/internal/discord"
 	"github.com/ableinc/coding-agent-loop/internal/gate"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 )
@@ -30,28 +31,30 @@ type Controller interface {
 
 // Server wraps the Fiber app.
 type Server struct {
-	app   *fiber.App
-	addr  string
-	store *store.Store
-	gate  *gate.Gate
-	ctrl  Controller
-	log   *slog.Logger
-	start time.Time
+	app     *fiber.App
+	addr    string
+	store   *store.Store
+	gate    *gate.Gate
+	ctrl    Controller
+	log     *slog.Logger
+	start   time.Time
+	discord *discord.Notifier
 }
 
 // New builds the API.
-func New(addr string, st *store.Store, g *gate.Gate, ctrl Controller, log *slog.Logger) *Server {
+func New(addr string, st *store.Store, g *gate.Gate, ctrl Controller, log *slog.Logger, d *discord.Notifier) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{
-		app:   fiber.New(fiber.Config{AppName: "coding-agent-loop"}),
-		addr:  addr,
-		store: st,
-		gate:  g,
-		ctrl:  ctrl,
-		log:   log,
-		start: time.Now(),
+		app:     fiber.New(fiber.Config{AppName: "coding-agent-loop"}),
+		addr:    addr,
+		store:   st,
+		gate:    g,
+		ctrl:    ctrl,
+		log:     log,
+		start:   time.Now(),
+		discord: d,
 	}
 	s.routes()
 	return s
@@ -217,6 +220,7 @@ func (s *Server) pause(c fiber.Ctx) error {
 		return s.fail(c, http.StatusInternalServerError, err)
 	}
 	s.log.Info("paused by operator", "reason", body.Reason)
+	s.discord.Paused(body.Reason)
 	return c.JSON(fiber.Map{
 		"paused": true,
 		"note":   "in-flight runs continue; no new issues will be claimed",
@@ -228,6 +232,7 @@ func (s *Server) resume(c fiber.Ctx) error {
 		return s.fail(c, http.StatusInternalServerError, err)
 	}
 	s.log.Info("resumed by operator")
+	s.discord.Resumed()
 	return c.JSON(fiber.Map{"paused": false})
 }
 

@@ -44,6 +44,7 @@ type Config struct {
 	Verify    VerifyConfig    `json:"verify"`
 	Server    ServerConfig    `json:"server"`
 	Store     StoreConfig     `json:"store"`
+	Discord   DiscordConfig   `json:"discord"`
 
 	// ModelsPath points at models.json. Defaults to ./models.json.
 	ModelsPath string `json:"models_path"`
@@ -129,6 +130,13 @@ type StoreConfig struct {
 	Path string `json:"path"`
 }
 
+// DiscordConfig controls one-way status notifications posted to a Discord
+// channel via an incoming webhook. The daemon never reads Discord.
+type DiscordConfig struct {
+	Enabled    bool   `json:"enabled"`
+	WebhookURL string `json:"webhook_url"`
+}
+
 // Default returns a Config with every field populated to a sane value.
 func Default() Config {
 	return Config{
@@ -164,9 +172,10 @@ func Default() Config {
 			CredentialsPath:   "~/.claude/.credentials.json",
 			UsageCachePath:    "~/.agent-loop/usage-cache.json",
 		},
-		Verify: VerifyConfig{AutoDetect: true, Commands: map[string]string{}},
-		Server: ServerConfig{Addr: "127.0.0.1:8787"},
-		Store:  StoreConfig{Path: "~/.agent-loop/state.db"},
+		Verify:  VerifyConfig{AutoDetect: true, Commands: map[string]string{}},
+		Server:  ServerConfig{Addr: "127.0.0.1:8787"},
+		Store:   StoreConfig{Path: "~/.agent-loop/state.db"},
+		Discord: DiscordConfig{Enabled: false},
 	}
 }
 
@@ -244,6 +253,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.Addr == "" {
 		return fmt.Errorf("server.addr must be set")
+	}
+	if c.Discord.Enabled && c.Discord.WebhookURL == "" {
+		return fmt.Errorf("discord.webhook_url must be set when discord.enabled is true")
 	}
 	return nil
 }

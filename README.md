@@ -31,6 +31,7 @@ gh search issues --label agent-ready
   - [models.json](#modelsjson)
 - [When it stops](#when-it-stops)
 - [Control API](#control-api)
+- [Discord notifications](#discord-notifications)
 - [Safety boundaries](#safety-boundaries)
 - [Deploying with systemd](#deploying-with-systemd)
 - [Layout](#layout)
@@ -204,6 +205,10 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
   "store": {
     "path": "~/.agent-loop/state.db"
   },
+  "discord": {
+    "enabled": false,
+    "webhook_url": ""
+  },
   "models_path": "models.json"
 }
 ```
@@ -233,6 +238,8 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `verify.commands` | per-repo override, keyed `"owner/name": "shell command"` |
 | `server.addr` | control API bind address; keep loopback-only |
 | `store.path` | SQLite database path |
+| `discord.enabled` | turn on Discord status notifications (see [Discord notifications](#discord-notifications)) |
+| `discord.webhook_url` | the channel's incoming webhook URL; **required** if `discord.enabled` is true |
 | `models_path` | path to `models.json` |
 
 ### models.json
@@ -287,6 +294,37 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | `GET /runs/{id}/log` | the raw JSONL transcript of the Claude run |
 | `POST /pause` `POST /resume` | stop / resume claiming new work |
 | `POST /runs/{id}/cancel` | cancel an in-flight run |
+
+## Discord notifications
+
+Optional, **one-way** status updates posted to a Discord channel (e.g. `#coding-agent-loop`) via an
+incoming webhook. The daemon only ever POSTs to it — it never reads the channel, never listens for
+messages, and never takes requests from it. There is nothing to secure against on the receiving
+end because a webhook URL is push-only by construction.
+
+To enable it:
+
+1. In Discord: channel settings → Integrations → Webhooks → New Webhook, then copy its URL.
+2. In `config.json`:
+   ```json
+   "discord": {
+     "enabled": true,
+     "webhook_url": "https://discord.com/api/webhooks/..."
+   }
+   ```
+
+Once enabled, every one of these posts an embed:
+
+- **Run lifecycle** — issue claimed, Claude run finished, verification result, draft PR opened,
+  run failed (will retry) or abandoned.
+- **Usage gate** — closes (with reason and until-when) and clears.
+- **Pause / resume** — whenever `POST /pause` or `POST /resume` is called.
+- **Daemon start / stop** — process startup, and graceful shutdown or crash. (Skipped for `--once`
+  passes, which aren't really "the daemon.")
+
+A Discord outage, timeout, or rate-limit is logged and dropped — it never blocks, delays, or fails
+an actual run. Leave `discord.enabled` false (the default) to disable it entirely; no network calls
+are made when it's off.
 
 ## Safety boundaries
 
