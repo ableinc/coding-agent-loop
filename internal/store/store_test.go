@@ -390,3 +390,39 @@ func TestCreatedAtIsBackfilledOnUpgrade(t *testing.T) {
 		t.Fatalf("created_at should be backfilled from started_at, got %v want %v", run.CreatedAt, started)
 	}
 }
+
+// The back-off is driven off IssueHistory, so what it counts matters: a run
+// the usage gate stopped is neither an attempt nor a failure.
+func TestIssueHistoryCountsFailuresButNotDeferrals(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	seed := func(id, status string, ended time.Time) {
+		if err := st.CreateRun(ctx, Run{ID: id, Repo: "o/r", Issue: 5, Status: StatusClaimed, StartedAt: ended}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.FailRun(ctx, id, status, "because"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("a", StatusFailed, time.Now())
+	seed("b", StatusDeferred, time.Now())
+	seed("c", StatusAbandoned, time.Now())
+
+	hist, err := st.IssueHistory(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Attempts != 2 {
+		t.Errorf("a deferred run should not consume an attempt, got %d attempts", hist.Attempts)
+	}
+	if hist.Failures != 2 {
+		t.Errorf("failures = %d, want 2", hist.Failures)
+	}
+	if hist.LastFailureAt.IsZero() {
+		t.Error("the back-off has nothing to measure from without LastFailureAt")
+	}
+	if hist.Succeeded {
+		t.Error("no run delivered a PR")
+	}
+}

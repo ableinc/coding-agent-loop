@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ableinc/coding-agent-loop/internal/config"
 	"github.com/ableinc/coding-agent-loop/internal/gh"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 	"github.com/ableinc/coding-agent-loop/internal/verify"
@@ -106,14 +108,67 @@ func TestPRBodyHandlesMissingSummary(t *testing.T) {
 	}
 }
 
-func TestFailureCommentExplainsRetryIntent(t *testing.T) {
-	retrying := failureComment("run-1", 1, 2, "claude run failed", true)
-	if !strings.Contains(retrying, "attempt 1 of 2") || !strings.Contains(retrying, "try again") {
-		t.Fatalf("retry comment unclear:\n%s", retrying)
+func TestFailureCommentExplainsWhenTheNextAttemptIsDue(t *testing.T) {
+	next := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	c := failureComment("run-1", 3, "claude run failed", next, "agent-ready")
+	if !strings.Contains(c, "attempt 3") || !strings.Contains(c, "try again after") {
+		t.Fatalf("retry comment unclear:\n%s", c)
 	}
-	final := failureComment("run-2", 2, 2, "claude run failed", false)
-	if !strings.Contains(final, "No further attempts") {
-		t.Fatalf("final failure should say it is giving up:\n%s", final)
+	if !strings.Contains(c, "1 Mar 2026 12:00:00 UTC") {
+		t.Fatalf("the next attempt time should be stated:\n%s", c)
+	}
+	// Retries are unbounded, so the comment has to say what actually stops them.
+	if !strings.Contains(c, "Remove the `agent-ready` label") {
+		t.Fatalf("the opt-out should be spelled out:\n%s", c)
+	}
+}
+
+func TestRetryDelayBacksOffExponentiallyAndCaps(t *testing.T) {
+	base, max := 15*time.Minute, 4*time.Hour
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, 0},
+		{1, 15 * time.Minute},
+		{2, 30 * time.Minute},
+		{3, time.Hour},
+		{4, 2 * time.Hour},
+		{5, 4 * time.Hour},
+		{6, 4 * time.Hour},
+		{99, 4 * time.Hour}, // never grows without bound, never overflows
+	}
+	for _, tc := range tests {
+		if got := retryDelay(tc.failures, base, max); got != tc.want {
+			t.Errorf("retryDelay(%d) = %v, want %v", tc.failures, got, tc.want)
+		}
+	}
+	if got := retryDelay(3, time.Hour, time.Minute); got != time.Hour {
+		t.Errorf("a max below base should clamp to base, got %v", got)
+	}
+}
+
+// The trigger label is the only thing that decides whether an issue is worked,
+// so a long history of failures must delay a retry, never cancel it.
+func TestNextAttemptAtOnlyDelays(t *testing.T) {
+	o := New(Options{Config: config.Config{Run: config.RunConfig{
+		RetryBackoff:    config.Duration(15 * time.Minute),
+		RetryBackoffMax: config.Duration(24 * time.Hour),
+	}}})
+
+	failed := time.Now().Add(-time.Minute)
+	next := o.nextAttemptAt(store.IssueState{Failures: 2, LastFailureAt: failed})
+	if !next.Equal(failed.Add(30 * time.Minute)) {
+		t.Fatalf("next attempt = %v, want %v", next, failed.Add(30*time.Minute))
+	}
+
+	stale := o.nextAttemptAt(store.IssueState{Failures: 50, LastFailureAt: time.Now().Add(-72 * time.Hour)})
+	if stale.After(time.Now()) {
+		t.Fatalf("an old failure must eventually become claimable again, got %v", stale)
+	}
+
+	if got := o.nextAttemptAt(store.IssueState{}); !got.IsZero() {
+		t.Fatalf("an issue with no failures should be claimable now, got %v", got)
 	}
 }
 

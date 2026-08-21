@@ -19,10 +19,11 @@
   },
   "run": {
     "max_concurrent_repos": 3,
-    "max_attempts": 2,
     "timeout": "45m",
     "lease": "90m",
-    "verify_timeout": "10m"
+    "verify_timeout": "10m",
+    "retry_backoff": "15m",
+    "retry_backoff_max": "24h"
   },
   "claude": {
     "binary": "claude",

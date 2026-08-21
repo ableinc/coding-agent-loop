@@ -205,28 +205,30 @@ func (n *Notifier) PROpened(repo string, issue int, runID, model, prURL string, 
 	})
 }
 
-// RunFailed reports a run failure that will be retried.
-func (n *Notifier) RunFailed(repo string, issue int, runID string, attempt, maxAttempts int, cause string, willRetry bool) {
+// RunFailed reports a failed run and when it will be tried again. Retries are
+// unbounded, so "when" is the useful number, not "how many are left".
+func (n *Notifier) RunFailed(repo string, issue int, runID string, attempt int, cause string, nextAttempt time.Time) {
 	n.post(embed{
 		Title:       fmt.Sprintf("Run failed: %s#%d", repo, issue),
 		Description: truncate(cause, 500),
 		Color:       colorOrange,
 		Fields: []embedField{
-			{Name: "Attempt", Value: fmt.Sprintf("%d/%d", attempt, maxAttempts), Inline: true},
-			{Name: "Will retry", Value: fmt.Sprintf("%v", willRetry), Inline: true},
+			{Name: "Attempt", Value: fmt.Sprintf("%d", attempt), Inline: true},
+			{Name: "Next attempt", Value: when(nextAttempt), Inline: true},
 			{Name: "Run ID", Value: runID, Inline: true},
 		},
 	})
 }
 
-// RunAbandoned reports a run that will not be retried (skipped, or retries
-// exhausted).
-func (n *Notifier) RunAbandoned(repo string, issue int, runID, reason string) {
+// RunAbandoned reports a run that was skipped rather than attempted — the
+// issue closed, lost its label, or is already covered by a pull request.
+func (n *Notifier) RunAbandoned(repo string, issue int, runID, reason string, nextAttempt time.Time) {
 	n.post(embed{
 		Title:       fmt.Sprintf("Run abandoned: %s#%d", repo, issue),
 		Description: truncate(reason, 500),
 		Color:       colorRed,
 		Fields: []embedField{
+			{Name: "Next attempt", Value: when(nextAttempt), Inline: true},
 			{Name: "Run ID", Value: runID, Inline: true},
 		},
 	})
@@ -298,6 +300,14 @@ func (n *Notifier) DaemonStopped(reason string) {
 		color = colorRed
 	}
 	n.post(embed{Title: "coding-agent-loop stopped", Description: reason, Color: color})
+}
+
+// when renders a scheduled time, or says that nothing is being waited for.
+func when(t time.Time) string {
+	if t.IsZero() {
+		return "next pass"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func labelList(labels []string) string {

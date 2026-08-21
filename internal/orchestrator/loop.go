@@ -92,6 +92,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		"worker", o.opts.WorkerID,
 		"poll_interval", interval.String(),
 		"max_concurrent_repos", o.opts.Config.Run.MaxConcurrentRepos,
+		"retry_backoff", o.opts.Config.Run.RetryBackoff.D().String(),
+		"retry_backoff_max", o.opts.Config.Run.RetryBackoffMax.D().String(),
 		"dry_run", o.opts.DryRun)
 
 	ticker := time.NewTicker(interval)
@@ -260,15 +262,53 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 		o.log.Error("issue history lookup failed", "repo", repo, "issue", issue, "error", err)
 		return false, "history lookup failed"
 	}
-	switch {
-	case hist.Succeeded:
+	if hist.Succeeded {
 		return false, "already delivered a PR"
-	case hist.Abandoned:
-		return false, "attempts exhausted previously"
-	case hist.Attempts >= o.opts.Config.Run.MaxAttempts:
-		return false, "attempt limit reached"
+	}
+	if next := o.nextAttemptAt(hist); time.Now().Before(next) {
+		return false, fmt.Sprintf("backing off after %d failed attempt(s), retrying at %s",
+			hist.Failures, next.Format(time.RFC3339))
 	}
 	return true, ""
+}
+
+// nextAttemptAt is when a previously failed issue may be claimed again. The
+// zero time means "now": there is nothing to wait for.
+func (o *Orchestrator) nextAttemptAt(hist store.IssueState) time.Time {
+	if hist.Failures == 0 || hist.LastFailureAt.IsZero() {
+		return time.Time{}
+	}
+	cfg := o.opts.Config.Run
+	return hist.LastFailureAt.Add(retryDelay(hist.Failures, cfg.RetryBackoff.D(), cfg.RetryBackoffMax.D()))
+}
+
+// retryDelay is the wait after the nth consecutive failure on one issue:
+// base, 2×base, 4×base, ... capped at max.
+//
+// No issue is ever given up on for having failed too often — the trigger label
+// is the only thing that decides whether it is worked at all — so the cap is
+// what keeps a permanently broken issue down to a trickle of runs instead of
+// letting it monopolise a repository's serial slot.
+func retryDelay(failures int, base, max time.Duration) time.Duration {
+	if failures <= 0 || base <= 0 {
+		return 0
+	}
+	if max > 0 && max < base {
+		max = base
+	}
+	d := base
+	for i := 1; i < failures; i++ {
+		// Doubling overflows int64 after ~63 failures; the cap is the answer
+		// either way.
+		if d > max/2 {
+			return max
+		}
+		d *= 2
+	}
+	if max > 0 && d > max {
+		d = max
+	}
+	return d
 }
 
 // work runs the full lifecycle for one issue.
@@ -400,16 +440,21 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 	o.event(ctx, runID, "worktree", worktree)
 
-	// Pick the model. On a retry, start one rung lower: the previous attempt
-	// already showed the model above it did not get there.
+	// Pick the model.
 	cooled, err := o.opts.Store.CooledDownModels(ctx)
 	if err != nil {
 		log.Warn("cooldown lookup failed, using full ladder", "error", err)
 		cooled = nil
 	}
 	ladder := o.opts.Registry.Ladder(models.RoleImplement, cooled)
-	if drop := attempt - 1; drop > 0 && drop < len(ladder) {
-		ladder = ladder[drop:]
+	// On a retry, start one rung lower: the previous attempt already showed the
+	// model above it did not get there. Retries are unbounded, so this wraps
+	// rather than pinning the issue to the weakest model forever — by the time
+	// the ladder has been walked once, the top of it is worth another try.
+	if len(ladder) > 0 {
+		if drop := (attempt - 1) % len(ladder); drop > 0 {
+			ladder = ladder[drop:]
+		}
 	}
 	head, fallbacks, err := models.Head(ladder)
 	if err != nil {
@@ -562,7 +607,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	return nil
 }
 
-// handleFailure records a failed run and decides whether a retry is possible.
+// handleFailure records a failed run and schedules the next attempt.
 func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand candidate, runID string, attempt int, cause error) {
 	cfg := o.opts.Config
 	// context.WithoutCancel: the run's context may already be cancelled, but
@@ -575,58 +620,68 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		if err := o.opts.Store.FailRun(ctx, runID, store.StatusAbandoned, "skipped: "+skip.reason); err != nil {
 			log.Error("could not record skip", "error", err)
 		}
-		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, "skipped: "+skip.reason)
+		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, "skipped: "+skip.reason,
+			o.scheduleRetry(ctx, log, cand, runID))
 		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
 
-	// A usage limit is nobody's fault; it must not consume a retry. Already
-	// reported to Discord via GateClosed above — do not notify again here.
+	// A usage limit is nobody's fault: it is neither an attempt nor a failure,
+	// so it neither drops the issue down the model ladder nor extends its
+	// back-off. Already reported to Discord via GateClosed above — do not
+	// notify again here.
 	var retryable errRetryable
 	if errors.As(cause, &retryable) {
-		log.Warn("run paused by usage limit", "error", cause)
-		if err := o.opts.Store.FailRun(ctx, runID, store.StatusFailed, cause.Error()); err != nil {
-			log.Error("could not record failure", "error", err)
+		log.Warn("run deferred by usage limit", "error", cause)
+		if err := o.opts.Store.FailRun(ctx, runID, store.StatusDeferred, cause.Error()); err != nil {
+			log.Error("could not record deferral", "error", err)
 		}
+		o.event(ctx, runID, "deferred", cause.Error())
 		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
 
-	willRetry := attempt < cfg.Run.MaxAttempts
-	status := store.StatusFailed
-	if !willRetry {
-		status = store.StatusAbandoned
-	}
-	log.Error("run failed", "error", cause, "attempt", attempt, "will_retry", willRetry)
-
-	if err := o.opts.Store.FailRun(ctx, runID, status, cause.Error()); err != nil {
+	log.Error("run failed", "error", cause, "attempt", attempt)
+	if err := o.opts.Store.FailRun(ctx, runID, store.StatusFailed, cause.Error()); err != nil {
 		log.Error("could not record failure", "error", err)
 	}
 	o.event(ctx, runID, "failed", cause.Error())
-	if willRetry {
-		o.opts.Discord.RunFailed(cand.repo, cand.number, runID, attempt, cfg.Run.MaxAttempts, cause.Error(), true)
-	} else {
-		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, cause.Error())
-	}
 
-	// The trigger label stays put while retries remain, since discovery is
-	// label-driven; it is removed once the issue is abandoned so the poller
-	// stops seeing it.
-	remove := []string{cfg.GitHub.WorkingLabel}
-	add := []string{}
-	if !willRetry {
-		add = append(add, cfg.GitHub.FailedLabel)
-		remove = append(remove, cfg.GitHub.Label)
-	}
-	o.setLabels(ctx, log, cand, runID, add, remove)
+	nextAttempt := o.scheduleRetry(ctx, log, cand, runID)
+	o.opts.Discord.RunFailed(cand.repo, cand.number, runID, attempt, cause.Error(), nextAttempt)
+
+	// The trigger label always stays put: it, and only it, decides whether the
+	// issue is worked. agent-failed mirrors the outcome until the next attempt
+	// clears it.
+	o.setLabels(ctx, log, cand, runID,
+		[]string{cfg.GitHub.FailedLabel}, []string{cfg.GitHub.WorkingLabel})
 	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
-		failureComment(runID, attempt, cfg.Run.MaxAttempts, cause.Error(), willRetry)); err != nil {
+		failureComment(runID, attempt, cause.Error(), nextAttempt, cfg.GitHub.Label)); err != nil {
 		log.Warn("could not comment on issue", "error", err)
 	}
 
 	o.finishCleanup(ctx, log, cand)
+}
+
+// scheduleRetry reports when this issue becomes claimable again, reading the
+// history back after the failure was written so the count includes it. A zero
+// time means the next discovery pass may take it.
+func (o *Orchestrator) scheduleRetry(ctx context.Context, log *slog.Logger, cand candidate, runID string) time.Time {
+	hist, err := o.opts.Store.IssueHistory(ctx, cand.repo, cand.number)
+	if err != nil {
+		log.Warn("could not compute retry back-off", "error", err)
+		return time.Time{}
+	}
+	next := o.nextAttemptAt(hist)
+	if next.IsZero() {
+		return next
+	}
+	o.event(ctx, runID, "retry_scheduled", fmt.Sprintf("failure %d, next attempt at %s",
+		hist.Failures, next.Format(time.RFC3339)))
+	log.Info("issue backing off", "failures", hist.Failures, "next_attempt", next.Format(time.RFC3339))
+	return next
 }
 
 // setLabels mirrors run state onto the issue. A label edit is never fatal to a

@@ -25,9 +25,10 @@ const (
 	StatusVerifying = "verifying"
 	StatusPushed    = "pushed"
 	StatusPROpen    = "pr_open"   // terminal, success
-	StatusFailed    = "failed"    // terminal, may be retried as a new run
-	StatusAbandoned = "abandoned" // terminal, attempts exhausted
+	StatusFailed    = "failed"    // terminal, retried after a back-off
+	StatusAbandoned = "abandoned" // terminal, skipped: the issue is not workable as it stands
 	StatusCanceled  = "canceled"  // terminal, operator cancelled
+	StatusDeferred  = "deferred"  // terminal, stopped by the usage gate; not the issue's fault
 )
 
 // Verify outcomes recorded on a run.
@@ -47,7 +48,7 @@ const (
 // IsTerminal reports whether a run status is final.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled:
+	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred:
 		return true
 	}
 	return false
@@ -483,27 +484,46 @@ func (s *Store) InFlightRuns(ctx context.Context) ([]Run, error) {
 }
 
 // IssueState summarises prior work on an issue so the poller can decide
-// whether to pick it up again.
+// whether to pick it up again, and how long to wait first.
 type IssueState struct {
-	Attempts   int
-	Succeeded  bool
-	Abandoned  bool
-	LastPRURL  string
-	LastStatus string
+	// Attempts counts runs that actually got a chance at the issue. Runs the
+	// usage gate stopped are excluded: being rate-limited is not an attempt.
+	Attempts int
+	// Failures counts runs that ended without delivering a PR. It is the
+	// exponent of the retry back-off.
+	Failures  int
+	Succeeded bool
+	Abandoned bool
+	// LastFailureAt is when the most recent failure ended, i.e. what the
+	// back-off is measured from.
+	LastFailureAt time.Time
+	LastPRURL     string
+	LastStatus    string
 }
 
 // IssueHistory reports what previous runs did with an issue.
 func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (IssueState, error) {
 	var st IssueState
+	var succeeded, abandoned, lastFailure int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*),
-		        SUM(CASE WHEN status = ? THEN 1 ELSE 0 END),
-		        SUM(CASE WHEN status = ? THEN 1 ELSE 0 END)
+		`SELECT COALESCE(SUM(CASE WHEN status <> ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END), 0),
+		        COALESCE(MAX(CASE WHEN status IN (?, ?, ?) THEN ended_at ELSE 0 END), 0)
 		 FROM runs WHERE repo = ? AND issue = ?`,
-		StatusPROpen, StatusAbandoned, repo, issue).
-		Scan(&st.Attempts, &nullInt{&st.Succeeded}, &nullInt{&st.Abandoned})
+		StatusDeferred, StatusPROpen, StatusAbandoned,
+		StatusFailed, StatusAbandoned, StatusCanceled,
+		StatusFailed, StatusAbandoned, StatusCanceled,
+		repo, issue).
+		Scan(&st.Attempts, &succeeded, &abandoned, &st.Failures, &lastFailure)
 	if err != nil {
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
+	}
+	st.Succeeded = succeeded > 0
+	st.Abandoned = abandoned > 0
+	if lastFailure > 0 {
+		st.LastFailureAt = time.Unix(lastFailure, 0)
 	}
 
 	row := s.db.QueryRowContext(ctx,
@@ -513,23 +533,6 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
 	}
 	return st, nil
-}
-
-// nullInt scans a possibly-NULL SUM() into a bool ("more than zero").
-type nullInt struct{ target *bool }
-
-func (n *nullInt) Scan(v any) error {
-	switch t := v.(type) {
-	case nil:
-		*n.target = false
-	case int64:
-		*n.target = t > 0
-	case float64:
-		*n.target = t > 0
-	default:
-		return fmt.Errorf("unexpected count type %T", v)
-	}
-	return nil
 }
 
 // --- gate -------------------------------------------------------------------

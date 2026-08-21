@@ -122,7 +122,8 @@ An issue is worked only if **all** of these hold:
 - it carries the trigger label (`github.label`, default `agent-ready`) and is open
 - its repository is not in `github.exclude_repos`
 - no other issue in that repository is currently in flight
-- no previous run delivered a PR for it, and it has attempts remaining (`run.max_attempts`)
+- no previous run delivered a PR for it, and it is not currently backing off after a failure
+  (`run.retry_backoff`)
 - no open pull request already closes it
 
 Labels mirror the state (`agent-working` → `agent-done` / `agent-failed`), but the SQLite claim
@@ -159,8 +160,15 @@ flight at a time), controlled by `run.max_concurrent_repos`.
 7. **Cleanup** — the worktree is removed (kept on disk if `workspace.keep_failed` and the run
    failed, for post-mortem). The claim is always released, on every exit path.
 
-Failures retry up to `run.max_attempts`, starting one rung lower on the `models.json` ladder each
-time. A usage limit hit mid-run does **not** consume an attempt.
+Failures are retried indefinitely behind an exponential back-off: `run.retry_backoff` after the
+first failure, doubling with each consecutive one, capped at `run.retry_backoff_max`. Each attempt
+starts one rung lower on the `models.json` ladder, wrapping back to the top once the ladder has been
+walked. **Nothing is abandoned for failing too often** — an issue that keeps failing gets slower, not
+dropped, so it is never left stale. The trigger label remains the only thing that decides whether an
+issue is worked at all: remove `agent-ready` to stop the retries.
+
+A usage limit hit mid-run is recorded as `deferred` — neither an attempt nor a failure, so it
+neither extends the back-off nor drops the issue down the ladder.
 
 ## Configuration reference
 
@@ -191,10 +199,11 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
   },
   "run": {
     "max_concurrent_repos": 3,
-    "max_attempts": 2,
     "timeout": "45m",
     "lease": "90m",
-    "verify_timeout": "10m"
+    "verify_timeout": "10m",
+    "retry_backoff": "15m",
+    "retry_backoff_max": "24h"
   },
   "claude": {
     "binary": "claude",
@@ -236,7 +245,8 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `workspace.logs_root`                                  | where JSONL run transcripts are written                                                                                            |
 | `workspace.keep_failed`                                | keep a failed run's worktree on disk for inspection instead of deleting it                                                         |
 | `run.max_concurrent_repos`                             | how many repos can have work in flight simultaneously                                                                              |
-| `run.max_attempts`                                     | retries per issue before it's marked `agent-failed` and abandoned                                                                  |
+| `run.retry_backoff`                                    | wait before a failed issue may be claimed again; doubles with each consecutive failure                                             |
+| `run.retry_backoff_max`                                | cap on that doubling; must be `>= run.retry_backoff`                                                                               |
 | `run.timeout`                                          | wall-clock limit for one Claude invocation                                                                                         |
 | `run.lease`                                            | how long a claim is held before it's considered abandoned; **must exceed `run.timeout`**, or a still-running claim could be stolen |
 | `run.verify_timeout`                                   | wall-clock limit for the test command                                                                                              |
@@ -289,7 +299,8 @@ hardcoded in Go — this file is the only place to update one.
 - `priority` — lower runs first within a role. The head of the priority-ordered list for a role
   becomes `--model`; the rest become `--fallback-model a,b,...`.
 - A model that fails or hits a limit is put on a 30-minute cooldown, so the next attempt starts
-  lower on the ladder. Retries also start one rung lower than the attempt before them. If every
+  lower on the ladder. Retries also start one rung lower than the attempt before them, wrapping
+  back to the head once the ladder has been walked, since retries are unbounded. If every
   candidate is cooled down, the full ladder is used anyway — refusing to run at all is worse; the
   usage gate is the real brake.
 
