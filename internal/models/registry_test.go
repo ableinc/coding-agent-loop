@@ -121,6 +121,33 @@ func TestResolveMatchesDatedAndCanonicalIDs(t *testing.T) {
 	}
 }
 
+// A binary shipped without the rest of the repo has nothing at the default
+// path, so Load must fall back to the ladder embedded at build time rather
+// than failing outright.
+func TestLoadFallsBackToEmbeddedDefaultWhenFileMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	reg, err := Load(missing)
+	if err != nil {
+		t.Fatalf("load should fall back to the embedded default, got: %v", err)
+	}
+	if len(reg.Ladder(RoleImplement, nil)) == 0 {
+		t.Fatal("embedded default should produce a usable implement ladder")
+	}
+}
+
+// A file present at path is the whole point of letting an operator customize
+// the ladder without rebuilding — it must win over the embedded default.
+func TestLoadPrefersFileOverEmbeddedDefault(t *testing.T) {
+	reg, err := Load(writeModels(t, `{"models":[{"id":"custom-model","alias":"custom","roles":["implement"],"priority":1}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ladder := reg.Ladder(RoleImplement, nil)
+	if len(ladder) != 1 || ladder[0].ID != "custom-model" {
+		t.Fatalf("file on disk should override the embedded default, got %+v", ladder)
+	}
+}
+
 func TestValidationRejectsBadRegistries(t *testing.T) {
 	tests := map[string]string{
 		"no models":         `{"models":[]}`,

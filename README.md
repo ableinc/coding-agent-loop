@@ -268,6 +268,12 @@ hardcoded in Go — this file is the only place to update one.
   candidate is cooled down, the full ladder is used anyway — refusing to run at all is worse; the
   usage gate is the real brake.
 
+The content above is also **embedded in the binary** (`internal/models/default.json`) as of build
+time, so a `coding-agent-loop` binary copied to a host on its own — no repo checkout, no
+`models.json` alongside it — still boots with a working ladder. A `models.json` at `models_path`
+(default `./models.json`, next to wherever the binary runs from) always takes precedence when
+present, so you can still customize the ladder on a given host without rebuilding.
+
 ## When it stops
 
 The loop runs around the clock and stops for exactly two reasons:
@@ -390,7 +396,7 @@ curl localhost:8787/status            # gate/run state (from the host, not the s
 |---|---|
 | `cmd/agent.go` | flags, boot checks, wiring |
 | `internal/config` | configuration load and validation |
-| `internal/models` | models.json, ladder selection |
+| `internal/models` | models.json, ladder selection, embedded default ladder |
 | `internal/store` | SQLite: claims, runs, gates, events |
 | `internal/gh` | GitHub CLI wrapper |
 | `internal/git` | clones and worktrees |
