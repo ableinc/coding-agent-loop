@@ -346,39 +346,56 @@ user can. What constrains it:
 - Child processes run in their own process group and are killed as a group on timeout, so a
   runaway grandchild (a stray build/test process) can't outlive the run.
 
-Run it as a dedicated unix user, not your own — `--install` below does this for you.
+`--install` below scopes the systemd unit's filesystem access to `/opt/coding-agent-loop` and its
+own `~/.agent-loop` regardless of which account it runs as (see
+[Deploying with systemd](#deploying-with-systemd) for why that's normally your own account, not a
+separate one).
 
 ## Deploying with systemd
 
-The unit file is embedded in the binary — `internal/install/coding-agent-loop.service` is its only source,
-compiled in via `go:embed`. Two ways to use it:
+The unit is a template embedded in the binary — `internal/install/coding-agent-loop.service` is its
+only source, compiled in via `go:embed`. `--install` renders it against whichever account will
+actually run the service, then writes, enables, and starts it.
 
 ```sh
 sudo bin/coding-agent-loop --install --config config.json
 ```
 
+**Run this via `sudo` from your own already-authenticated account** (the one with `gh auth login`
+and Claude Code already logged in) — not as a `root` login shell. `--install` reads `$SUDO_USER`,
+which `sudo` sets to the account that invoked it, and runs the service as *that* account. This
+matters because gh and Claude Code store their auth per-user (`~/.config/gh`,
+`~/.claude/.credentials.json`); a service running as anyone else has no credentials to use, which
+surfaces as `claude binary "claude" is not on PATH` or `gh is not authenticated` in the journal even
+when both work fine interactively.
+
 `--install` (root required):
 
-1. creates the `coding-agent-loop` system user if it doesn't exist (no login shell, its own home);
+1. resolves the target account from `$SUDO_USER` (falling back to creating an isolated
+   `coding-agent-loop` system user only if there is no `$SUDO_USER` — e.g. already logged in as
+   root — in which case you must separately run `sudo -u coding-agent-loop gh auth login` and the
+   Claude Code login flow before the service can do anything);
 2. copies the running binary to `/opt/coding-agent-loop/bin/coding-agent-loop`;
 3. copies `--config` to `/opt/coding-agent-loop/config.json` — **never** overwriting one already there;
-4. writes `/etc/systemd/system/coding-agent-loop.service`;
+4. writes `/etc/systemd/system/coding-agent-loop.service` with `User=`/`Group=` set to that account;
 5. runs `systemctl daemon-reload` then `enable --now coding-agent-loop.service`;
 6. confirms the unit reached `active`.
 
 Re-running it is safe: it replaces the binary but leaves an existing config untouched.
 
 ```sh
-bin/coding-agent-loop --print-service   # print the embedded unit, e.g. to review before installing
+bin/coding-agent-loop --print-service   # print the unit --install would write, e.g. run as yourself
 ```
 
-`--print-service` needs no privileges; it just writes the exact unit `--install` would use to stdout.
+`--print-service` needs no privileges; it renders the unit for whichever account would be resolved
+right now (also honoring `$SUDO_USER` if set) and writes it to stdout, so you can check who it would
+run as before committing to `--install`.
 
 The unit itself: `Type=simple`, restarts on failure, `KillSignal=SIGTERM` with
 `TimeoutStopSec=50m` (longer than one run timeout, so a SIGTERM drains in-flight work instead of
 killing it mid-push), and hardened with `ProtectSystem=strict`, `ProtectHome=read-only`,
-`NoNewPrivileges=true`, and `ReadWritePaths` scoped to `/opt/coding-agent-loop` and the service user's
-`~/.agent-loop`.
+`NoNewPrivileges=true`, and `ReadWritePaths` scoped to `/opt/coding-agent-loop` and the service
+account's own `~/.agent-loop`.
 
 Common operations once installed:
 

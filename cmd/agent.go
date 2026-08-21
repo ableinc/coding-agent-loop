@@ -74,11 +74,16 @@ func main() {
 	flag.BoolVar(&f.noServer, "no-server", false, "do not start the control API")
 	flag.BoolVar(&f.checkOnly, "check", false, "run start-up checks and exit")
 	flag.BoolVar(&f.install, "install", false, "install the systemd unit (embedded in this binary), enable it, and start it; must run as root")
-	flag.BoolVar(&f.printUnit, "print-service", false, "print the embedded systemd unit file and exit")
+	flag.BoolVar(&f.printUnit, "print-service", false, "print the systemd unit --install would write and exit")
 	flag.Parse()
 
 	if f.printUnit {
-		os.Stdout.Write(install.ServiceUnit)
+		unit, err := install.PreviewUnit()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "coding-agent-loop: %v\n", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(unit)
 		return
 	}
 

@@ -1,8 +1,15 @@
 // Package install lays down the systemd unit for coding-agent-loop and starts
-// it. The unit file is embedded in the binary, so the paths in it
-// (/opt/coding-agent-loop, the coding-agent-loop user) are the contract this
-// package installs against — Run does not template the unit, it makes the
-// host match it.
+// it. The unit template is embedded in the binary and rendered against
+// whichever account should run the service.
+//
+// gh and Claude Code store their auth under the account that logged into
+// them (~/.config/gh, ~/.claude/.credentials.json), so the service must run
+// as that same account or it authenticates as nobody. When --install is run
+// via `sudo`, SUDO_USER names that account and Run uses it directly. Only
+// when there is no SUDO_USER (already logged in as root, e.g. in a
+// container) does this fall back to creating a fresh, isolated system user —
+// which then needs its own `gh auth login` / Claude Code login before the
+// service can do anything.
 package install
 
 import (
@@ -13,18 +20,66 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 //go:embed coding-agent-loop.service
-var ServiceUnit []byte
+var serviceTemplate []byte
 
 const (
-	unitPath    = "/etc/systemd/system/coding-agent-loop.service"
-	installRoot = "/opt/coding-agent-loop"
-	serviceUser = "coding-agent-loop"
-	serviceHome = "/home/coding-agent-loop"
-	binaryName  = "coding-agent-loop"
+	unitPath      = "/etc/systemd/system/coding-agent-loop.service"
+	installRoot   = "/opt/coding-agent-loop"
+	binaryName    = "coding-agent-loop"
+	dedicatedUser = "coding-agent-loop"
+	dedicatedHome = "/home/coding-agent-loop"
 )
+
+// target is the account the systemd unit will run as.
+type target struct {
+	user, group, home string
+	uid, gid          int
+	// dedicated is true when target is a fresh system user Run must create;
+	// false when it is an existing, already-authenticated account.
+	dedicated bool
+}
+
+// resolveTarget decides who the service should run as. It does not require
+// root and makes no changes, so it is also used by PreviewUnit.
+func resolveTarget() (target, error) {
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+		u, err := user.Lookup(sudoUser)
+		if err != nil {
+			return target{}, fmt.Errorf("look up SUDO_USER %q: %w", sudoUser, err)
+		}
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+		group := sudoUser
+		if g, err := user.LookupGroupId(u.Gid); err == nil {
+			group = g.Name
+		}
+		return target{user: u.Username, group: group, home: u.HomeDir, uid: uid, gid: gid}, nil
+	}
+	// No SUDO_USER: fall back to a dedicated, isolated system user. Its
+	// uid/gid are not known until ensureServiceUser creates it, so Run
+	// resolves them separately in that path.
+	return target{user: dedicatedUser, group: dedicatedUser, home: dedicatedHome, dedicated: true}, nil
+}
+
+func render(t target) []byte {
+	r := strings.NewReplacer("{{USER}}", t.user, "{{GROUP}}", t.group, "{{HOME}}", t.home)
+	return []byte(r.Replace(string(serviceTemplate)))
+}
+
+// PreviewUnit renders the unit for whichever account --install would use
+// right now, without requiring root or making any changes.
+func PreviewUnit() ([]byte, error) {
+	t, err := resolveTarget()
+	if err != nil {
+		return nil, err
+	}
+	return render(t), nil
+}
 
 // Options controls what Run copies into place before it writes the unit.
 type Options struct {
@@ -36,7 +91,7 @@ type Options struct {
 }
 
 // Run installs the systemd unit and starts it. It must run as root, since it
-// creates a system user, writes into /etc and /opt, and calls systemctl.
+// writes into /etc and /opt and calls systemctl.
 func Run(opts Options) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("--install must run as root (try: sudo %s --install)", os.Args[0])
@@ -46,17 +101,35 @@ func Run(opts Options) error {
 		log = func(string, ...any) {}
 	}
 
-	if err := ensureServiceUser(log); err != nil {
-		return fmt.Errorf("create service user: %w", err)
+	t, err := resolveTarget()
+	if err != nil {
+		return err
 	}
+
+	if t.dedicated {
+		log("no SUDO_USER in the environment; creating an isolated service user",
+			"user", t.user)
+		uid, gid, err := ensureServiceUser(log)
+		if err != nil {
+			return fmt.Errorf("create service user: %w", err)
+		}
+		t.uid, t.gid = uid, gid
+		log("remember: this user has no gh/claude auth of its own yet",
+			"next_step", fmt.Sprintf("sudo -u %s gh auth login", t.user))
+	} else {
+		log("running as the invoking user, since that account already has gh/claude auth",
+			"user", t.user)
+	}
+
 	if err := os.MkdirAll(filepath.Join(installRoot, "bin"), 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", installRoot, err)
 	}
-	if err := os.MkdirAll(filepath.Join(serviceHome, ".agent-loop"), 0o755); err != nil {
-		return fmt.Errorf("create %s/.agent-loop: %w", serviceHome, err)
+	agentDir := filepath.Join(t.home, ".agent-loop")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", agentDir, err)
 	}
-	if err := chownToService(filepath.Join(serviceHome, ".agent-loop")); err != nil {
-		return fmt.Errorf("chown %s/.agent-loop: %w", serviceHome, err)
+	if err := os.Chown(agentDir, t.uid, t.gid); err != nil {
+		return fmt.Errorf("chown %s: %w", agentDir, err)
 	}
 
 	binDest := filepath.Join(installRoot, "bin", binaryName)
@@ -66,14 +139,14 @@ func Run(opts Options) error {
 	log("binary installed", "path", binDest)
 
 	cfgDest := filepath.Join(installRoot, "config.json")
-	if err := installConfig(opts.ConfigPath, cfgDest, log); err != nil {
+	if err := installConfig(opts.ConfigPath, cfgDest, t, log); err != nil {
 		return fmt.Errorf("install config: %w", err)
 	}
 
-	if err := os.WriteFile(unitPath, ServiceUnit, 0o644); err != nil {
+	if err := os.WriteFile(unitPath, render(t), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", unitPath, err)
 	}
-	log("unit installed", "path", unitPath)
+	log("unit installed", "path", unitPath, "run_as", t.user)
 
 	if err := runSystemctl(log, "daemon-reload"); err != nil {
 		return err
@@ -88,41 +161,34 @@ func Run(opts Options) error {
 	return nil
 }
 
-func ensureServiceUser(log func(string, ...any)) error {
-	if _, err := user.Lookup(serviceUser); err == nil {
-		return nil
-	}
-	if _, err := exec.LookPath("useradd"); err != nil {
-		return fmt.Errorf("user %q does not exist and `useradd` is not available; create it manually", serviceUser)
-	}
-	log("creating service user", "user", serviceUser)
-	cmd := exec.Command("useradd",
-		"--system",
-		"--home-dir", serviceHome,
-		"--create-home",
-		"--shell", "/usr/sbin/nologin",
-		serviceUser,
-	)
-	out, err := cmd.CombinedOutput()
+// ensureServiceUser creates the dedicated system user used when there is no
+// SUDO_USER to run as, and returns its uid/gid.
+func ensureServiceUser(log func(string, ...any)) (uid, gid int, err error) {
+	u, err := user.Lookup(dedicatedUser)
 	if err != nil {
-		return fmt.Errorf("useradd: %w: %s", err, out)
+		if _, lookErr := exec.LookPath("useradd"); lookErr != nil {
+			return 0, 0, fmt.Errorf("user %q does not exist and `useradd` is not available; create it manually", dedicatedUser)
+		}
+		log("creating service user", "user", dedicatedUser)
+		cmd := exec.Command("useradd",
+			"--system",
+			"--home-dir", dedicatedHome,
+			"--create-home",
+			"--shell", "/usr/sbin/nologin",
+			dedicatedUser,
+		)
+		out, cmdErr := cmd.CombinedOutput()
+		if cmdErr != nil {
+			return 0, 0, fmt.Errorf("useradd: %w: %s", cmdErr, out)
+		}
+		u, err = user.Lookup(dedicatedUser)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
-	return nil
-}
-
-func chownToService(path string) error {
-	u, err := user.Lookup(serviceUser)
-	if err != nil {
-		return err
-	}
-	var uid, gid int
-	if _, err := fmt.Sscanf(u.Uid, "%d", &uid); err != nil {
-		return err
-	}
-	if _, err := fmt.Sscanf(u.Gid, "%d", &gid); err != nil {
-		return err
-	}
-	return os.Chown(path, uid, gid)
+	uid, _ = strconv.Atoi(u.Uid)
+	gid, _ = strconv.Atoi(u.Gid)
+	return uid, gid, nil
 }
 
 // copySelf copies the currently running binary to dest, since that is the
@@ -161,7 +227,7 @@ func copySelf(dest string) error {
 
 // installConfig copies configPath to dest unless dest already exists — an
 // operator's live config must never be clobbered by a re-run of --install.
-func installConfig(configPath, dest string, log func(string, ...any)) error {
+func installConfig(configPath, dest string, t target, log func(string, ...any)) error {
 	if _, err := os.Stat(dest); err == nil {
 		log("config already present, leaving it untouched", "path", dest)
 		return nil
@@ -178,7 +244,7 @@ func installConfig(configPath, dest string, log func(string, ...any)) error {
 	if err := os.WriteFile(dest, data, 0o640); err != nil {
 		return err
 	}
-	if err := chownToService(dest); err != nil {
+	if err := os.Chown(dest, t.uid, t.gid); err != nil {
 		return err
 	}
 	log("config installed", "path", dest)

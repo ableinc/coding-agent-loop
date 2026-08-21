@@ -17,13 +17,14 @@ KillSignal=SIGTERM
 TimeoutStopSec=50m
 
 # The agent runs Claude Code with bypassPermissions against host worktrees, so
-# it can do anything this user can. Run it as its own user with nothing else in
-# its home, and keep the rest of the filesystem read-only.
-User=coding-agent-loop
-Group=coding-agent-loop
+# it can do anything this user can. It runs as {{USER}} because gh and Claude
+# Code store their auth under that account's home — a different user has no
+# credentials to use. Keep the rest of the filesystem read-only.
+User={{USER}}
+Group={{GROUP}}
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/coding-agent-loop /home/coding-agent-loop/.agent-loop
+ReadWritePaths=/opt/coding-agent-loop {{HOME}}/.agent-loop
 PrivateTmp=true
 NoNewPrivileges=true
 
