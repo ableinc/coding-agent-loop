@@ -524,3 +524,74 @@ func TestExistingRunSessionsAreBackfilled(t *testing.T) {
 		t.Fatalf("existing sessions should be carried over, got %+v", sessions)
 	}
 }
+
+func TestPlanSaveAndOverwrite(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	body, err := st.LatestPlan(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatalf("latest plan for unseen issue: %v", err)
+	}
+	if body != "" {
+		t.Fatalf("unseen issue should have no plan, got %q", body)
+	}
+
+	if err := st.SavePlan(ctx, "o/r", 5, "run-1", "## Plan\nfirst draft"); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+	body, err = st.LatestPlan(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "## Plan\nfirst draft" {
+		t.Fatalf("plan body = %q", body)
+	}
+
+	// A re-plan overwrites rather than accumulating: only the latest plan
+	// matters to an implement run or the next re-plan.
+	if err := st.SavePlan(ctx, "o/r", 5, "run-2", "## Plan\nrevised"); err != nil {
+		t.Fatalf("overwrite plan: %v", err)
+	}
+	body, err = st.LatestPlan(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "## Plan\nrevised" {
+		t.Fatalf("plan should be overwritten, got %q", body)
+	}
+}
+
+func TestStatusPlannedIsTerminalButNotSuccessOrFailure(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if !IsTerminal(StatusPlanned) {
+		t.Fatal("planned must be a terminal status")
+	}
+
+	if err := st.CreateRun(ctx, Run{ID: "p1", Repo: "o/r", Issue: 7, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetRunStatus(ctx, "p1", StatusPlanned); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetRun(ctx, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EndedAt.IsZero() {
+		t.Fatal("terminal status should stamp ended_at")
+	}
+
+	hist, err := st.IssueHistory(ctx, "o/r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Succeeded {
+		t.Fatal("a planned run must not count as delivering a PR")
+	}
+	if hist.Failures != 0 {
+		t.Fatalf("a planned run must not count as a failure, got %d", hist.Failures)
+	}
+}

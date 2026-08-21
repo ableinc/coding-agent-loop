@@ -26,6 +26,7 @@ var defaultModelsJSON []byte
 // Roles a model may be used for.
 const (
 	RoleTriage    = "triage"
+	RolePlan      = "plan"
 	RoleImplement = "implement"
 )
 
@@ -109,15 +110,18 @@ func (r *Registry) Validate() error {
 		seen[m.ID] = true
 		for _, role := range m.Roles {
 			switch strings.ToLower(role) {
-			case RoleTriage, RoleImplement:
+			case RoleTriage, RolePlan, RoleImplement:
 			default:
-				return fmt.Errorf("models[%d] (%s): unknown role %q (want %q or %q)",
-					i, m.ID, role, RoleTriage, RoleImplement)
+				return fmt.Errorf("models[%d] (%s): unknown role %q (want %q, %q, or %q)",
+					i, m.ID, role, RoleTriage, RolePlan, RoleImplement)
 			}
 		}
 	}
 	if len(r.forRole(RoleImplement)) == 0 {
 		return fmt.Errorf("no model serves the %q role, so no work could ever run", RoleImplement)
+	}
+	if len(r.forRole(RolePlan)) == 0 {
+		return fmt.Errorf("no model serves the %q role, so no plan could ever be produced", RolePlan)
 	}
 	return nil
 }

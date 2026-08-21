@@ -16,8 +16,8 @@ func writeModels(t *testing.T, body string) string {
 }
 
 const goodModels = `{"models":[
-	{"id":"claude-opus-5","alias":"opus","roles":["implement"],"priority":1},
-	{"id":"claude-sonnet-5","alias":"sonnet","roles":["implement"],"priority":2},
+	{"id":"claude-opus-5","alias":"opus","roles":["plan","implement"],"priority":1},
+	{"id":"claude-sonnet-5","alias":"sonnet","roles":["plan","implement"],"priority":2},
 	{"id":"claude-haiku-4-5","alias":"haiku","roles":["triage"],"priority":1}
 ]}`
 
@@ -48,6 +48,11 @@ func TestLoadAndLadderOrder(t *testing.T) {
 
 	if triage := reg.Ladder(RoleTriage, nil); len(triage) != 1 || triage[0].ID != "claude-haiku-4-5" {
 		t.Fatalf("triage ladder wrong: %+v", triage)
+	}
+
+	plan := reg.Ladder(RolePlan, nil)
+	if len(plan) != 2 || plan[0].ID != "claude-opus-5" || plan[1].ID != "claude-sonnet-5" {
+		t.Fatalf("plan ladder wrong: %+v", plan)
 	}
 }
 
@@ -138,7 +143,7 @@ func TestLoadFallsBackToEmbeddedDefaultWhenFileMissing(t *testing.T) {
 // A file present at path is the whole point of letting an operator customize
 // the ladder without rebuilding — it must win over the embedded default.
 func TestLoadPrefersFileOverEmbeddedDefault(t *testing.T) {
-	reg, err := Load(writeModels(t, `{"models":[{"id":"custom-model","alias":"custom","roles":["implement"],"priority":1}]}`))
+	reg, err := Load(writeModels(t, `{"models":[{"id":"custom-model","alias":"custom","roles":["plan","implement"],"priority":1}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +160,7 @@ func TestValidationRejectsBadRegistries(t *testing.T) {
 		"duplicate id":      `{"models":[{"id":"a","roles":["implement"]},{"id":"a","roles":["implement"]}]}`,
 		"unknown role":      `{"models":[{"id":"a","roles":["deploy"]}]}`,
 		"no implement role": `{"models":[{"id":"a","roles":["triage"]}]}`,
+		"no plan role":      `{"models":[{"id":"a","roles":["implement"]}]}`,
 		"unknown field":     `{"models":[{"id":"a"}],"extra":true}`,
 	}
 	for name, body := range tests {

@@ -30,6 +30,10 @@ Working context:
 - Branch: %s (already created and checked out for you)
 - Worktree: %s
 
+A human has already reviewed and approved the plan for this change (see the
+"Approved plan" section of the task below). Follow it; do not re-litigate its
+scope.
+
 The harness, not you, owns version control and GitHub. Specifically:
 - Do NOT run git push, git rebase, git reset --hard, or any force operation.
 - Do NOT create branches, tags, pull requests, or issue comments.
@@ -46,19 +50,52 @@ Scope rules:
 Autonomy:
 - Nobody is watching and nobody can answer a question mid-task. Do not ask for
   confirmation and do not end your turn with a proposal or a plan you did not carry out.
-- If the issue is genuinely ambiguous, choose the most reasonable reading, implement it,
-  and state the assumption in your final message.
+- If the plan turns out to be wrong once you're in the code, deviate only where it is
+  demonstrably wrong, and say so plainly in your final summary.
 - If you conclude the change should not be made, make no edits and explain why.
 
 Finish with a short summary: what you changed, which files, and anything a reviewer
 should look at closely.`, repo, branch, worktree)
 }
 
-// taskPrompt renders the issue into the actual instruction.
-func taskPrompt(repo string, issue gh.Issue) string {
+// planSystemPrompt states the rules for the read-only planning pass: produce
+// a plan, do not touch the repository.
+func planSystemPrompt(repo, worktree string) string {
+	return fmt.Sprintf(`You are running unattended as an automated planning agent.
+
+Working context:
+- Repository: %s
+- Worktree (read-only checkout for reference): %s
+
+Your only job is to produce a plan for the change described below. Do NOT edit any
+files, do NOT run git commands, and do NOT create branches, commits, or pull requests.
+Read whatever parts of the repository you need in order to write a concrete plan.
+
+Autonomy:
+- Nobody is watching and nobody can answer a question mid-task. Do not ask for
+  confirmation.
+- If the issue is genuinely ambiguous, choose the most reasonable reading and
+  say so in the plan, rather than stalling on it.
+
+Your final message IS the plan. Write it in markdown, and make it concrete:
+- Name the actual files you would change and, where relevant, the functions or
+  helpers already in the repository that the change should reuse.
+- Describe the approach step by step, in enough detail that a reviewer can judge it
+  without reading the code themselves.
+- Call out anything risky, ambiguous, or that needs a design decision from the
+  reviewer before implementation starts.
+
+Do not implement anything. Do not include a preamble like "Here is my plan" — the
+final message should be the plan itself, headed by a short one-line summary of the
+change.`, repo, worktree)
+}
+
+// issueContext renders the issue itself: title, labels, description, and
+// recent discussion. Shared by the plan and implement prompts so the two
+// phases see the same view of the issue.
+func issueContext(repo string, issue gh.Issue) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "Implement the change requested by GitHub issue #%d in %s.\n\n", issue.Number, repo)
 	fmt.Fprintf(&b, "## Issue #%d: %s\n\n", issue.Number, issue.Title)
 	if issue.URL != "" {
 		fmt.Fprintf(&b, "<%s>\n\n", issue.URL)
@@ -90,6 +127,49 @@ func taskPrompt(repo string, issue gh.Issue) string {
 			}
 			fmt.Fprintf(&b, "**@%s**: %s\n\n", author, truncate(strings.TrimSpace(c.Body), maxCommentChars))
 		}
+	}
+
+	return b.String()
+}
+
+// planTaskPrompt renders the issue into a planning instruction. When
+// previousPlan is non-empty, this is a re-plan: the model is told to revise
+// it against the newest feedback rather than starting from scratch.
+func planTaskPrompt(repo string, issue gh.Issue, previousPlan string) string {
+	var b strings.Builder
+
+	if previousPlan == "" {
+		fmt.Fprintf(&b, "Write a plan for the change requested by GitHub issue #%d in %s.\n\n", issue.Number, repo)
+	} else {
+		fmt.Fprintf(&b, "Revise the plan for GitHub issue #%d in %s.\n\n", issue.Number, repo)
+	}
+	b.WriteString(issueContext(repo, issue))
+
+	if previousPlan != "" {
+		b.WriteString("\n### Previous plan\n\n")
+		b.WriteString(previousPlan)
+		b.WriteString("\n\nA reviewer replied with feedback (see the newest comment in the discussion above) " +
+			"instead of approving this plan. Revise the plan to address it; keep whatever still holds.\n")
+	}
+
+	b.WriteString("\nRead the relevant parts of the repository, then write the plan.\n")
+	return b.String()
+}
+
+// implementTaskPrompt renders the issue and its approved plan into the
+// implementation instruction.
+func implementTaskPrompt(repo string, issue gh.Issue, plan string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Implement the change requested by GitHub issue #%d in %s.\n\n", issue.Number, repo)
+	b.WriteString(issueContext(repo, issue))
+
+	if plan != "" {
+		b.WriteString("\n### Approved plan\n\n")
+		b.WriteString("A human reviewed and approved the following plan. Follow it; deviate only where it is " +
+			"demonstrably wrong, and say so in your final summary.\n\n")
+		b.WriteString(plan)
+		b.WriteString("\n")
 	}
 
 	b.WriteString("\nRead the relevant parts of the repository before editing, then make the change.\n")

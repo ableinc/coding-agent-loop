@@ -53,10 +53,12 @@ type Config struct {
 type GitHubConfig struct {
 	// Label is the opt-in label an issue must carry to be picked up.
 	Label string `json:"label"`
-	// WorkingLabel/DoneLabel/FailedLabel mirror run state onto the issue.
+	// WorkingLabel/DoneLabel/FailedLabel/PlanLabel mirror run state onto the issue.
 	WorkingLabel string `json:"working_label"`
 	DoneLabel    string `json:"done_label"`
 	FailedLabel  string `json:"failed_label"`
+	// PlanLabel marks an issue that has a plan comment awaiting human approval.
+	PlanLabel string `json:"plan_label"`
 	// Owners scopes discovery. Empty means "every repo the token can see",
 	// which is broad — prefer naming the orgs/users you actually want.
 	Owners []string `json:"owners"`
@@ -106,6 +108,9 @@ type ClaudeConfig struct {
 	Binary         string   `json:"binary"`
 	PermissionMode string   `json:"permission_mode"`
 	ExtraArgs      []string `json:"extra_args"`
+	// PlanPermissionMode governs the read-only planning run, distinct from the
+	// implement run's PermissionMode.
+	PlanPermissionMode string `json:"plan_permission_mode"`
 	// UsagePollInterval throttles the OAuth usage endpoint, which rate-limits
 	// hard. Do not lower this below a few minutes.
 	UsagePollInterval Duration `json:"usage_poll_interval"`
@@ -151,6 +156,7 @@ func Default() Config {
 			WorkingLabel: "agent-working",
 			DoneLabel:    "agent-done",
 			FailedLabel:  "agent-failed",
+			PlanLabel:    "agent-planned",
 			SearchLimit:  50,
 			PollInterval: Duration(5 * time.Minute),
 			Binary:       "gh",
@@ -171,12 +177,13 @@ func Default() Config {
 			RetryBackoffMax:    Duration(24 * time.Hour),
 		},
 		Claude: ClaudeConfig{
-			Binary:            "claude",
-			PermissionMode:    "bypassPermissions",
-			UsagePollInterval: Duration(15 * time.Minute),
-			UsageBackoff:      Duration(15 * time.Minute),
-			CredentialsPath:   "~/.claude/.credentials.json",
-			UsageCachePath:    "~/.agent-loop/usage-cache.json",
+			Binary:             "claude",
+			PermissionMode:     "bypassPermissions",
+			PlanPermissionMode: "plan",
+			UsagePollInterval:  Duration(15 * time.Minute),
+			UsageBackoff:       Duration(15 * time.Minute),
+			CredentialsPath:    "~/.claude/.credentials.json",
+			UsageCachePath:     "~/.agent-loop/usage-cache.json",
 		},
 		Verify:  VerifyConfig{AutoDetect: true, Commands: map[string]string{}},
 		Server:  ServerConfig{Addr: "127.0.0.1:8787"},

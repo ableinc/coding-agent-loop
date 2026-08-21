@@ -271,6 +271,25 @@ func (n *Notifier) PROpened(r RunRef, prURL string, res *claude.Result, v verify
 	})
 }
 
+// PlanPosted reports that a plan was posted for human review and the run is
+// now waiting on an "implement" reply.
+func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duration) {
+	model, cost := "", 0.0
+	if res != nil {
+		model, cost = res.PrimaryModel(), res.TotalCostUSD
+	}
+	n.post(embed{
+		Title:       r.title("Plan posted, awaiting approval"),
+		Description: "Reply `implement` on the issue to start the change.",
+		Color:       colorBlurple,
+		Fields: append(r.fields(),
+			embedField{Name: "Model", Value: orNone(model), Inline: true},
+			embedField{Name: "Cost", Value: money(cost), Inline: true},
+			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
+		),
+	})
+}
+
 // RunFailed reports a failed run and when it will be tried again. Retries are
 // unbounded, so "when" is the useful number, not "how many are left".
 func (n *Notifier) RunFailed(r RunRef, cause string, nextAttempt time.Time) {

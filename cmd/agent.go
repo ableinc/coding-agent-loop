@@ -272,15 +272,19 @@ func bootCheck(cfg config.Config, registry *models.Registry, ghClient *gh.Client
 		return fmt.Errorf("start-up checks failed:\n  - %s", strings.Join(problems, "\n  - "))
 	}
 
-	ladder := registry.Ladder(models.RoleImplement, nil)
-	refs := make([]string, 0, len(ladder))
-	for _, m := range ladder {
-		refs = append(refs, m.ID)
+	ladderRefs := func(role string) string {
+		ladder := registry.Ladder(role, nil)
+		refs := make([]string, 0, len(ladder))
+		for _, m := range ladder {
+			refs = append(refs, m.ID)
+		}
+		return strings.Join(refs, " > ")
 	}
 	log.Info("start-up checks passed",
 		"label", cfg.GitHub.Label,
 		"owners", strings.Join(cfg.GitHub.Owners, ","),
-		"implement_ladder", strings.Join(refs, " > "),
+		"plan_ladder", ladderRefs(models.RolePlan),
+		"implement_ladder", ladderRefs(models.RoleImplement),
 		"store", cfg.Store.Path)
 	return nil
 }
