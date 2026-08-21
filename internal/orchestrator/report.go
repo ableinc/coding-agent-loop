@@ -76,6 +76,8 @@ func prBody(r prReport) string {
 // issueComment is the short note left on the issue when a PR is opened.
 func issueComment(prURL, runID string, v verify.Result) string {
 	var b strings.Builder
+	b.WriteString(markerPR)
+	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "Opened a draft pull request for this issue: %s\n\n", prURL)
 	switch v.Status {
 	case store.VerifyPassed:
@@ -94,6 +96,8 @@ func issueComment(prURL, runID string, v verify.Result) string {
 // says what actually stops the retries: taking the trigger label off.
 func failureComment(runID string, attempt int, reason string, nextAttempt time.Time, triggerLabel string) string {
 	var b strings.Builder
+	b.WriteString(markerFailure)
+	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "The coding agent could not complete this issue (attempt %d).\n\n", attempt)
 	b.WriteString("```\n")
 	b.WriteString(strings.TrimSpace(reason))
@@ -106,5 +110,23 @@ func failureComment(runID string, attempt int, reason string, nextAttempt time.T
 	}
 	fmt.Fprintf(&b, " Remove the `%s` label to stop it retrying.\n", triggerLabel)
 	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
+	return b.String()
+}
+
+// maxPlanCommentChars keeps a plan comment under GitHub's ~65536-character
+// comment body limit, leaving room for the marker and footer.
+const maxPlanCommentChars = 60000
+
+// planComment is what gets posted after a planning run: the plan itself, and
+// instructions for how a human moves the issue forward.
+func planComment(plan, runID, modelID string, costUSD float64) string {
+	var b strings.Builder
+	b.WriteString(markerPlan)
+	b.WriteString("\n\n## Plan\n\n")
+	b.WriteString(truncate(strings.TrimSpace(plan), maxPlanCommentChars))
+	b.WriteString("\n\n---\n\n")
+	b.WriteString("Reply with exactly `implement` to approve this plan and start the change. ")
+	b.WriteString("Reply with anything else and the plan will be revised to address it.\n\n")
+	fmt.Fprintf(&b, "<sub>coding-agent-loop run `%s`, model `%s`, cost $%.4f</sub>\n", runID, modelID, costUSD)
 	return b.String()
 }

@@ -29,6 +29,7 @@ const (
 	StatusAbandoned = "abandoned" // terminal, skipped: the issue is not workable as it stands
 	StatusCanceled  = "canceled"  // terminal, operator cancelled
 	StatusDeferred  = "deferred"  // terminal, stopped by the usage gate; not the issue's fault
+	StatusPlanned   = "planned"   // terminal, a plan was posted and awaits human approval
 )
 
 // Verify outcomes recorded on a run.
@@ -48,7 +49,7 @@ const (
 // IsTerminal reports whether a run status is final.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred:
+	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred, StatusPlanned:
 		return true
 	}
 	return false
@@ -235,6 +236,18 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS sessions_run ON sessions(run_id);
 	INSERT OR IGNORE INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
 		SELECT session_id, id, repo, issue, model_id, created_at FROM runs WHERE session_id <> '';`,
+
+	// One plan per issue: the latest plan posted, kept so the implement prompt
+	// can carry it verbatim even though the issue comment itself may have been
+	// truncated when it was read back as discussion.
+	`CREATE TABLE IF NOT EXISTS plans (
+		repo       TEXT NOT NULL,
+		issue      INTEGER NOT NULL,
+		run_id     TEXT NOT NULL,
+		body       TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (repo, issue)
+	);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -636,6 +649,40 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
 	}
 	return st, nil
+}
+
+// --- plans ------------------------------------------------------------------
+
+// SavePlan records the latest plan posted for an issue, overwriting any
+// previous one: only the most recent plan is ever relevant to an implement run
+// or a re-plan.
+func (s *Store) SavePlan(ctx context.Context, repo string, issue int, runID, body string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO plans (repo, issue, run_id, body, created_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(repo, issue) DO UPDATE SET
+			run_id     = excluded.run_id,
+			body       = excluded.body,
+			created_at = excluded.created_at`,
+		repo, issue, runID, body, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("save plan %s#%d: %w", repo, issue, err)
+	}
+	return nil
+}
+
+// LatestPlan returns the most recent plan body for an issue, or "" when none
+// has been recorded.
+func (s *Store) LatestPlan(ctx context.Context, repo string, issue int) (string, error) {
+	var body string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT body FROM plans WHERE repo = ? AND issue = ?`, repo, issue).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("latest plan %s#%d: %w", repo, issue, err)
+	}
+	return body, nil
 }
 
 // --- gate -------------------------------------------------------------------

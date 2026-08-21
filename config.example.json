@@ -4,6 +4,7 @@
     "working_label": "agent-working",
     "done_label": "agent-done",
     "failed_label": "agent-failed",
+    "plan_label": "agent-planned",
     "owners": ["ableinc"],
     "exclude_repos": [],
     "search_limit": 50,
@@ -28,6 +29,7 @@
   "claude": {
     "binary": "claude",
     "permission_mode": "bypassPermissions",
+    "plan_permission_mode": "plan",
     "extra_args": [],
     "usage_poll_interval": "15m",
     "usage_backoff": "15m",

@@ -246,7 +246,12 @@ func (o *Orchestrator) releaseRepo(repo string) {
 	o.mu.Unlock()
 }
 
-// eligible applies the cheap filters before anything is claimed.
+// eligible applies the cheap filters before anything is claimed, then decides
+// the phase from the issue's current comments. An issue waiting on a human
+// (phaseWait) is reported as not eligible, so it costs a fetch but never a
+// claim, a worktree, or a Claude run. execute decides the phase again for
+// itself from a fresh fetch before acting, so the phase decided here is not
+// carried any further.
 func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bool, string) {
 	if o.opts.Config.GitHub.Excluded(repo) {
 		return false, "repo excluded by config"
@@ -278,6 +283,15 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 	if next := o.nextAttemptAt(hist); time.Now().Before(next) {
 		return false, fmt.Sprintf("backing off after %d failed attempt(s), retrying at %s",
 			hist.Failures, next.Format(time.RFC3339))
+	}
+
+	view, err := o.opts.GH.ViewIssue(ctx, repo, issue)
+	if err != nil {
+		o.log.Error("issue view failed", "repo", repo, "issue", issue, "error", err)
+		return false, "issue fetch failed"
+	}
+	if phase, reason := decidePhase(view); phase == phaseWait {
+		return false, reason
 	}
 	return true, ""
 }
@@ -433,6 +447,13 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		return errSkip{"an open pull request already covers this issue: " + existing}
 	}
 
+	// Discovery's phase decision may be stale by the time execution starts;
+	// decide again from the issue fetched just above.
+	phase, phaseReason := decidePhase(issue)
+	if phase == phaseWait {
+		return errSkip{"waiting for approval: " + phaseReason}
+	}
+
 	meta, err := o.repoMetadata(ctx, cand.repo)
 	if err != nil {
 		return fmt.Errorf("repo metadata: %w", err)
@@ -452,19 +473,30 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 	o.event(ctx, runID, "worktree", worktree)
 
-	// Pick the model.
+	// Pick the model. Plan and implement draw from separate ladders.
+	role := models.RoleImplement
+	if phase == phasePlan {
+		role = models.RolePlan
+	}
 	cooled, err := o.opts.Store.CooledDownModels(ctx)
 	if err != nil {
 		log.Warn("cooldown lookup failed, using full ladder", "error", err)
 		cooled = nil
 	}
-	ladder := o.opts.Registry.Ladder(models.RoleImplement, cooled)
+	ladder := o.opts.Registry.Ladder(role, cooled)
 	// On a retry, start one rung lower: the previous attempt already showed the
 	// model above it did not get there. Retries are unbounded, so this wraps
 	// rather than pinning the issue to the weakest model forever — by the time
 	// the ladder has been walked once, the top of it is worth another try.
+	//
+	// This keys off failures, not the attempt number: a successful plan run
+	// also advances the attempt counter, and demoting the implement run that
+	// follows it for that reason would be wrong.
 	if len(ladder) > 0 {
-		if drop := (attempt - 1) % len(ladder); drop > 0 {
+		hist, err := o.opts.Store.IssueHistory(ctx, cand.repo, cand.number)
+		if err != nil {
+			log.Warn("issue history lookup failed, using full ladder", "error", err)
+		} else if drop := hist.Failures % len(ladder); drop > 0 {
 			ladder = ladder[drop:]
 		}
 	}
@@ -480,12 +512,36 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		log.Warn("status update failed", "error", err)
 	}
 	// The outcome labels of an earlier attempt are stale the moment this one
-	// starts, so they go in the same edit that marks the issue as working.
-	o.setLabels(ctx, log, cand, runID,
-		[]string{cfg.GitHub.WorkingLabel},
-		[]string{cfg.GitHub.DoneLabel, cfg.GitHub.FailedLabel})
+	// starts, so they go in the same edit that marks the issue as working. A
+	// plan run additionally clears the previous plan's label: the old plan is
+	// stale the moment a re-plan starts.
+	removeLabels := []string{cfg.GitHub.DoneLabel, cfg.GitHub.FailedLabel}
+	if phase == phasePlan {
+		removeLabels = append(removeLabels, cfg.GitHub.PlanLabel)
+	}
+	o.setLabels(ctx, log, cand, runID, []string{cfg.GitHub.WorkingLabel}, removeLabels)
 	o.event(ctx, runID, "model", fmt.Sprintf("%s (fallbacks: %s)", head.ID, orNone(fallbacks)))
-	log.Info("starting claude", "model", head.ID, "branch", branch, "attempt", attempt)
+	log.Info("starting claude", "phase", phase, "model", head.ID, "branch", branch, "attempt", attempt)
+
+	var prompt, sysPrompt, permissionMode string
+	var previousPlan string
+	if phase == phasePlan {
+		previousPlan, err = o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
+		if err != nil {
+			log.Warn("could not read previous plan, planning from scratch", "error", err)
+		}
+		prompt = planTaskPrompt(cand.repo, issue, previousPlan)
+		sysPrompt = planSystemPrompt(cand.repo, worktree)
+		permissionMode = cfg.Claude.PlanPermissionMode
+	} else {
+		plan, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
+		if err != nil {
+			log.Warn("could not read approved plan, implementing without it", "error", err)
+		}
+		prompt = implementTaskPrompt(cand.repo, issue, plan)
+		sysPrompt = systemPrompt(cand.repo, branch, worktree)
+		permissionMode = cfg.Claude.PermissionMode
+	}
 
 	// The CLI announces its session ID on the first stream event, long before
 	// the run produces a result. Capturing it there means a run that is killed
@@ -494,11 +550,11 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	claudeStarted := time.Now()
 	result, runErr := o.opts.Runner.Run(ctx, claude.Options{
 		Binary:         cfg.Claude.Binary,
-		Prompt:         taskPrompt(cand.repo, issue),
-		SystemPrompt:   systemPrompt(cand.repo, branch, worktree),
+		Prompt:         prompt,
+		SystemPrompt:   sysPrompt,
 		Model:          head.Ref(),
 		Fallbacks:      fallbacks,
-		PermissionMode: cfg.Claude.PermissionMode,
+		PermissionMode: permissionMode,
 		WorkDir:        worktree,
 		ExtraArgs:      cfg.Claude.ExtraArgs,
 		LogPath:        logPath,
@@ -519,10 +575,10 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	})
 
 	// Record spend even on failure: the tokens were burned either way.
+	usedModel := head.ID
 	if result != nil {
-		usedModel := result.PrimaryModel()
-		if usedModel == "" {
-			usedModel = head.ID
+		if m := result.PrimaryModel(); m != "" {
+			usedModel = m
 		}
 		if err := o.opts.Store.RecordUsage(ctx, runID, usedModel, result.SessionID,
 			result.TotalCostUSD, result.TokensIn(), result.TokensOut(), result.NumTurns); err != nil {
@@ -563,6 +619,29 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 	o.opts.Discord.GateCleared()
 	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
+
+	if phase == phasePlan {
+		if strings.TrimSpace(result.Result) == "" {
+			return fmt.Errorf("the plan run produced no plan")
+		}
+		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
+			log.Warn("could not save plan", "error", err)
+		}
+		if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
+			planComment(result.Result, runID, usedModel, result.TotalCostUSD)); err != nil {
+			log.Warn("could not comment on issue", "error", err)
+		}
+		o.setLabels(ctx, log, cand, runID,
+			[]string{cfg.GitHub.PlanLabel}, []string{cfg.GitHub.WorkingLabel})
+		if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPlanned); err != nil {
+			log.Warn("status update failed", "error", err)
+		}
+		o.event(ctx, runID, "planned", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
+		o.opts.Discord.PlanPosted(ref, result, time.Since(claudeStarted))
+		o.cleanup(ctx, log, repoPath, worktree, true)
+		return nil
+	}
+
 	o.opts.Discord.ClaudeFinished(ref, result, time.Since(claudeStarted))
 
 	hasWork, err := o.opts.Git.HasWork(ctx, worktree, meta.defaultBranch)
@@ -630,7 +709,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 	o.setLabels(ctx, log, cand, runID,
 		[]string{cfg.GitHub.DoneLabel},
-		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel})
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
 
 	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPROpen); err != nil {
 		log.Warn("status update failed", "error", err)

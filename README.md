@@ -40,11 +40,13 @@ gh search issues --label agent-ready
 
 ## What this is
 
-You label a GitHub issue `agent-ready`. The daemon finds it, checks out a fresh git worktree, hands
-the issue to Claude Code running headless, runs the repository's own test suite against whatever
-Claude wrote, pushes a branch, and opens a **draft** PR that says what happened — including if the
-tests failed. A human reviews and merges (or doesn't). The daemon never pushes to `main`, never
-merges, and never touches an issue that isn't opted in.
+You label a GitHub issue `agent-ready`. The daemon finds it, checks out a fresh git worktree, and
+first has Claude Code produce a **plan** — posted as an issue comment, no edits made. A human reviews
+the plan and replies `implement` to approve it (or anything else, which sends it back for a
+revision). Only then does the daemon run the actual change, run the repository's own test suite
+against whatever Claude wrote, push a branch, and open a **draft** PR that says what happened —
+including if the tests failed. A human reviews and merges (or doesn't). The daemon never pushes to
+`main`, never merges, and never touches an issue that isn't opted in.
 
 **Use case:** a backlog of well-scoped, low-risk issues (bug fixes, small features, chores) across
 repositories you own, that you'd rather review as a diff than write yourself — worked on
@@ -98,7 +100,8 @@ sudo systemctl status coding-agent-loop.service # check status of process
 sudo journalctl -u coding-agent-loop # check system daemon logs (or at ~/.agent-loop/logs/)
 ```
 
-Label an issue `agent-ready` in one of the repositories you own, and the next poll picks it up.
+Label an issue `agent-ready` in one of the repositories you own. The next poll posts a plan as a
+comment on the issue; reply `implement` on that comment to have the daemon carry it out.
 
 ## CLI flags
 
@@ -125,9 +128,23 @@ An issue is worked only if **all** of these hold:
 - no previous run delivered a PR for it, and it is not currently backing off after a failure
   (`run.retry_backoff`)
 - no open pull request already closes it
+- the issue's comment history says it's this issue's turn to be worked (see below)
 
-Labels mirror the state (`agent-working` → `agent-done` / `agent-failed`), but the SQLite claim
-table is the source of truth — labels can be edited by humans mid-run, leases cannot.
+**The issue's own comments are what decide the phase**, not a label or a database column. Every
+comment the daemon posts is tagged with an invisible HTML marker, so it can tell its own narration
+apart from a human reply:
+
+- No plan comment yet → **plan**: post a plan, then stop.
+- A plan is posted and nothing from a human has followed it → **wait**: do nothing this poll. This
+  costs one `gh issue view` per poll, never a claim, a worktree, or a Claude run.
+- The newest human reply after the plan is exactly `implement` (trimmed, case-insensitive) →
+  **implement**: run the actual change.
+- The newest human reply after the plan is anything else → **plan**: treat it as feedback and post a
+  revised plan.
+
+Labels mirror this state (`agent-planned` while waiting on a reply, `agent-working` →
+`agent-done` / `agent-failed` around a run), but the SQLite claim table and the issue's own comments
+are the source of truth — labels can be edited by humans mid-run, leases and comment history cannot.
 
 Label edits are reconciled rather than fired blindly: the issue's current labels are read first, the
 edit is reduced to what actually changes, a status label the repository does not define yet is
@@ -142,24 +159,33 @@ flight at a time), controlled by `run.max_concurrent_repos`.
 ## Lifecycle of one issue
 
 1. **Discover** — `gh search issues --label <label> --state open` scoped to `github.owners`, minus
-   `exclude_repos`.
+   `exclude_repos`. The issue is fetched and its comments decide the phase (plan, wait, or
+   implement) before anything is claimed.
 2. **Claim** — an atomic SQLite insert with a lease (`run.lease`); losing the race means another
    worker already has it. The issue gets the `agent-working` label and a `runs` row.
 3. **Workspace** — the repo is cloned once (checkout-less) into `workspace.repos_root`, then a
    `git worktree` is added under `workspace.root` on a fresh `agent/issue-<n>` branch off the
-   default branch.
-4. **Run Claude** — `claude -p --output-format stream-json --permission-mode bypassPermissions`,
-   scoped to the worktree, with a system prompt that hands over the issue and forbids git/GitHub
-   mutation. The lease is renewed periodically while the run is in flight. The CLI's session ID is
-   recorded against the run and the issue as soon as it is announced — before any result, so a
-   killed or timed-out run still leaves one behind — and is queryable later via `GET /sessions`.
-5. **Verify** — the repository's own test command runs (auto-detected, or from `verify.commands`).
+   default branch. Both the plan and implement phases get this same worktree; the plan phase just
+   never writes to it.
+4. **Plan** (skipped once approved) — `claude -p --permission-mode plan` (`claude.plan_permission_mode`)
+   is handed the issue and told to produce a plan, not a change. Its final message is saved to SQLite
+   and posted as an issue comment naming the files and approach it would take. The issue gets the
+   `agent-planned` label and the run ends there — no commit, no verify, no push, no PR. Any human
+   reply that isn't exactly `implement` triggers another plan pass that revises it against that
+   feedback.
+5. **Run Claude** (once approved) — `claude -p --output-format stream-json --permission-mode
+   bypassPermissions`, scoped to the worktree, with a system prompt that hands over the issue and the
+   approved plan and forbids git/GitHub mutation. The lease is renewed periodically while the run is
+   in flight. The CLI's session ID is recorded against the run and the issue as soon as it is
+   announced — before any result, so a killed or timed-out run still leaves one behind — and is
+   queryable later via `GET /sessions`.
+6. **Verify** — the repository's own test command runs (auto-detected, or from `verify.commands`).
    A failing suite does **not** block the PR — it's a draft either way, and the failure is reported
    in the PR body so a human sees it immediately.
-6. **Deliver** — the remote is re-checked, then pushed; a draft PR is opened with `Closes #<n>`,
+7. **Deliver** — the remote is re-checked, then pushed; a draft PR is opened with `Closes #<n>`,
    verification result, model used, and cost; the issue is commented with the PR link;
-   `agent-working` is swapped for `agent-done` or `agent-failed`.
-7. **Cleanup** — the worktree is removed (kept on disk if `workspace.keep_failed` and the run
+   `agent-working` and `agent-planned` are swapped for `agent-done` or `agent-failed`.
+8. **Cleanup** — the worktree is removed (kept on disk if `workspace.keep_failed` and the run
    failed, for post-mortem). The claim is always released, on every exit path.
 
 Failures are retried indefinitely behind an exponential back-off: `run.retry_backoff` after the
@@ -186,6 +212,7 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
     "working_label": "agent-working",
     "done_label": "agent-done",
     "failed_label": "agent-failed",
+    "plan_label": "agent-planned",
     "owners": ["ableinc"],
     "exclude_repos": [],
     "search_limit": 50,
@@ -210,6 +237,7 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
   "claude": {
     "binary": "claude",
     "permission_mode": "bypassPermissions",
+    "plan_permission_mode": "plan",
     "extra_args": [],
     "usage_poll_interval": "15m",
     "usage_backoff": "15m",
@@ -238,6 +266,7 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `github.label`                                         | trigger label; **must not be empty**, or every open issue would match                                                              |
 | `github.working_label` / `done_label` / `failed_label` | status labels the daemon swaps `label` for                                                                                         |
+| `github.plan_label`                                    | label added while a posted plan awaits an `implement` reply, removed once the change is delivered                                  |
 | `github.owners`                                        | users/orgs to search; empty means every repo the `gh` token can see (a boot-time warning fires if left empty)                      |
 | `github.exclude_repos`                                 | `owner/name` repos to never touch, even if labelled                                                                                |
 | `github.search_limit`                                  | max issues fetched per discovery pass                                                                                              |
@@ -253,7 +282,8 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `run.lease`                                            | how long a claim is held before it's considered abandoned; **must exceed `run.timeout`**, or a still-running claim could be stolen |
 | `run.verify_timeout`                                   | wall-clock limit for the test command                                                                                              |
 | `claude.binary`                                        | executable name/path for the Claude Code CLI                                                                                       |
-| `claude.permission_mode`                               | passed through as `--permission-mode`                                                                                              |
+| `claude.permission_mode`                               | passed through as `--permission-mode` for the implement run                                                                        |
+| `claude.plan_permission_mode`                          | passed through as `--permission-mode` for the read-only planning run                                                               |
 | `claude.usage_poll_interval` / `usage_backoff`         | advisory OAuth usage poll cadence and 429 backoff; **must be ≥ 1m**                                                                |
 | `claude.credentials_path`                              | where the CLI's OAuth token lives, read for the advisory usage snapshot                                                            |
 | `verify.auto_detect`                                   | try `Makefile` → `go.mod` → `package.json` → `Cargo.toml` → `pyproject.toml`, in that order                                        |
@@ -275,13 +305,13 @@ hardcoded in Go — this file is the only place to update one.
     {
       "id": "claude-opus-5",
       "alias": "opus",
-      "roles": ["implement"],
+      "roles": ["plan", "implement"],
       "priority": 1
     },
     {
       "id": "claude-sonnet-5",
       "alias": "sonnet",
-      "roles": ["implement"],
+      "roles": ["plan", "implement"],
       "priority": 2
     },
     {
@@ -297,14 +327,17 @@ hardcoded in Go — this file is the only place to update one.
 - `id` is the canonical model identifier, recorded in the `runs` table so history stays meaningful
   even if an alias's meaning shifts later.
 - `alias` is what's passed on the CLI.
-- `roles` — currently `implement` (does the work); `triage` is reserved for a future pre-pass.
+- `roles` — `plan` (writes the plan comment) and `implement` (does the work) each have their own
+  ladder, selected independently per phase; a registry needs at least one model serving each or the
+  loop refuses to start. `triage` is reserved for a future pre-pass and currently unused.
 - `priority` — lower runs first within a role. The head of the priority-ordered list for a role
   becomes `--model`; the rest become `--fallback-model a,b,...`.
 - A model that fails or hits a limit is put on a 30-minute cooldown, so the next attempt starts
-  lower on the ladder. Retries also start one rung lower than the attempt before them, wrapping
-  back to the head once the ladder has been walked, since retries are unbounded. If every
-  candidate is cooled down, the full ladder is used anyway — refusing to run at all is worse; the
-  usage gate is the real brake.
+  lower on the ladder. Retries also start one rung lower for every failure recorded on the issue,
+  wrapping back to the head once the ladder has been walked, since retries are unbounded — a
+  successful plan run does not demote the implement run that follows it, since it isn't a failure.
+  If every candidate is cooled down, the full ladder is used anyway — refusing to run at all is
+  worse; the usage gate is the real brake.
 
 The content above is also **embedded in the binary** (`internal/models/default.json`) as of build
 time, so a `coding-agent-loop` binary copied to a host on its own — no repo checkout, no

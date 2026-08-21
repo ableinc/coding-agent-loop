@@ -178,6 +178,30 @@ func TestIssueComment(t *testing.T) {
 	if !strings.Contains(c, "pull/9") || !strings.Contains(c, "make test") {
 		t.Fatalf("issue comment missing detail:\n%s", c)
 	}
+	// Without the marker, decidePhase would read the harness's own comment
+	// back as human feedback and re-plan forever.
+	if !isAgentComment(c) {
+		t.Fatalf("issue comment must carry the agent marker:\n%s", c)
+	}
+}
+
+func TestFailureCommentCarriesTheAgentMarker(t *testing.T) {
+	c := failureComment("run-1", 1, "boom", time.Time{}, "agent-ready")
+	if !isAgentComment(c) {
+		t.Fatalf("failure comment must carry the agent marker:\n%s", c)
+	}
+}
+
+func TestPlanComment(t *testing.T) {
+	c := planComment("## Plan\n\ndo the thing", "run-1", "claude-opus-5", 0.42)
+	if !isPlanComment(c) {
+		t.Fatalf("plan comment must carry the plan marker:\n%s", c)
+	}
+	for _, want := range []string{"do the thing", "implement", "claude-opus-5", "0.4200"} {
+		if !strings.Contains(c, want) {
+			t.Errorf("plan comment missing %q:\n%s", want, c)
+		}
+	}
 }
 
 func TestSystemPromptStatesTheHarnessBoundary(t *testing.T) {
@@ -204,7 +228,7 @@ func TestTaskPromptIncludesIssueContext(t *testing.T) {
 			{Author: gh.User{Login: "alice"}, Body: "Only for idempotent requests."},
 		},
 	}
-	p := taskPrompt("acme/widgets", issue)
+	p := implementTaskPrompt("acme/widgets", issue, "")
 	for _, want := range []string{"#42", "Add retry logic", "We need retries on 5xx.", "@alice", "Only for idempotent requests.", "agent-ready"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("task prompt missing %q", want)
@@ -213,7 +237,7 @@ func TestTaskPromptIncludesIssueContext(t *testing.T) {
 }
 
 func TestTaskPromptHandlesEmptyBody(t *testing.T) {
-	p := taskPrompt("acme/widgets", gh.Issue{Number: 1, Title: "Do the thing"})
+	p := implementTaskPrompt("acme/widgets", gh.Issue{Number: 1, Title: "Do the thing"}, "")
 	if !strings.Contains(p, "no description") {
 		t.Fatalf("an empty body should be called out:\n%s", p)
 	}
@@ -224,7 +248,7 @@ func TestTaskPromptTrimsLongDiscussions(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		issue.Comments = append(issue.Comments, gh.Comment{Author: gh.User{Login: "u"}, Body: "comment"})
 	}
-	p := taskPrompt("acme/widgets", issue)
+	p := implementTaskPrompt("acme/widgets", issue, "")
 	if !strings.Contains(p, "showing the last") {
 		t.Fatalf("long discussions should be trimmed and say so:\n%s", p)
 	}
