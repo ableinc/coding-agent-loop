@@ -86,12 +86,6 @@ type RunConfig struct {
 	// MaxConcurrentRepos bounds how many repos are worked in parallel. Work
 	// within a single repo is always serial.
 	MaxConcurrentRepos int `json:"max_concurrent_repos"`
-	// MaxAttempts is accepted so configuration files written before retries
-	// became unbounded still load. It has no effect.
-	//
-	// Deprecated: an issue is never given up on for having failed too often;
-	// RetryBackoff spaces the retries out instead.
-	MaxAttempts int `json:"max_attempts"`
 	// RetryBackoff is how long a failed issue waits before it may be claimed
 	// again. It doubles with every consecutive failure — 15m, 30m, 1h, ... —
 	// so a permanently broken issue costs a trickle of runs rather than a
