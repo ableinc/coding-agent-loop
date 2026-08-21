@@ -14,7 +14,7 @@ help:
 	@grep -E '^## ' Makefile | sed 's/^## /  /'
 
 build:
-	go build -o $(BINARY) ./cmd
+	go build -ldflags="-w -s" -o $(BINARY) ./cmd
 
 ## config: create config.json from config.example.json if it doesn't exist yet
 config:
