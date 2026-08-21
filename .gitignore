@@ -1,0 +1,42 @@
+# Build output
+/bin/
+*.exe
+*.test
+
+# Test / coverage artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Local configuration — config.example.json is the tracked template
+config.json
+
+# Runtime state the daemon creates at ~/.agent-loop by default, but a
+# workspace/store/logs root pointed inside the repo would land here too
+.agent-loop/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/work/
+/repos/
+/logs/
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key

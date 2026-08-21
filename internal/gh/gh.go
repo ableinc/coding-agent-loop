@@ -1,0 +1,385 @@
+// Package gh wraps the GitHub CLI.
+//
+// Everything shells out to `gh` with `--json` and is decoded into typed
+// structs; nothing parses human-readable output. Mutating calls honour a
+// dry-run flag so the whole pipeline can be exercised against real issues
+// without touching GitHub.
+package gh
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Client runs gh commands.
+type Client struct {
+	// Bin is the gh executable name or path.
+	Bin string
+	// DryRun suppresses every mutating call.
+	DryRun bool
+	// Log receives a line for each suppressed mutation. May be nil.
+	Log func(format string, args ...any)
+}
+
+// New returns a Client using the given binary.
+func New(bin string, dryRun bool) *Client {
+	if bin == "" {
+		bin = "gh"
+	}
+	return &Client{Bin: bin, DryRun: dryRun}
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c.Log != nil {
+		c.Log(format, args...)
+	}
+}
+
+// CmdError carries enough context to debug a failed gh invocation.
+type CmdError struct {
+	Args     []string
+	ExitCode int
+	Stderr   string
+	Err      error
+}
+
+func (e *CmdError) Error() string {
+	msg := strings.TrimSpace(e.Stderr)
+	if msg == "" {
+		msg = e.Err.Error()
+	}
+	return fmt.Sprintf("gh %s: %s", strings.Join(e.Args, " "), msg)
+}
+
+func (e *CmdError) Unwrap() error { return e.Err }
+
+// run executes gh and returns stdout. stdin may be nil.
+func (c *Client) run(ctx context.Context, stdin string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, c.Bin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	if err := cmd.Run(); err != nil {
+		code := -1
+		var ee *exec.ExitError
+		if ok := asExitError(err, &ee); ok {
+			code = ee.ExitCode()
+		}
+		return nil, &CmdError{Args: args, ExitCode: code, Stderr: stderr.String(), Err: err}
+	}
+	return stdout.Bytes(), nil
+}
+
+func asExitError(err error, target **exec.ExitError) bool {
+	ee, ok := err.(*exec.ExitError)
+	if ok {
+		*target = ee
+	}
+	return ok
+}
+
+func (c *Client) runJSON(ctx context.Context, out any, args ...string) error {
+	data, err := c.run(ctx, "", args...)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("gh %s: decode json: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// --- types ------------------------------------------------------------------
+
+// Label is a GitHub label.
+type Label struct {
+	Name string `json:"name"`
+}
+
+// User is a GitHub account.
+type User struct {
+	Login string `json:"login"`
+}
+
+// Comment is one issue comment.
+type Comment struct {
+	Author    User      `json:"author"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// SearchResult is one hit from `gh search issues`.
+type SearchResult struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Body       string `json:"body"`
+	Repository struct {
+		Name          string `json:"name"`
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"repository"`
+	Labels        []Label   `json:"labels"`
+	Assignees     []User    `json:"assignees"`
+	IsPullRequest bool      `json:"isPullRequest"`
+	State         string    `json:"state"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// Issue is the detail view of one issue.
+type Issue struct {
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	URL       string    `json:"url"`
+	State     string    `json:"state"`
+	Labels    []Label   `json:"labels"`
+	Assignees []User    `json:"assignees"`
+	Comments  []Comment `json:"comments"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// HasLabel reports whether the issue carries name.
+func (i Issue) HasLabel(name string) bool {
+	for _, l := range i.Labels {
+		if strings.EqualFold(l.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// PullRequest is an open PR, used to avoid opening a second one for an issue.
+type PullRequest struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	Body        string `json:"body"`
+	Title       string `json:"title"`
+	HeadRefName string `json:"headRefName"`
+	State       string `json:"state"`
+}
+
+// --- read operations --------------------------------------------------------
+
+// AuthStatus returns an error when gh is not authenticated.
+func (c *Client) AuthStatus(ctx context.Context) error {
+	if _, err := c.run(ctx, "", "auth", "status"); err != nil {
+		return fmt.Errorf("gh is not authenticated (run `gh auth login`): %w", err)
+	}
+	return nil
+}
+
+// SearchIssues finds open issues carrying label, restricted to owners when
+// given. Pull requests are excluded: --include-prs is deliberately not passed.
+func (c *Client) SearchIssues(ctx context.Context, label string, owners []string, limit int) ([]SearchResult, error) {
+	if label == "" {
+		return nil, fmt.Errorf("search requires a label: an empty label would match every open issue")
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	args := []string{"search", "issues",
+		"--label", label,
+		"--state", "open",
+		"--limit", strconv.Itoa(limit),
+		"--json", "number,title,url,body,repository,labels,assignees,isPullRequest,state,updatedAt",
+	}
+	for _, o := range owners {
+		if o = strings.TrimSpace(o); o != "" {
+			args = append(args, "--owner", o)
+		}
+	}
+
+	var results []SearchResult
+	if err := c.runJSON(ctx, &results, args...); err != nil {
+		return nil, err
+	}
+	// Defensive: drop anything that slipped through as a PR or non-open.
+	filtered := results[:0]
+	for _, r := range results {
+		if r.IsPullRequest {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered, nil
+}
+
+// ViewIssue fetches one issue with its comments.
+func (c *Client) ViewIssue(ctx context.Context, repo string, number int) (Issue, error) {
+	var issue Issue
+	err := c.runJSON(ctx, &issue,
+		"issue", "view", strconv.Itoa(number),
+		"--repo", repo,
+		"--json", "number,title,body,url,state,labels,assignees,comments,updatedAt")
+	if err != nil {
+		return Issue{}, err
+	}
+	return issue, nil
+}
+
+// DefaultBranch returns the repository's default branch name.
+func (c *Client) DefaultBranch(ctx context.Context, repo string) (string, error) {
+	var out struct {
+		DefaultBranchRef struct {
+			Name string `json:"name"`
+		} `json:"defaultBranchRef"`
+	}
+	if err := c.runJSON(ctx, &out, "repo", "view", repo, "--json", "defaultBranchRef"); err != nil {
+		return "", err
+	}
+	if out.DefaultBranchRef.Name == "" {
+		return "", fmt.Errorf("repo %s reported no default branch", repo)
+	}
+	return out.DefaultBranchRef.Name, nil
+}
+
+// CloneURL returns the URL to clone repo from.
+func (c *Client) CloneURL(ctx context.Context, repo string) (string, error) {
+	var out struct {
+		URL string `json:"url"`
+	}
+	if err := c.runJSON(ctx, &out, "repo", "view", repo, "--json", "url"); err != nil {
+		return "", err
+	}
+	if out.URL == "" {
+		return "", fmt.Errorf("repo %s reported no url", repo)
+	}
+	return out.URL + ".git", nil
+}
+
+// ListOpenPRs returns the repo's open pull requests.
+func (c *Client) ListOpenPRs(ctx context.Context, repo string, limit int) ([]PullRequest, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var prs []PullRequest
+	err := c.runJSON(ctx, &prs,
+		"pr", "list", "--repo", repo, "--state", "open",
+		"--limit", strconv.Itoa(limit),
+		"--json", "number,url,body,title,headRefName,state")
+	if err != nil {
+		return nil, err
+	}
+	return prs, nil
+}
+
+// FindPRForIssue looks for an existing open PR that closes the issue or was
+// pushed to the branch we would use. Returns "" when there is none.
+func (c *Client) FindPRForIssue(ctx context.Context, repo string, issue int, branch string) (string, error) {
+	prs, err := c.ListOpenPRs(ctx, repo, 100)
+	if err != nil {
+		return "", err
+	}
+	needles := []string{
+		fmt.Sprintf("closes #%d", issue),
+		fmt.Sprintf("fixes #%d", issue),
+		fmt.Sprintf("resolves #%d", issue),
+	}
+	for _, pr := range prs {
+		if branch != "" && strings.EqualFold(pr.HeadRefName, branch) {
+			return pr.URL, nil
+		}
+		body := strings.ToLower(pr.Body)
+		for _, n := range needles {
+			if strings.Contains(body, n) {
+				return pr.URL, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// --- mutating operations ----------------------------------------------------
+
+// EditLabels adds and removes labels on an issue. Missing labels on the repo
+// make gh fail, so failures here are reported but are not usually fatal to the
+// caller.
+func (c *Client) EditLabels(ctx context.Context, repo string, number int, add, remove []string) error {
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+	args := []string{"issue", "edit", strconv.Itoa(number), "--repo", repo}
+	for _, l := range add {
+		args = append(args, "--add-label", l)
+	}
+	for _, l := range remove {
+		args = append(args, "--remove-label", l)
+	}
+	if c.DryRun {
+		c.logf("dry-run: would run gh %s", strings.Join(args, " "))
+		return nil
+	}
+	_, err := c.run(ctx, "", args...)
+	return err
+}
+
+// Comment posts a comment on an issue. The body goes over stdin so it is never
+// subject to argument length or quoting limits.
+func (c *Client) Comment(ctx context.Context, repo string, number int, body string) error {
+	args := []string{"issue", "comment", strconv.Itoa(number), "--repo", repo, "--body-file", "-"}
+	if c.DryRun {
+		c.logf("dry-run: would comment on %s#%d:\n%s", repo, number, body)
+		return nil
+	}
+	_, err := c.run(ctx, body, args...)
+	return err
+}
+
+// PROptions describes the pull request to open.
+type PROptions struct {
+	Repo  string
+	Base  string
+	Head  string
+	Title string
+	Body  string
+	Draft bool
+}
+
+// CreatePR opens a pull request and returns its URL.
+func (c *Client) CreatePR(ctx context.Context, opts PROptions) (string, error) {
+	args := []string{"pr", "create",
+		"--repo", opts.Repo,
+		"--base", opts.Base,
+		"--head", opts.Head,
+		"--title", opts.Title,
+		"--body-file", "-",
+	}
+	if opts.Draft {
+		args = append(args, "--draft")
+	}
+	if c.DryRun {
+		c.logf("dry-run: would run gh %s\nwith body:\n%s", strings.Join(args, " "), opts.Body)
+		return "https://example.invalid/dry-run/pr", nil
+	}
+	out, err := c.run(ctx, opts.Body, args...)
+	if err != nil {
+		return "", err
+	}
+	// gh prints the PR URL on the last non-empty line.
+	for _, line := range reverseLines(string(out)) {
+		if strings.HasPrefix(line, "http") {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("gh pr create produced no URL, output was: %s", strings.TrimSpace(string(out)))
+}
+
+func reverseLines(s string) []string {
+	raw := strings.Split(s, "\n")
+	out := make([]string, 0, len(raw))
+	for i := len(raw) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(raw[i]); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}

@@ -1,0 +1,34 @@
+[Unit]
+Description=coding-agent-loop — autonomous GitHub issue to draft PR agent
+Documentation=https://github.com/ableinc/coding-agent-loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent-loop
+ExecStart=/opt/agent-loop/bin/agent-loop --config /opt/agent-loop/config.json
+Restart=on-failure
+RestartSec=30s
+
+# SIGTERM makes the loop stop claiming and drain whatever is in flight, so give
+# it longer than one run timeout before killing it.
+KillSignal=SIGTERM
+TimeoutStopSec=50m
+
+# The agent runs Claude Code with bypassPermissions against host worktrees, so
+# it can do anything this user can. Run it as its own user with nothing else in
+# its home, and keep the rest of the filesystem read-only.
+User=agent-loop
+Group=agent-loop
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/agent-loop /home/agent-loop/.agent-loop
+PrivateTmp=true
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

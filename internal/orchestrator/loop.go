@@ -1,0 +1,739 @@
+// Package orchestrator is the loop itself: discover labelled issues, claim one
+// per repository, drive Claude over it, and open a draft pull request.
+//
+// Concurrency model: several repositories are worked in parallel, but never
+// two issues in the same repository at once. That is enforced twice — in
+// memory for this process, and through the store's claim table so it also
+// holds across a restart or a second daemon.
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/ableinc/coding-agent-loop/internal/claude"
+	"github.com/ableinc/coding-agent-loop/internal/config"
+	"github.com/ableinc/coding-agent-loop/internal/gate"
+	"github.com/ableinc/coding-agent-loop/internal/gh"
+	gitpkg "github.com/ableinc/coding-agent-loop/internal/git"
+	"github.com/ableinc/coding-agent-loop/internal/models"
+	"github.com/ableinc/coding-agent-loop/internal/store"
+	"github.com/ableinc/coding-agent-loop/internal/verify"
+)
+
+// modelCooldown is how long a model is sidelined after it fails a run.
+const modelCooldown = 30 * time.Minute
+
+// Options are the orchestrator's dependencies.
+type Options struct {
+	Config   config.Config
+	Store    *store.Store
+	Registry *models.Registry
+	GH       *gh.Client
+	Git      *gitpkg.Manager
+	Runner   *claude.Runner
+	Gate     *gate.Gate
+	Verify   *verify.Runner
+	Logger   *slog.Logger
+	DryRun   bool
+	WorkerID string
+}
+
+// Orchestrator runs the loop.
+type Orchestrator struct {
+	opts Options
+	log  *slog.Logger
+
+	wg sync.WaitGroup
+
+	mu          sync.Mutex
+	activeRepos map[string]bool
+	cancels     map[string]context.CancelFunc
+	repoInfo    map[string]repoMeta
+}
+
+type repoMeta struct {
+	defaultBranch string
+	cloneURL      string
+}
+
+// New builds an Orchestrator.
+func New(opts Options) *Orchestrator {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.WorkerID == "" {
+		opts.WorkerID = uuid.NewString()[:8]
+	}
+	return &Orchestrator{
+		opts:        opts,
+		log:         opts.Logger,
+		activeRepos: map[string]bool{},
+		cancels:     map[string]context.CancelFunc{},
+		repoInfo:    map[string]repoMeta{},
+	}
+}
+
+// Run polls until ctx is cancelled, then waits for in-flight work to finish.
+func (o *Orchestrator) Run(ctx context.Context) error {
+	interval := o.opts.Config.GitHub.PollInterval.D()
+	o.log.Info("orchestrator started",
+		"worker", o.opts.WorkerID,
+		"poll_interval", interval.String(),
+		"max_concurrent_repos", o.opts.Config.Run.MaxConcurrentRepos,
+		"dry_run", o.opts.DryRun)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	o.tick(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			o.log.Info("orchestrator draining in-flight runs")
+			o.wg.Wait()
+			o.log.Info("orchestrator stopped")
+			return nil
+		case <-ticker.C:
+			o.tick(ctx)
+		}
+	}
+}
+
+// RunOnce does a single discovery pass and waits for whatever it started.
+func (o *Orchestrator) RunOnce(ctx context.Context) error {
+	o.tick(ctx)
+	o.wg.Wait()
+	return nil
+}
+
+// Cancel stops an in-flight run. It reports whether the run was found.
+func (o *Orchestrator) Cancel(runID string) bool {
+	o.mu.Lock()
+	cancel, ok := o.cancels[runID]
+	o.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
+// ActiveRepos lists repositories currently being worked by this process.
+func (o *Orchestrator) ActiveRepos() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make([]string, 0, len(o.activeRepos))
+	for r := range o.activeRepos {
+		out = append(out, r)
+	}
+	return out
+}
+
+// tick is one discovery pass.
+func (o *Orchestrator) tick(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Advisory only: this refreshes /status and never gates the loop.
+	o.opts.Gate.PollUsage(ctx)
+
+	status, err := o.opts.Gate.Check(ctx)
+	if err != nil {
+		o.log.Error("gate check failed", "error", err)
+		return
+	}
+	if !status.Allowed {
+		for _, g := range status.Gates {
+			o.log.Info("not claiming work", "gate", g.Kind, "until", g.BlockedUntil.Format(time.RFC3339), "reason", g.Reason)
+		}
+		return
+	}
+
+	capacity := o.capacity()
+	if capacity <= 0 {
+		return
+	}
+
+	results, err := o.opts.GH.SearchIssues(ctx, o.opts.Config.GitHub.Label, o.opts.Config.GitHub.Owners, o.opts.Config.GitHub.SearchLimit)
+	if err != nil {
+		o.log.Error("issue discovery failed", "error", err)
+		return
+	}
+	o.log.Debug("discovery pass", "candidates", len(results), "capacity", capacity)
+
+	for _, r := range results {
+		if ctx.Err() != nil || capacity <= 0 {
+			return
+		}
+		repo := r.Repository.NameWithOwner
+		if repo == "" || r.Number == 0 {
+			continue
+		}
+		ok, reason := o.eligible(ctx, repo, r.Number)
+		if !ok {
+			if reason != "" {
+				o.log.Debug("skipping issue", "repo", repo, "issue", r.Number, "reason", reason)
+			}
+			continue
+		}
+		if !o.reserveRepo(repo) {
+			continue
+		}
+		capacity--
+
+		cand := candidate{repo: repo, number: r.Number, title: r.Title}
+		o.wg.Add(1)
+		go func() {
+			defer o.wg.Done()
+			defer o.releaseRepo(cand.repo)
+			o.work(ctx, cand)
+		}()
+	}
+}
+
+type candidate struct {
+	repo   string
+	number int
+	title  string
+}
+
+func (o *Orchestrator) capacity() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.opts.Config.Run.MaxConcurrentRepos - len(o.activeRepos)
+}
+
+func (o *Orchestrator) reserveRepo(repo string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.activeRepos[repo] {
+		return false
+	}
+	if len(o.activeRepos) >= o.opts.Config.Run.MaxConcurrentRepos {
+		return false
+	}
+	o.activeRepos[repo] = true
+	return true
+}
+
+func (o *Orchestrator) releaseRepo(repo string) {
+	o.mu.Lock()
+	delete(o.activeRepos, repo)
+	o.mu.Unlock()
+}
+
+// eligible applies the cheap filters before anything is claimed.
+func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bool, string) {
+	if o.opts.Config.GitHub.Excluded(repo) {
+		return false, "repo excluded by config"
+	}
+
+	o.mu.Lock()
+	busy := o.activeRepos[repo]
+	o.mu.Unlock()
+	if busy {
+		return false, ""
+	}
+
+	// Cross-process/cross-restart version of the same check.
+	if busy, err := o.opts.Store.RepoBusy(ctx, repo); err != nil {
+		o.log.Error("repo busy check failed", "repo", repo, "error", err)
+		return false, "busy check failed"
+	} else if busy {
+		return false, ""
+	}
+
+	hist, err := o.opts.Store.IssueHistory(ctx, repo, issue)
+	if err != nil {
+		o.log.Error("issue history lookup failed", "repo", repo, "issue", issue, "error", err)
+		return false, "history lookup failed"
+	}
+	switch {
+	case hist.Succeeded:
+		return false, "already delivered a PR"
+	case hist.Abandoned:
+		return false, "attempts exhausted previously"
+	case hist.Attempts >= o.opts.Config.Run.MaxAttempts:
+		return false, "attempt limit reached"
+	}
+	return true, ""
+}
+
+// work runs the full lifecycle for one issue.
+func (o *Orchestrator) work(ctx context.Context, cand candidate) {
+	cfg := o.opts.Config
+	runID := uuid.NewString()
+	log := o.log.With("run", runID, "repo", cand.repo, "issue", cand.number)
+
+	hist, err := o.opts.Store.IssueHistory(ctx, cand.repo, cand.number)
+	if err != nil {
+		log.Error("issue history lookup failed", "error", err)
+		return
+	}
+	attempt := hist.Attempts + 1
+
+	claimed, err := o.opts.Store.TryClaim(ctx, cand.repo, cand.number, runID, o.opts.WorkerID, cfg.Run.Lease.D())
+	if err != nil {
+		log.Error("claim failed", "error", err)
+		return
+	}
+	if !claimed {
+		log.Debug("issue claimed by another worker")
+		return
+	}
+	defer func() {
+		if err := o.opts.Store.ReleaseClaim(context.WithoutCancel(ctx), cand.repo, cand.number, runID); err != nil {
+			log.Error("release claim failed", "error", err)
+		}
+	}()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	o.mu.Lock()
+	o.cancels[runID] = cancel
+	o.mu.Unlock()
+	defer func() {
+		o.mu.Lock()
+		delete(o.cancels, runID)
+		o.mu.Unlock()
+	}()
+
+	// Keep the lease alive for as long as the run is genuinely working, so a
+	// slow run never has its claim stolen out from under it.
+	stopRenew := o.renewLease(runCtx, cand, runID)
+	defer stopRenew()
+
+	branch := branchName(cfg.Workspace.BranchPrefix, cand.number, cand.title)
+	logPath := filepath.Join(cfg.Workspace.LogsRoot, runID+".jsonl")
+
+	run := store.Run{
+		ID: runID, Repo: cand.repo, Issue: cand.number, Attempt: attempt,
+		Branch: branch, Status: store.StatusClaimed, StartedAt: time.Now(), LogPath: logPath,
+	}
+	if err := o.opts.Store.CreateRun(ctx, run); err != nil {
+		log.Error("create run failed", "error", err)
+		return
+	}
+	o.event(ctx, runID, "claimed", fmt.Sprintf("attempt %d as worker %s", attempt, o.opts.WorkerID))
+
+	if err := o.execute(runCtx, log, cand, runID, branch, logPath, attempt); err != nil {
+		o.handleFailure(ctx, log, cand, runID, attempt, err)
+		return
+	}
+}
+
+// renewLease extends the claim periodically until the returned func is called.
+func (o *Orchestrator) renewLease(ctx context.Context, cand candidate, runID string) func() {
+	lease := o.opts.Config.Run.Lease.D()
+	ticker := time.NewTicker(lease / 3)
+	done := make(chan struct{})
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := o.opts.Store.RenewClaim(ctx, cand.repo, cand.number, runID, lease); err != nil {
+					o.log.Error("lease renewal failed", "run", runID, "error", err)
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
+}
+
+// execute is the happy path; every failure returns an error for handleFailure.
+func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candidate, runID, branch, logPath string, attempt int) error {
+	cfg := o.opts.Config
+
+	issue, err := o.opts.GH.ViewIssue(ctx, cand.repo, cand.number)
+	if err != nil {
+		return fmt.Errorf("fetch issue: %w", err)
+	}
+	// Discovery and execution are minutes apart; re-check the preconditions.
+	if !strings.EqualFold(issue.State, "OPEN") {
+		return errSkip{fmt.Sprintf("issue is %s, not open", strings.ToLower(issue.State))}
+	}
+	if !issue.HasLabel(cfg.GitHub.Label) {
+		return errSkip{fmt.Sprintf("issue no longer carries the %q label", cfg.GitHub.Label)}
+	}
+
+	if existing, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch); err != nil {
+		log.Warn("existing PR lookup failed, continuing", "error", err)
+	} else if existing != "" {
+		return errSkip{"an open pull request already covers this issue: " + existing}
+	}
+
+	meta, err := o.repoMetadata(ctx, cand.repo)
+	if err != nil {
+		return fmt.Errorf("repo metadata: %w", err)
+	}
+
+	repoPath, err := o.opts.Git.EnsureRepo(ctx, cand.repo, meta.cloneURL)
+	if err != nil {
+		return fmt.Errorf("prepare clone: %w", err)
+	}
+	if err := o.opts.Git.AssertRemote(ctx, repoPath, cand.repo); err != nil {
+		return err
+	}
+
+	worktree := o.opts.Git.WorktreePath(cand.repo, cand.number)
+	if err := o.opts.Git.AddWorktree(ctx, repoPath, worktree, branch, meta.defaultBranch); err != nil {
+		return fmt.Errorf("create worktree: %w", err)
+	}
+	o.event(ctx, runID, "worktree", worktree)
+
+	// Pick the model. On a retry, start one rung lower: the previous attempt
+	// already showed the model above it did not get there.
+	cooled, err := o.opts.Store.CooledDownModels(ctx)
+	if err != nil {
+		log.Warn("cooldown lookup failed, using full ladder", "error", err)
+		cooled = nil
+	}
+	ladder := o.opts.Registry.Ladder(models.RoleImplement, cooled)
+	if drop := attempt - 1; drop > 0 && drop < len(ladder) {
+		ladder = ladder[drop:]
+	}
+	head, fallbacks, err := models.Head(ladder)
+	if err != nil {
+		return fmt.Errorf("select model: %w", err)
+	}
+	if err := o.opts.Store.RecordUsage(ctx, runID, head.ID, "", 0, 0, 0, 0); err != nil {
+		log.Warn("could not pre-record model", "error", err)
+	}
+
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusWorking); err != nil {
+		log.Warn("status update failed", "error", err)
+	}
+	_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, []string{cfg.GitHub.WorkingLabel}, nil)
+	o.event(ctx, runID, "model", fmt.Sprintf("%s (fallbacks: %s)", head.ID, orNone(fallbacks)))
+	log.Info("starting claude", "model", head.ID, "branch", branch, "attempt", attempt)
+
+	result, runErr := o.opts.Runner.Run(ctx, claude.Options{
+		Binary:         cfg.Claude.Binary,
+		Prompt:         taskPrompt(cand.repo, issue),
+		SystemPrompt:   systemPrompt(cand.repo, branch, worktree),
+		Model:          head.Ref(),
+		Fallbacks:      fallbacks,
+		PermissionMode: cfg.Claude.PermissionMode,
+		WorkDir:        worktree,
+		ExtraArgs:      cfg.Claude.ExtraArgs,
+		LogPath:        logPath,
+		Timeout:        cfg.Run.Timeout.D(),
+	})
+
+	// Record spend even on failure: the tokens were burned either way.
+	if result != nil {
+		usedModel := result.PrimaryModel()
+		if usedModel == "" {
+			usedModel = head.ID
+		}
+		if err := o.opts.Store.RecordUsage(ctx, runID, usedModel, result.SessionID,
+			result.TotalCostUSD, result.TokensIn(), result.TokensOut(), result.NumTurns); err != nil {
+			log.Warn("usage record failed", "error", err)
+		}
+	}
+
+	if runErr != nil {
+		if hit, limited := gate.DetectLimit(result, runErr); limited {
+			until, gerr := o.opts.Gate.RecordLimit(ctx, hit)
+			if gerr != nil {
+				log.Error("could not record usage limit", "error", gerr)
+			}
+			if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, hit.Reason); err != nil {
+				log.Warn("could not cool down model", "error", err)
+			}
+			o.event(ctx, runID, "usage_limit", hit.Reason)
+			return errRetryable{fmt.Errorf("usage limit reached, paused until %s: %s",
+				until.Format(time.RFC3339), hit.Reason)}
+		}
+		// A model that failed for another reason still gets sidelined briefly so
+		// the retry does not immediately land on it again.
+		if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, "run failed"); err != nil {
+			log.Warn("could not cool down model", "error", err)
+		}
+		return fmt.Errorf("claude run failed: %w", runErr)
+	}
+
+	if err := o.opts.Gate.RecordSuccess(ctx); err != nil {
+		log.Warn("could not clear usage gate", "error", err)
+	}
+	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
+
+	hasWork, err := o.opts.Git.HasWork(ctx, worktree, meta.defaultBranch)
+	if err != nil {
+		return fmt.Errorf("inspect worktree: %w", err)
+	}
+	if !hasWork {
+		return fmt.Errorf("the agent finished without changing anything; its summary was: %s",
+			firstLine(result.Result))
+	}
+
+	commitMsg := fmt.Sprintf("%s\n\nCloses #%d\n\nGenerated by coding-agent-loop run %s.",
+		commitSubject(issue.Title, cand.number), cand.number, runID)
+	if committed, err := o.opts.Git.CommitAll(ctx, worktree, commitMsg); err != nil {
+		return fmt.Errorf("commit changes: %w", err)
+	} else if committed {
+		o.event(ctx, runID, "committed", "harness committed the agent's working tree")
+	}
+
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusVerifying); err != nil {
+		log.Warn("status update failed", "error", err)
+	}
+	vres := o.opts.Verify.Run(ctx, cand.repo, worktree)
+	if err := o.opts.Store.SetVerifyStatus(ctx, runID, vres.Status); err != nil {
+		log.Warn("verify status update failed", "error", err)
+	}
+	o.event(ctx, runID, "verify", fmt.Sprintf("%s (%s)", vres.Status, orNone(vres.Command)))
+	log.Info("verification finished", "status", vres.Status, "command", vres.Command)
+
+	if err := o.opts.Git.Push(ctx, worktree, branch, cand.repo); err != nil {
+		return fmt.Errorf("push branch: %w", err)
+	}
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPushed); err != nil {
+		log.Warn("status update failed", "error", err)
+	}
+	o.event(ctx, runID, "pushed", branch)
+
+	diffstat, err := o.opts.Git.DiffStat(ctx, worktree, meta.defaultBranch)
+	if err != nil {
+		log.Warn("diffstat failed", "error", err)
+	}
+
+	prURL, err := o.opts.GH.CreatePR(ctx, gh.PROptions{
+		Repo:  cand.repo,
+		Base:  meta.defaultBranch,
+		Head:  branch,
+		Title: prTitle(issue.Title, cand.number),
+		Draft: true,
+		Body: prBody(prReport{
+			Repo: cand.repo, Issue: cand.number, RunID: runID,
+			ModelID: result.PrimaryModel(), CostUSD: result.TotalCostUSD,
+			Summary: result.Result, DiffStat: diffstat, Verify: vres, Attempt: attempt,
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("create pull request: %w", err)
+	}
+	if err := o.opts.Store.SetPRURL(ctx, runID, prURL); err != nil {
+		log.Warn("could not record PR url", "error", err)
+	}
+
+	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, issueComment(prURL, runID, vres)); err != nil {
+		log.Warn("could not comment on issue", "error", err)
+	}
+	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number,
+		[]string{cfg.GitHub.DoneLabel},
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label}); err != nil {
+		log.Warn("could not update labels", "error", err)
+	}
+
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPROpen); err != nil {
+		log.Warn("status update failed", "error", err)
+	}
+	o.event(ctx, runID, "pr_open", prURL)
+	log.Info("draft pull request opened", "url", prURL, "cost_usd", result.TotalCostUSD)
+
+	o.cleanup(ctx, log, repoPath, worktree, true)
+	return nil
+}
+
+// handleFailure records a failed run and decides whether a retry is possible.
+func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand candidate, runID string, attempt int, cause error) {
+	cfg := o.opts.Config
+	// context.WithoutCancel: the run's context may already be cancelled, but
+	// the bookkeeping still has to be written.
+	ctx = context.WithoutCancel(ctx)
+
+	var skip errSkip
+	if errors.As(cause, &skip) {
+		log.Info("run skipped", "reason", skip.reason)
+		if err := o.opts.Store.FailRun(ctx, runID, store.StatusAbandoned, "skipped: "+skip.reason); err != nil {
+			log.Error("could not record skip", "error", err)
+		}
+		_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, nil, []string{cfg.GitHub.WorkingLabel})
+		o.finishCleanup(ctx, log, cand)
+		return
+	}
+
+	// A usage limit is nobody's fault; it must not consume a retry.
+	var retryable errRetryable
+	if errors.As(cause, &retryable) {
+		log.Warn("run paused by usage limit", "error", cause)
+		if err := o.opts.Store.FailRun(ctx, runID, store.StatusFailed, cause.Error()); err != nil {
+			log.Error("could not record failure", "error", err)
+		}
+		_ = o.opts.GH.EditLabels(ctx, cand.repo, cand.number, nil, []string{cfg.GitHub.WorkingLabel})
+		o.finishCleanup(ctx, log, cand)
+		return
+	}
+
+	willRetry := attempt < cfg.Run.MaxAttempts
+	status := store.StatusFailed
+	if !willRetry {
+		status = store.StatusAbandoned
+	}
+	log.Error("run failed", "error", cause, "attempt", attempt, "will_retry", willRetry)
+
+	if err := o.opts.Store.FailRun(ctx, runID, status, cause.Error()); err != nil {
+		log.Error("could not record failure", "error", err)
+	}
+	o.event(ctx, runID, "failed", cause.Error())
+
+	// The trigger label stays put while retries remain, since discovery is
+	// label-driven; it is removed once the issue is abandoned so the poller
+	// stops seeing it.
+	remove := []string{cfg.GitHub.WorkingLabel}
+	add := []string{}
+	if !willRetry {
+		add = append(add, cfg.GitHub.FailedLabel)
+		remove = append(remove, cfg.GitHub.Label)
+	}
+	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number, add, remove); err != nil {
+		log.Warn("could not update labels", "error", err)
+	}
+	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
+		failureComment(runID, attempt, cfg.Run.MaxAttempts, cause.Error(), willRetry)); err != nil {
+		log.Warn("could not comment on issue", "error", err)
+	}
+
+	o.finishCleanup(ctx, log, cand)
+}
+
+func (o *Orchestrator) finishCleanup(ctx context.Context, log *slog.Logger, cand candidate) {
+	repoPath := o.opts.Git.RepoPath(cand.repo)
+	worktree := o.opts.Git.WorktreePath(cand.repo, cand.number)
+	o.cleanup(ctx, log, repoPath, worktree, false)
+}
+
+// cleanup removes the worktree, unless a failed one is being kept for
+// inspection.
+func (o *Orchestrator) cleanup(ctx context.Context, log *slog.Logger, repoPath, worktree string, success bool) {
+	if !success && o.opts.Config.Workspace.KeepFailed {
+		log.Info("keeping worktree for inspection", "path", worktree)
+		return
+	}
+	if err := o.opts.Git.RemoveWorktree(context.WithoutCancel(ctx), repoPath, worktree); err != nil {
+		log.Warn("worktree cleanup failed", "path", worktree, "error", err)
+	}
+}
+
+// repoMetadata caches the default branch and clone URL per repository.
+func (o *Orchestrator) repoMetadata(ctx context.Context, repo string) (repoMeta, error) {
+	o.mu.Lock()
+	meta, ok := o.repoInfo[repo]
+	o.mu.Unlock()
+	if ok {
+		return meta, nil
+	}
+
+	branch, err := o.opts.GH.DefaultBranch(ctx, repo)
+	if err != nil {
+		return repoMeta{}, err
+	}
+	url, err := o.opts.GH.CloneURL(ctx, repo)
+	if err != nil {
+		return repoMeta{}, err
+	}
+	meta = repoMeta{defaultBranch: branch, cloneURL: url}
+
+	o.mu.Lock()
+	o.repoInfo[repo] = meta
+	o.mu.Unlock()
+	return meta, nil
+}
+
+func (o *Orchestrator) event(ctx context.Context, runID, kind, detail string) {
+	if err := o.opts.Store.AppendEvent(context.WithoutCancel(ctx), runID, kind, detail); err != nil {
+		o.log.Warn("could not append event", "run", runID, "kind", kind, "error", err)
+	}
+}
+
+// --- error kinds ------------------------------------------------------------
+
+// errSkip means the issue should not be worked and should not be retried.
+type errSkip struct{ reason string }
+
+func (e errSkip) Error() string { return e.reason }
+
+// errRetryable means the run stopped for a reason that is not the issue's
+// fault, so it must not consume one of the issue's attempts.
+type errRetryable struct{ err error }
+
+func (e errRetryable) Error() string { return e.err.Error() }
+func (e errRetryable) Unwrap() error { return e.err }
+
+// --- naming helpers ---------------------------------------------------------
+
+var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)
+
+// branchName builds a stable, git-safe branch name for an issue.
+func branchName(prefix string, issue int, title string) string {
+	slug := nonSlug.ReplaceAllString(strings.ToLower(title), "-")
+	slug = strings.Trim(slug, "-")
+	if len(slug) > 40 {
+		slug = strings.Trim(slug[:40], "-")
+	}
+	name := fmt.Sprintf("%s%d", prefix, issue)
+	if slug != "" {
+		name += "-" + slug
+	}
+	return name
+}
+
+func prTitle(title string, issue int) string {
+	t := strings.TrimSpace(title)
+	if t == "" {
+		t = fmt.Sprintf("Address issue #%d", issue)
+	}
+	if len(t) > 120 {
+		t = t[:117] + "..."
+	}
+	return fmt.Sprintf("%s (#%d)", t, issue)
+}
+
+func commitSubject(title string, issue int) string {
+	t := strings.TrimSpace(strings.Split(title, "\n")[0])
+	if t == "" {
+		t = fmt.Sprintf("address issue #%d", issue)
+	}
+	if len(t) > 68 {
+		t = t[:65] + "..."
+	}
+	return t
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 300 {
+		s = s[:300] + "..."
+	}
+	if s == "" {
+		return "(no summary)"
+	}
+	return s
+}
+
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "none"
+	}
+	return s
+}

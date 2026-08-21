@@ -1,0 +1,18 @@
+path: "./"
+ext:
+ - .go
+ - .json
+ignore:
+ - .git
+ - vendor
+ - bin
+out: ./bin/agent-loop
+entry: ./cmd
+debounce: 500
+envs:
+ -
+env_file:
+flags:
+ -
+cli:
+ -

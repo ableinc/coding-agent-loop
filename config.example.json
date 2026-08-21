@@ -1,0 +1,47 @@
+{
+  "github": {
+    "label": "agent-ready",
+    "working_label": "agent-working",
+    "done_label": "agent-done",
+    "failed_label": "agent-failed",
+    "owners": ["ableinc"],
+    "exclude_repos": [],
+    "search_limit": 50,
+    "poll_interval": "5m",
+    "binary": "gh"
+  },
+  "workspace": {
+    "root": "~/.agent-loop/work",
+    "repos_root": "~/.agent-loop/repos",
+    "logs_root": "~/.agent-loop/logs",
+    "keep_failed": true,
+    "branch_prefix": "agent/issue-"
+  },
+  "run": {
+    "max_concurrent_repos": 3,
+    "max_attempts": 2,
+    "timeout": "45m",
+    "lease": "90m",
+    "verify_timeout": "10m"
+  },
+  "claude": {
+    "binary": "claude",
+    "permission_mode": "bypassPermissions",
+    "extra_args": [],
+    "usage_poll_interval": "15m",
+    "usage_backoff": "15m",
+    "credentials_path": "~/.claude/.credentials.json",
+    "usage_cache_path": "~/.agent-loop/usage-cache.json"
+  },
+  "verify": {
+    "auto_detect": true,
+    "commands": {}
+  },
+  "server": {
+    "addr": "127.0.0.1:8787"
+  },
+  "store": {
+    "path": "~/.agent-loop/state.db"
+  },
+  "models_path": "models.json"
+}
