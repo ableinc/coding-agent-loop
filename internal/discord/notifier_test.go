@@ -2,12 +2,18 @@ package discord
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ableinc/coding-agent-loop/internal/claude"
+	"github.com/ableinc/coding-agent-loop/internal/store"
+	"github.com/ableinc/coding-agent-loop/internal/verify"
 )
 
 // stubWebhook captures POSTed bodies so tests can assert on the JSON a
@@ -48,36 +54,188 @@ func waitForCount(t *testing.T, bodies func() [][]byte, n int) [][]byte {
 	return nil
 }
 
-func TestRunClaimedPostsEmbed(t *testing.T) {
-	url, bodies := stubWebhook(t)
-	n := New(true, url, nil)
+// testRef is the run every test in this file reports on.
+func testRef() RunRef {
+	return RunRef{
+		Repo: "acme/widgets", Issue: 42, Title: "Add retries",
+		URL: "https://github.com/acme/widgets/issues/42", RunID: "run-1", Attempt: 1,
+	}
+}
 
-	n.RunClaimed("acme/widgets", 42, "run-1", 1)
-	n.Close(2 * time.Second)
-
-	got := waitForCount(t, bodies, 1)
+func decodeEmbed(t *testing.T, body []byte) embed {
+	t.Helper()
 	var payload webhookPayload
-	if err := json.Unmarshal(got[0], &payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
 	if len(payload.Embeds) != 1 {
 		t.Fatalf("expected 1 embed, got %d", len(payload.Embeds))
 	}
-	e := payload.Embeds[0]
+	return payload.Embeds[0]
+}
+
+func field(e embed, name string) (string, bool) {
+	for _, f := range e.Fields {
+		if f.Name == name {
+			return f.Value, true
+		}
+	}
+	return "", false
+}
+
+func TestRunClaimedPostsEmbed(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.RunClaimed(testRef(), 2)
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
 	if e.Title != "Run claimed: acme/widgets#42" {
 		t.Errorf("unexpected title: %q", e.Title)
 	}
 	if e.Timestamp == "" {
 		t.Error("timestamp should be set")
 	}
-	foundRunID := false
-	for _, f := range e.Fields {
-		if f.Name == "Run ID" && f.Value == "run-1" {
-			foundRunID = true
+	// The issue title and link say what the work is, not only which number.
+	if !strings.Contains(e.Description, "Add retries") || !strings.Contains(e.Description, "issues/42") {
+		t.Errorf("description should link the issue, got %q", e.Description)
+	}
+	if v, ok := field(e, "Run ID"); !ok || v != "run-1" {
+		t.Errorf("expected a Run ID field, got %+v", e.Fields)
+	}
+	if v, ok := field(e, "Previous failures"); !ok || v != "2" {
+		t.Errorf("a retry should say how many attempts preceded it, got %+v", e.Fields)
+	}
+}
+
+// The session ID is what ties a notification back to the sessions table.
+func TestClaudeFinishedReportsSessionAndSpend(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.ClaudeFinished(testRef(), &claude.Result{
+		SessionID: "sess-abc", NumTurns: 7, TotalCostUSD: 0.25,
+		Usage:      claude.Usage{InputTokens: 100, OutputTokens: 40},
+		ModelUsage: map[string]claude.ModelUsage{"claude-opus-5-20260101": {CanonicalModel: "claude-opus-5", OutputTokens: 40}},
+	}, 90*time.Second)
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	for name, want := range map[string]string{
+		"Session":  "sess-abc",
+		"Model":    "claude-opus-5",
+		"Turns":    "7",
+		"Cost":     "$0.2500",
+		"Duration": "1m30s",
+	} {
+		if got, ok := field(e, name); !ok || got != want {
+			t.Errorf("field %q = %q (present=%v), want %q", name, got, ok, want)
 		}
 	}
-	if !foundRunID {
-		t.Errorf("expected a Run ID field, got %+v", e.Fields)
+}
+
+// A nil result means the CLI never got far enough to report anything.
+func TestClaudeFinishedIgnoresANilResult(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.ClaudeFinished(testRef(), nil, time.Second)
+	n.Close(200 * time.Millisecond)
+
+	if got := bodies(); len(got) != 0 {
+		t.Fatalf("nothing to report should post nothing, got %d", len(got))
+	}
+}
+
+// Having to open the PR to find out what broke defeats the point of the alert.
+func TestVerifyFailureCarriesTheOutput(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.VerifyResult(testRef(), verify.Result{
+		Status: store.VerifyFailed, Command: "go test ./...", Output: "--- FAIL: TestThing",
+	})
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	if e.Title != "Verify failed: acme/widgets#42" {
+		t.Errorf("unexpected title %q", e.Title)
+	}
+	out, ok := field(e, "Output (tail)")
+	if !ok || !strings.Contains(out, "FAIL: TestThing") {
+		t.Errorf("test output should be included, got %+v", e.Fields)
+	}
+}
+
+// Retries are unbounded, so the useful number is when — not how many are left.
+func TestRunFailedStatesTheNextAttempt(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	next := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	n.RunFailed(testRef(), "claude run failed", next)
+	n.RunFailed(testRef(), "claude run failed", time.Time{})
+	n.Close(2 * time.Second)
+
+	// Posts are fire-and-forget, so they can land in either order.
+	seen := map[string]bool{}
+	for _, body := range waitForCount(t, bodies, 2) {
+		v, _ := field(decodeEmbed(t, body), "Next attempt")
+		seen[v] = true
+	}
+	if !seen["2026-03-01T12:00:00Z"] {
+		t.Errorf("a scheduled retry should state its time, got %v", seen)
+	}
+	if !seen["next pass"] {
+		t.Errorf("an unscheduled retry should say so, got %v", seen)
+	}
+}
+
+// A label edit that failed leaves GitHub disagreeing with the store, which is
+// invisible unless it is reported.
+func TestLabelUpdateFailedNamesTheLabels(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.LabelUpdateFailed("acme/widgets", 42, "run-1",
+		[]string{"agent-failed"}, []string{"agent-working"}, errors.New("HTTP 404"))
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	if v, _ := field(e, "Add"); v != "agent-failed" {
+		t.Errorf("Add = %q", v)
+	}
+	if v, _ := field(e, "Remove"); v != "agent-working" {
+		t.Errorf("Remove = %q", v)
+	}
+	if !strings.Contains(e.Description, "HTTP 404") {
+		t.Errorf("the failure should be described, got %q", e.Description)
+	}
+}
+
+func TestDaemonStartedDescribesTheConfiguration(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.DaemonStarted(DaemonInfo{
+		Worker: "host-1", Label: "agent-ready", Owners: []string{"ableinc"},
+		PollInterval: 5 * time.Minute, MaxConcurrentRepos: 3,
+		RetryBackoff: 15 * time.Minute, RetryBackoffMax: 24 * time.Hour,
+	})
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	for name, want := range map[string]string{
+		"Worker":         "host-1",
+		"Trigger label":  "agent-ready",
+		"Owners":         "ableinc",
+		"Poll interval":  "5m0s",
+		"Retry back-off": "15m0s → 24h0m0s",
+	} {
+		if got, ok := field(e, name); !ok || got != want {
+			t.Errorf("field %q = %q (present=%v), want %q", name, got, ok, want)
+		}
 	}
 }
 
@@ -85,7 +243,7 @@ func TestDisabledNotifierMakesNoRequests(t *testing.T) {
 	url, bodies := stubWebhook(t)
 	n := New(false, url, nil)
 
-	n.RunClaimed("acme/widgets", 1, "run-1", 1)
+	n.RunClaimed(testRef(), 0)
 	n.Paused("testing")
 	n.Close(200 * time.Millisecond)
 
@@ -99,8 +257,8 @@ func TestEmptyWebhookURLIsNoop(t *testing.T) {
 	// Must not panic and must not hang.
 	done := make(chan struct{})
 	go func() {
-		n.RunClaimed("acme/widgets", 1, "run-1", 1)
-		n.DaemonStarted("worker-1")
+		n.RunClaimed(testRef(), 0)
+		n.DaemonStarted(DaemonInfo{Worker: "worker-1"})
 		close(done)
 	}()
 	select {
@@ -114,7 +272,7 @@ func TestNilNotifierIsSafe(t *testing.T) {
 	var n *Notifier
 	// Every exported method must tolerate a nil receiver, since Options{}
 	// literals in other packages' tests may not set Discord.
-	n.RunClaimed("acme/widgets", 1, "run-1", 1)
+	n.RunClaimed(testRef(), 0)
 	n.Paused("")
 	n.Close(time.Millisecond)
 }
@@ -129,7 +287,7 @@ func TestPostDoesNotBlockOnSlowWebhook(t *testing.T) {
 	n := New(true, srv.URL, nil)
 	done := make(chan struct{})
 	go func() {
-		n.RunClaimed("acme/widgets", 1, "run-1", 1)
+		n.RunClaimed(testRef(), 0)
 		close(done)
 	}()
 	select {

@@ -173,7 +173,16 @@ func run(f flags) error {
 	if workerID == "" {
 		workerID = "coding-agent-loop"
 	}
-	notifier.DaemonStarted(workerID)
+	notifier.DaemonStarted(discord.DaemonInfo{
+		Worker:             workerID,
+		Label:              cfg.GitHub.Label,
+		Owners:             cfg.GitHub.Owners,
+		PollInterval:       cfg.GitHub.PollInterval.D(),
+		MaxConcurrentRepos: cfg.Run.MaxConcurrentRepos,
+		RetryBackoff:       cfg.Run.RetryBackoff.D(),
+		RetryBackoffMax:    cfg.Run.RetryBackoffMax.D(),
+		DryRun:             f.dryRun,
+	})
 
 	errCh := make(chan error, 2)
 	if !f.noServer {

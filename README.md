@@ -359,14 +359,30 @@ To enable it:
    }
    ```
 
-Once enabled, every one of these posts an embed:
+Once enabled, every one of these posts an embed. Run notifications lead with the issue's own title,
+linked, and carry the run ID and attempt number:
 
-- **Run lifecycle** — issue claimed, Claude run finished, verification result, draft PR opened,
-  run failed (will retry) or abandoned.
+- **Run claimed** — plus how many earlier attempts on that issue failed, when it is a retry.
+- **Claude finished** — model, session ID, turns, cost, tokens in/out, wall-clock duration.
+- **Verification** — passed, failed, or skipped, with the command and, on failure, the tail of the
+  test output, so the channel says what broke without opening the PR.
+- **Draft PR opened** — link, model, session ID, cost, verification status, total run duration,
+  diffstat.
+- **Run failed** — the cause and **when the next attempt is due** (retries are unbounded, so "when"
+  is the useful number).
+- **Run abandoned** — a run that was skipped rather than attempted: the issue closed, lost its
+  label, or is already covered by a PR.
+- **Run deferred** — a run the usage gate stopped. Neither an attempt nor a failure.
+- **Run cancelled** — `POST /runs/{id}/cancel`.
+- **Label update failed** — the labels on GitHub now disagree with the store, and which edit was
+  refused. Otherwise invisible.
+- **Model cooled down** — which model, until when, and why, so a run served from lower on the ladder
+  than expected is explainable.
 - **Usage gate** — closes (with reason and until-when) and clears.
 - **Pause / resume** — whenever `POST /pause` or `POST /resume` is called.
-- **Daemon start / stop** — process startup, and graceful shutdown or crash. (Skipped for `--once`
-  passes, which aren't really "the daemon.")
+- **Daemon start / stop** — startup states the trigger label, owners, poll interval, concurrency,
+  retry back-off, and whether it is a dry run; shutdown says graceful or crash. (Skipped for
+  `--once` passes, which aren't really "the daemon.")
 
 A Discord outage, timeout, or rate-limit is logged and dropped — it never blocks, delays, or fails
 an actual run. Leave `discord.enabled` false (the default) to disable it entirely; no network calls

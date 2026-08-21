@@ -261,6 +261,7 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 		return s.fail(c, http.StatusNotFound, errors.New("run is not in flight on this process"))
 	}
 	s.log.Info("run cancelled by operator", "run", id)
+	s.discord.RunCanceled(id)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
 }
 

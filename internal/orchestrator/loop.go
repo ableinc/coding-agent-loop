@@ -196,7 +196,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 		}
 		capacity--
 
-		cand := candidate{repo: repo, number: r.Number, title: r.Title}
+		cand := candidate{repo: repo, number: r.Number, title: r.Title, url: r.URL}
 		o.wg.Add(1)
 		go func() {
 			defer o.wg.Done()
@@ -210,6 +210,15 @@ type candidate struct {
 	repo   string
 	number int
 	title  string
+	url    string
+}
+
+// ref describes a run to the notifier.
+func (c candidate) ref(runID string, attempt int) discord.RunRef {
+	return discord.RunRef{
+		Repo: c.repo, Issue: c.number, Title: c.title, URL: c.url,
+		RunID: runID, Attempt: attempt,
+	}
 }
 
 func (o *Orchestrator) capacity() int {
@@ -368,7 +377,7 @@ func (o *Orchestrator) work(ctx context.Context, cand candidate) {
 		return
 	}
 	o.event(ctx, runID, "claimed", fmt.Sprintf("attempt %d as worker %s", attempt, o.opts.WorkerID))
-	o.opts.Discord.RunClaimed(cand.repo, cand.number, runID, attempt)
+	o.opts.Discord.RunClaimed(cand.ref(runID, attempt), hist.Failures)
 
 	if err := o.execute(runCtx, log, cand, runID, branch, logPath, attempt); err != nil {
 		o.handleFailure(ctx, log, cand, runID, attempt, err)
@@ -403,6 +412,8 @@ func (o *Orchestrator) renewLease(ctx context.Context, cand candidate, runID str
 // execute is the happy path; every failure returns an error for handleFailure.
 func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candidate, runID, branch, logPath string, attempt int) error {
 	cfg := o.opts.Config
+	ref := cand.ref(runID, attempt)
+	started := time.Now()
 
 	issue, err := o.opts.GH.ViewIssue(ctx, cand.repo, cand.number)
 	if err != nil {
@@ -480,6 +491,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	// the run produces a result. Capturing it there means a run that is killed
 	// or times out still leaves a session behind to refer back to.
 	var sessionOnce sync.Once
+	claudeStarted := time.Now()
 	result, runErr := o.opts.Runner.Run(ctx, claude.Options{
 		Binary:         cfg.Claude.Binary,
 		Prompt:         taskPrompt(cand.repo, issue),
@@ -528,6 +540,8 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 			}
 			if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, hit.Reason); err != nil {
 				log.Warn("could not cool down model", "error", err)
+			} else {
+				o.opts.Discord.ModelCooledDown(head.ID, time.Now().Add(modelCooldown), hit.Reason)
 			}
 			o.event(ctx, runID, "usage_limit", hit.Reason)
 			o.opts.Discord.GateClosed(hit.Reason, until)
@@ -538,6 +552,8 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		// the retry does not immediately land on it again.
 		if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, "run failed"); err != nil {
 			log.Warn("could not cool down model", "error", err)
+		} else {
+			o.opts.Discord.ModelCooledDown(head.ID, time.Now().Add(modelCooldown), "run failed")
 		}
 		return fmt.Errorf("claude run failed: %w", runErr)
 	}
@@ -547,7 +563,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 	o.opts.Discord.GateCleared()
 	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
-	o.opts.Discord.ClaudeFinished(cand.repo, cand.number, runID, result.PrimaryModel(), result.NumTurns, result.TotalCostUSD)
+	o.opts.Discord.ClaudeFinished(ref, result, time.Since(claudeStarted))
 
 	hasWork, err := o.opts.Git.HasWork(ctx, worktree, meta.defaultBranch)
 	if err != nil {
@@ -574,7 +590,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		log.Warn("verify status update failed", "error", err)
 	}
 	o.event(ctx, runID, "verify", fmt.Sprintf("%s (%s)", vres.Status, orNone(vres.Command)))
-	o.opts.Discord.VerifyResult(cand.repo, cand.number, runID, vres)
+	o.opts.Discord.VerifyResult(ref, vres)
 	log.Info("verification finished", "status", vres.Status, "command", vres.Command)
 
 	if err := o.opts.Git.Push(ctx, worktree, branch, cand.repo); err != nil {
@@ -620,7 +636,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		log.Warn("status update failed", "error", err)
 	}
 	o.event(ctx, runID, "pr_open", prURL)
-	o.opts.Discord.PROpened(cand.repo, cand.number, runID, result.PrimaryModel(), prURL, result.TotalCostUSD, diffstat)
+	o.opts.Discord.PROpened(ref, prURL, result, vres, diffstat, time.Since(started))
 	log.Info("draft pull request opened", "url", prURL, "cost_usd", result.TotalCostUSD)
 
 	o.cleanup(ctx, log, repoPath, worktree, true)
@@ -640,7 +656,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		if err := o.opts.Store.FailRun(ctx, runID, store.StatusAbandoned, "skipped: "+skip.reason); err != nil {
 			log.Error("could not record skip", "error", err)
 		}
-		o.opts.Discord.RunAbandoned(cand.repo, cand.number, runID, "skipped: "+skip.reason,
+		o.opts.Discord.RunAbandoned(cand.ref(runID, attempt), "skipped: "+skip.reason,
 			o.scheduleRetry(ctx, log, cand, runID))
 		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
@@ -658,6 +674,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 			log.Error("could not record deferral", "error", err)
 		}
 		o.event(ctx, runID, "deferred", cause.Error())
+		o.opts.Discord.RunDeferred(cand.ref(runID, attempt), cause.Error())
 		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
@@ -670,7 +687,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 	o.event(ctx, runID, "failed", cause.Error())
 
 	nextAttempt := o.scheduleRetry(ctx, log, cand, runID)
-	o.opts.Discord.RunFailed(cand.repo, cand.number, runID, attempt, cause.Error(), nextAttempt)
+	o.opts.Discord.RunFailed(cand.ref(runID, attempt), cause.Error(), nextAttempt)
 
 	// The trigger label always stays put: it, and only it, decides whether the
 	// issue is worked. agent-failed mirrors the outcome until the next attempt
