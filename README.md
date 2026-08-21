@@ -93,6 +93,9 @@ cp config.example.json config.json   # then edit github.owners
 make build
 make dry-run                         # one pass; never pushes, never opens a PR
 make run                             # start the daemon
+make install                         # install as a system daemon
+sudo systemctl status coding-agent-loop.service # check status of process
+sudo journalctl -u coding-agent-loop # check system daemon logs (or at ~/.agent-loop/logs/)
 ```
 
 Label an issue `agent-ready` in one of the repositories you own, and the next poll picks it up.
@@ -101,16 +104,16 @@ Label an issue `agent-ready` in one of the repositories you own, and the next po
 
 All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `make once` / `make dry-run`):
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--config` | `config.json` | path to the configuration file |
-| `--once` | off | run a single discovery pass, then exit (no server) |
-| `--dry-run` | off | do everything except push branches, open PRs, or edit issues |
-| `--log-level` | `info` | `debug`, `info`, `warn`, or `error` |
-| `--no-server` | off | do not start the control API |
-| `--check` | off | run start-up checks (binaries, auth, config) and exit |
-| `--install` | off | install + enable + start the systemd unit; **must run as root** |
-| `--print-service` | off | print the embedded systemd unit to stdout and exit; no privileges needed |
+| Flag              | Default       | Effect                                                                   |
+| ----------------- | ------------- | ------------------------------------------------------------------------ |
+| `--config`        | `config.json` | path to the configuration file                                           |
+| `--once`          | off           | run a single discovery pass, then exit (no server)                       |
+| `--dry-run`       | off           | do everything except push branches, open PRs, or edit issues             |
+| `--log-level`     | `info`        | `debug`, `info`, `warn`, or `error`                                      |
+| `--no-server`     | off           | do not start the control API                                             |
+| `--check`         | off           | run start-up checks (binaries, auth, config) and exit                    |
+| `--install`       | off           | install + enable + start the systemd unit; **must run as root**          |
+| `--print-service` | off           | print the embedded systemd unit to stdout and exit; no privileges needed |
 
 ## How work is selected
 
@@ -213,34 +216,34 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `github.label` | trigger label; **must not be empty**, or every open issue would match |
-| `github.working_label` / `done_label` / `failed_label` | status labels the daemon swaps `label` for |
-| `github.owners` | users/orgs to search; empty means every repo the `gh` token can see (a boot-time warning fires if left empty) |
-| `github.exclude_repos` | `owner/name` repos to never touch, even if labelled |
-| `github.search_limit` | max issues fetched per discovery pass |
-| `github.poll_interval` | how often discovery runs |
-| `workspace.root` | where per-issue worktrees live |
-| `workspace.repos_root` | where the one-per-repo checkout-less clones live |
-| `workspace.logs_root` | where JSONL run transcripts are written |
-| `workspace.keep_failed` | keep a failed run's worktree on disk for inspection instead of deleting it |
-| `run.max_concurrent_repos` | how many repos can have work in flight simultaneously |
-| `run.max_attempts` | retries per issue before it's marked `agent-failed` and abandoned |
-| `run.timeout` | wall-clock limit for one Claude invocation |
-| `run.lease` | how long a claim is held before it's considered abandoned; **must exceed `run.timeout`**, or a still-running claim could be stolen |
-| `run.verify_timeout` | wall-clock limit for the test command |
-| `claude.binary` | executable name/path for the Claude Code CLI |
-| `claude.permission_mode` | passed through as `--permission-mode` |
-| `claude.usage_poll_interval` / `usage_backoff` | advisory OAuth usage poll cadence and 429 backoff; **must be ≥ 1m** |
-| `claude.credentials_path` | where the CLI's OAuth token lives, read for the advisory usage snapshot |
-| `verify.auto_detect` | try `Makefile` → `go.mod` → `package.json` → `Cargo.toml` → `pyproject.toml`, in that order |
-| `verify.commands` | per-repo override, keyed `"owner/name": "shell command"` |
-| `server.addr` | control API bind address; keep loopback-only |
-| `store.path` | SQLite database path |
-| `discord.enabled` | turn on Discord status notifications (see [Discord notifications](#discord-notifications)) |
-| `discord.webhook_url` | the channel's incoming webhook URL; **required** if `discord.enabled` is true |
-| `models_path` | path to `models.json` |
+| Field                                                  | Meaning                                                                                                                            |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `github.label`                                         | trigger label; **must not be empty**, or every open issue would match                                                              |
+| `github.working_label` / `done_label` / `failed_label` | status labels the daemon swaps `label` for                                                                                         |
+| `github.owners`                                        | users/orgs to search; empty means every repo the `gh` token can see (a boot-time warning fires if left empty)                      |
+| `github.exclude_repos`                                 | `owner/name` repos to never touch, even if labelled                                                                                |
+| `github.search_limit`                                  | max issues fetched per discovery pass                                                                                              |
+| `github.poll_interval`                                 | how often discovery runs                                                                                                           |
+| `workspace.root`                                       | where per-issue worktrees live                                                                                                     |
+| `workspace.repos_root`                                 | where the one-per-repo checkout-less clones live                                                                                   |
+| `workspace.logs_root`                                  | where JSONL run transcripts are written                                                                                            |
+| `workspace.keep_failed`                                | keep a failed run's worktree on disk for inspection instead of deleting it                                                         |
+| `run.max_concurrent_repos`                             | how many repos can have work in flight simultaneously                                                                              |
+| `run.max_attempts`                                     | retries per issue before it's marked `agent-failed` and abandoned                                                                  |
+| `run.timeout`                                          | wall-clock limit for one Claude invocation                                                                                         |
+| `run.lease`                                            | how long a claim is held before it's considered abandoned; **must exceed `run.timeout`**, or a still-running claim could be stolen |
+| `run.verify_timeout`                                   | wall-clock limit for the test command                                                                                              |
+| `claude.binary`                                        | executable name/path for the Claude Code CLI                                                                                       |
+| `claude.permission_mode`                               | passed through as `--permission-mode`                                                                                              |
+| `claude.usage_poll_interval` / `usage_backoff`         | advisory OAuth usage poll cadence and 429 backoff; **must be ≥ 1m**                                                                |
+| `claude.credentials_path`                              | where the CLI's OAuth token lives, read for the advisory usage snapshot                                                            |
+| `verify.auto_detect`                                   | try `Makefile` → `go.mod` → `package.json` → `Cargo.toml` → `pyproject.toml`, in that order                                        |
+| `verify.commands`                                      | per-repo override, keyed `"owner/name": "shell command"`                                                                           |
+| `server.addr`                                          | control API bind address; keep loopback-only                                                                                       |
+| `store.path`                                           | SQLite database path                                                                                                               |
+| `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |
+| `discord.webhook_url`                                  | the channel's incoming webhook URL; **required** if `discord.enabled` is true                                                      |
+| `models_path`                                          | path to `models.json`                                                                                                              |
 
 ### models.json
 
@@ -250,9 +253,24 @@ hardcoded in Go — this file is the only place to update one.
 ```json
 {
   "models": [
-    { "id": "claude-opus-5",    "alias": "opus",   "roles": ["implement"], "priority": 1 },
-    { "id": "claude-sonnet-5",  "alias": "sonnet", "roles": ["implement"], "priority": 2 },
-    { "id": "claude-haiku-4-5", "alias": "haiku",  "roles": ["triage"],    "priority": 1 }
+    {
+      "id": "claude-opus-5",
+      "alias": "opus",
+      "roles": ["implement"],
+      "priority": 1
+    },
+    {
+      "id": "claude-sonnet-5",
+      "alias": "sonnet",
+      "roles": ["implement"],
+      "priority": 2
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "alias": "haiku",
+      "roles": ["triage"],
+      "priority": 1
+    }
   ]
 }
 ```
@@ -291,15 +309,15 @@ contractual.
 
 Loopback-only by default. It can pause and cancel work, so do not expose it.
 
-| Route | Purpose |
-|---|---|
-| `GET /healthz` | liveness |
-| `GET /status` | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
-| `GET /runs?limit=&repo=` | recent runs with outcome, model, cost, PR link |
-| `GET /runs/{id}` | one run plus its event timeline |
-| `GET /runs/{id}/log` | the raw JSONL transcript of the Claude run |
-| `POST /pause` `POST /resume` | stop / resume claiming new work |
-| `POST /runs/{id}/cancel` | cancel an in-flight run |
+| Route                        | Purpose                                                             |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `GET /healthz`               | liveness                                                            |
+| `GET /status`                | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
+| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link                      |
+| `GET /runs/{id}`             | one run plus its event timeline                                     |
+| `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
+| `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
+| `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
 
 ## Discord notifications
 
@@ -312,6 +330,7 @@ To enable it:
 
 1. In Discord: channel settings → Integrations → Webhooks → New Webhook, then copy its URL.
 2. In `config.json`:
+
    ```json
    "discord": {
      "enabled": true,
@@ -363,7 +382,7 @@ sudo bin/coding-agent-loop --install --config config.json
 
 **Run this via `sudo` from your own already-authenticated account** (the one with `gh auth login`
 and Claude Code already logged in) — not as a `root` login shell. `--install` reads `$SUDO_USER`,
-which `sudo` sets to the account that invoked it, and runs the service as *that* account. This
+which `sudo` sets to the account that invoked it, and runs the service as _that_ account. This
 matters because gh and Claude Code store their auth per-user (`~/.config/gh`,
 `~/.claude/.credentials.json`); a service running as anyone else has no credentials to use, which
 surfaces as `claude binary "claude" is not on PATH` or `gh is not authenticated` in the journal even
@@ -409,21 +428,21 @@ curl localhost:8787/status            # gate/run state (from the host, not the s
 
 ## Layout
 
-| Path | Role |
-|---|---|
-| `cmd/agent.go` | flags, boot checks, wiring |
-| `internal/config` | configuration load and validation |
-| `internal/models` | models.json, ladder selection, embedded default ladder |
-| `internal/store` | SQLite: claims, runs, gates, events |
-| `internal/gh` | GitHub CLI wrapper |
-| `internal/git` | clones and worktrees |
-| `internal/claude` | headless Claude runs, stream-json parsing |
-| `internal/gate` | usage-limit detection and pausing |
-| `internal/verify` | detect and run the repo's tests |
-| `internal/orchestrator` | the loop, prompts, PR reports |
-| `internal/server` | Fiber v3 control API |
-| `internal/proc` | process-group isolation |
-| `internal/install` | embedded systemd unit, `--install` |
+| Path                    | Role                                                   |
+| ----------------------- | ------------------------------------------------------ |
+| `cmd/agent.go`          | flags, boot checks, wiring                             |
+| `internal/config`       | configuration load and validation                      |
+| `internal/models`       | models.json, ladder selection, embedded default ladder |
+| `internal/store`        | SQLite: claims, runs, gates, events                    |
+| `internal/gh`           | GitHub CLI wrapper                                     |
+| `internal/git`          | clones and worktrees                                   |
+| `internal/claude`       | headless Claude runs, stream-json parsing              |
+| `internal/gate`         | usage-limit detection and pausing                      |
+| `internal/verify`       | detect and run the repo's tests                        |
+| `internal/orchestrator` | the loop, prompts, PR reports                          |
+| `internal/server`       | Fiber v3 control API                                   |
+| `internal/proc`         | process-group isolation                                |
+| `internal/install`      | embedded systemd unit, `--install`                     |
 
 ## Tests
 
@@ -436,13 +455,13 @@ without network access or subscription usage.
 
 ## Troubleshooting
 
-| Symptom | Likely cause |
-|---|---|
-| `start-up checks failed: gh is not authenticated` | run `gh auth login` with `repo` + `read:org` scopes |
-| `github.owners is empty: discovery will scan every repository this token can see` | expected if `owners` is unset; narrow it in `config.json` if that's not what you want |
-| Nothing ever gets picked up | confirm an issue actually carries the exact `github.label` value and is open, and its repo isn't in `exclude_repos` |
-| `/status` shows `claiming_work: false` | check `gates` in the response — either a usage limit is active (wait for `blocked_until`) or someone called `POST /pause` |
-| A PR opened but tests show as failed | expected behavior, not a bug — verification failures are reported in the draft PR body rather than blocking it |
-| `--install` fails with a permissions error | it must run as root (`sudo`); it writes to `/etc/systemd/system` and `/opt` |
-| Service won't start after `--install` | `journalctl -u coding-agent-loop -e`; most often a missing/invalid `/opt/coding-agent-loop/config.json` |
-| `git clone` fails with `could not read Username ... terminal prompts disabled` | gh's git credential helper is normally found by name on `$PATH`, and a systemd service's `$PATH` is minimal — this should no longer happen since the daemon resolves `github.binary` to an absolute path and forces git to use it directly as the credential helper (`internal/git/workspace.go`); if you still see it, confirm `gh auth status` succeeds as the account the service runs as (`sudo -u <user> gh auth status`) |
+| Symptom                                                                           | Likely cause                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `start-up checks failed: gh is not authenticated`                                 | run `gh auth login` with `repo` + `read:org` scopes                                                                                                                                                                                                                                                                                                                                                                            |
+| `github.owners is empty: discovery will scan every repository this token can see` | expected if `owners` is unset; narrow it in `config.json` if that's not what you want                                                                                                                                                                                                                                                                                                                                          |
+| Nothing ever gets picked up                                                       | confirm an issue actually carries the exact `github.label` value and is open, and its repo isn't in `exclude_repos`                                                                                                                                                                                                                                                                                                            |
+| `/status` shows `claiming_work: false`                                            | check `gates` in the response — either a usage limit is active (wait for `blocked_until`) or someone called `POST /pause`                                                                                                                                                                                                                                                                                                      |
+| A PR opened but tests show as failed                                              | expected behavior, not a bug — verification failures are reported in the draft PR body rather than blocking it                                                                                                                                                                                                                                                                                                                 |
+| `--install` fails with a permissions error                                        | it must run as root (`sudo`); it writes to `/etc/systemd/system` and `/opt`                                                                                                                                                                                                                                                                                                                                                    |
+| Service won't start after `--install`                                             | `journalctl -u coding-agent-loop -e`; most often a missing/invalid `/opt/coding-agent-loop/config.json`                                                                                                                                                                                                                                                                                                                        |
+| `git clone` fails with `could not read Username ... terminal prompts disabled`    | gh's git credential helper is normally found by name on `$PATH`, and a systemd service's `$PATH` is minimal — this should no longer happen since the daemon resolves `github.binary` to an absolute path and forces git to use it directly as the credential helper (`internal/git/workspace.go`); if you still see it, confirm `gh auth status` succeeds as the account the service runs as (`sudo -u <user> gh auth status`) |
