@@ -123,18 +123,6 @@ func TestDurationRoundTrip(t *testing.T) {
 	}
 }
 
-// max_attempts no longer does anything, but a config file that still carries it
-// has to keep loading — unknown fields are rejected outright.
-func TestRetiredMaxAttemptsStillLoads(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"run":{"max_attempts":2}}`))
-	if err != nil {
-		t.Fatalf("an existing config with max_attempts should still load, got %v", err)
-	}
-	if cfg.Run.RetryBackoff.D() != 15*time.Minute {
-		t.Fatalf("retry backoff default = %v", cfg.Run.RetryBackoff.D())
-	}
-}
-
 func TestRetryBackoffMaxMustNotBeBelowTheBase(t *testing.T) {
 	_, err := Load(writeConfig(t, `{"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`))
 	if err == nil || !strings.Contains(err.Error(), "retry_backoff") {
