@@ -445,3 +445,4 @@ without network access or subscription usage.
 | A PR opened but tests show as failed | expected behavior, not a bug — verification failures are reported in the draft PR body rather than blocking it |
 | `--install` fails with a permissions error | it must run as root (`sudo`); it writes to `/etc/systemd/system` and `/opt` |
 | Service won't start after `--install` | `journalctl -u coding-agent-loop -e`; most often a missing/invalid `/opt/coding-agent-loop/config.json` |
+| `git clone` fails with `could not read Username ... terminal prompts disabled` | gh's git credential helper is normally found by name on `$PATH`, and a systemd service's `$PATH` is minimal — this should no longer happen since the daemon resolves `github.binary` to an absolute path and forces git to use it directly as the credential helper (`internal/git/workspace.go`); if you still see it, confirm `gh auth status` succeeds as the account the service runs as (`sudo -u <user> gh auth status`) |
