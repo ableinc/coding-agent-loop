@@ -5,7 +5,9 @@
     "done_label": "agent-done",
     "failed_label": "agent-failed",
     "plan_label": "agent-planned",
-    "owners": [],
+    "owners": [
+      "your-gh-username"
+    ],
     "exclude_repos": [],
     "search_limit": 50,
     "poll_interval": "5m",
