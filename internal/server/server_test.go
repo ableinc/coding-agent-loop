@@ -219,6 +219,22 @@ func TestCancelRun(t *testing.T) {
 	}
 }
 
+// A run the controller cancels may not have a row in the store (e.g. it
+// hasn't been recorded yet); the notification lookup must not affect the
+// HTTP result or panic.
+func TestCancelRunWithNoStoreRowStillSucceeds(t *testing.T) {
+	s, _, ctrl := testServer(t)
+	ctrl.cancelOK = true
+
+	code, body := do(t, s, http.MethodPost, "/runs/unknown-run/cancel", nil)
+	if code != http.StatusOK {
+		t.Fatalf("cancel = %d", code)
+	}
+	if body["cancelled"] != true {
+		t.Fatalf("unexpected body: %v", body)
+	}
+}
+
 // fiberTimeout gives handlers room on a loaded machine; the default is 1s.
 var fiberTimeout = fiber.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true}
 
