@@ -240,6 +240,9 @@ func (c *Config) Validate() error {
 	if c.GitHub.Label == "" {
 		return fmt.Errorf("github.label must be set: it is the opt-in trigger and an empty label would match every issue")
 	}
+	if len(validOwners(c.GitHub.Owners)) == 0 {
+		return fmt.Errorf("github.owners must list at least one owner: an empty list would scan every repository the token can see")
+	}
 	if c.Run.MaxConcurrentRepos < 1 {
 		return fmt.Errorf("run.max_concurrent_repos must be >= 1, got %d", c.Run.MaxConcurrentRepos)
 	}
@@ -277,10 +280,41 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// validOwners returns the entries of owners that are non-blank after trimming.
+func validOwners(owners []string) []string {
+	out := make([]string, 0, len(owners))
+	for _, o := range owners {
+		if strings.TrimSpace(o) != "" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // Excluded reports whether repo ("owner/name") is vetoed.
 func (g GitHubConfig) Excluded(repo string) bool {
 	for _, r := range g.ExcludeRepos {
 		if strings.EqualFold(r, repo) {
+			return true
+		}
+	}
+	return false
+}
+
+// Owned reports whether repo ("owner/name") belongs to one of the configured
+// owners. Validate rejects a config with no owners, so this is always a real
+// allowlist check, never "everything passes" by default. Callers that touch a
+// repository — discovery, cloning, commenting, labeling, opening a PR — must
+// check this before doing anything with a repo string that did not originate
+// from this allowlist, as a second line of defense against a search result,
+// stale store entry, or future code path smuggling in a repo we don't own.
+func (g GitHubConfig) Owned(repo string) bool {
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return false
+	}
+	for _, o := range validOwners(g.Owners) {
+		if strings.EqualFold(o, owner) {
 			return true
 		}
 	}

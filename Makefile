@@ -2,8 +2,9 @@ BINARY  := bin/coding-agent-loop
 PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './vendor/*')
 CONFIG  ?= config.json
+MODELS  ?= models.json
 
-.PHONY: all help build config check run once dry-run \
+.PHONY: all help build build-check build-summary config check run once dry-run \
         install uninstall print-service \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
 
@@ -13,7 +14,33 @@ all: build
 help:
 	@grep -E '^## ' Makefile | sed 's/^## /  /'
 
-build:
+## build-check: refuse to build unless config.json and models.json exist
+build-check:
+	@missing=""; \
+	test -f "$(CONFIG)" || missing="$$missing $(CONFIG)"; \
+	test -f "$(MODELS)" || missing="$$missing $(MODELS)"; \
+	if [ -n "$$missing" ]; then \
+		echo "coding-agent-loop: refusing to build, missing:$$missing"; \
+		echo "  run 'make config' to create $(CONFIG) from config.example.json, and make sure $(MODELS) exists alongside it"; \
+		exit 1; \
+	fi
+
+## build-summary: print the config.json and models.json content the build depends on
+build-summary:
+	@echo "== $(CONFIG) =="; \
+	if command -v jq >/dev/null 2>&1; then \
+		jq '{label: .github.label, owners: .github.owners, exclude_repos: .github.exclude_repos, poll_interval: .github.poll_interval, search_limit: .github.search_limit, max_concurrent_repos: .run.max_concurrent_repos, discord_enabled: .discord.enabled}' "$(CONFIG)"; \
+	else \
+		cat "$(CONFIG)"; \
+	fi; \
+	echo "== $(MODELS) =="; \
+	if command -v jq >/dev/null 2>&1; then \
+		jq '[.models[] | {id, alias, roles, priority}]' "$(MODELS)"; \
+	else \
+		cat "$(MODELS)"; \
+	fi
+
+build: build-check build-summary
 	go build -ldflags="-w -s" -o $(BINARY) ./cmd
 
 ## config: create config.json from config.example.json if it doesn't exist yet

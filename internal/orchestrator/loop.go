@@ -184,6 +184,14 @@ func (o *Orchestrator) tick(ctx context.Context) {
 		if repo == "" || r.Number == 0 {
 			continue
 		}
+		// Defense in depth: gh is asked to scope search to Owners, but a search
+		// result naming any other repo must never be touched, regardless of why
+		// it slipped through (a gh bug, a flag regression, an API change).
+		if !o.opts.Config.GitHub.Owned(repo) {
+			o.log.Error("discovery returned a repo outside github.owners; refusing to touch it",
+				"repo", repo, "issue", r.Number, "owners", strings.Join(o.opts.Config.GitHub.Owners, ","))
+			continue
+		}
 		ok, reason := o.eligible(ctx, repo, r.Number)
 		if !ok {
 			if reason != "" {
@@ -253,6 +261,9 @@ func (o *Orchestrator) releaseRepo(repo string) {
 // itself from a fresh fetch before acting, so the phase decided here is not
 // carried any further.
 func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bool, string) {
+	if !o.opts.Config.GitHub.Owned(repo) {
+		return false, "repo is not owned by github.owners"
+	}
 	if o.opts.Config.GitHub.Excluded(repo) {
 		return false, "repo excluded by config"
 	}

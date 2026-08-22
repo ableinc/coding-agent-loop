@@ -263,11 +263,6 @@ func bootCheck(cfg config.Config, registry *models.Registry, ghClient *gh.Client
 		}
 	}
 
-	if len(cfg.GitHub.Owners) == 0 {
-		log.Warn("github.owners is empty: discovery will scan every repository this token can see",
-			"label", cfg.GitHub.Label)
-	}
-
 	if len(problems) > 0 {
 		return fmt.Errorf("start-up checks failed:\n  - %s", strings.Join(problems, "\n  - "))
 	}

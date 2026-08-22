@@ -17,10 +17,19 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func TestLoadMissingFileUsesDefaults(t *testing.T) {
-	cfg, err := Load(filepath.Join(t.TempDir(), "absent.json"))
+func TestLoadMissingFileRequiresOwners(t *testing.T) {
+	// Defaults alone are not loadable: github.owners has no sane default, and an
+	// empty list would silently scan every repository the token can see.
+	_, err := Load(filepath.Join(t.TempDir(), "absent.json"))
+	if err == nil || !strings.Contains(err.Error(), "owners") {
+		t.Fatalf("want an owners validation error, got %v", err)
+	}
+}
+
+func TestLoadUsesDefaultsWhenOwnersProvided(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]}}`))
 	if err != nil {
-		t.Fatalf("a missing config should fall back to defaults, got %v", err)
+		t.Fatal(err)
 	}
 	if cfg.GitHub.Label != "agent-ready" {
 		t.Fatalf("unexpected default label %q", cfg.GitHub.Label)
@@ -30,8 +39,15 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestOwnersOfOnlyBlanksIsRejected(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"github":{"owners":["  ",""]}}`))
+	if err == nil || !strings.Contains(err.Error(), "owners") {
+		t.Fatalf("want an owners validation error, got %v", err)
+	}
+}
+
 func TestLoadOverlaysOntoDefaults(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"github":{"label":"claude-please","poll_interval":"90s"}}`))
+	cfg, err := Load(writeConfig(t, `{"github":{"label":"claude-please","poll_interval":"90s","owners":["acme"]}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +80,7 @@ func TestBadDurationIsReportedClearly(t *testing.T) {
 // A lease shorter than the run timeout means a live run can have its claim
 // stolen mid-flight, so it must be rejected at load time.
 func TestLeaseMustExceedTimeout(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"run":{"timeout":"45m","lease":"10m"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"timeout":"45m","lease":"10m"}}`))
 	if err == nil || !strings.Contains(err.Error(), "must exceed") {
 		t.Fatalf("want a lease/timeout validation error, got %v", err)
 	}
@@ -85,7 +101,7 @@ func TestAggressiveUsagePollIsRejected(t *testing.T) {
 }
 
 func TestPathsAreExpandedAndAbsolute(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"store":{"path":"~/.agent-loop/test.db"}}`))
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"store":{"path":"~/.agent-loop/test.db"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +124,19 @@ func TestExcluded(t *testing.T) {
 	}
 }
 
+func TestOwned(t *testing.T) {
+	g := GitHubConfig{Owners: []string{"Acme", " ", ""}}
+	if !g.Owned("acme/widgets") {
+		t.Fatal("owner match should be case-insensitive")
+	}
+	if g.Owned("someoneelse/widgets") {
+		t.Fatal("repo owned by someone else must not be considered owned")
+	}
+	if g.Owned("not-a-repo-string") {
+		t.Fatal("a repo without an owner/name split must never be considered owned")
+	}
+}
+
 func TestDurationRoundTrip(t *testing.T) {
 	d := Duration(90 * time.Second)
 	b, err := d.MarshalJSON()
@@ -124,7 +153,7 @@ func TestDurationRoundTrip(t *testing.T) {
 }
 
 func TestRetryBackoffMaxMustNotBeBelowTheBase(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`))
 	if err == nil || !strings.Contains(err.Error(), "retry_backoff") {
 		t.Fatalf("want a backoff validation error, got %v", err)
 	}

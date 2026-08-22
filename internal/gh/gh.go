@@ -203,15 +203,35 @@ func (c *Client) SearchIssues(ctx context.Context, label string, owners []string
 	if err := c.runJSON(ctx, &results, args...); err != nil {
 		return nil, err
 	}
-	// Defensive: drop anything that slipped through as a PR or non-open.
+	// Defensive: drop anything that slipped through as a PR, non-open, or (when
+	// owners were given) outside the requested owners. gh is trusted to honour
+	// --owner, but a result naming any other repo must never reach the caller.
 	filtered := results[:0]
 	for _, r := range results {
 		if r.IsPullRequest {
 			continue
 		}
+		if len(owners) > 0 && !ownedBy(r.Repository.NameWithOwner, owners) {
+			c.logf("dropping search result for %s: repository owner is not in %v", r.Repository.NameWithOwner, owners)
+			continue
+		}
 		filtered = append(filtered, r)
 	}
 	return filtered, nil
+}
+
+// ownedBy reports whether repo ("owner/name") belongs to one of owners.
+func ownedBy(repo string, owners []string) bool {
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return false
+	}
+	for _, o := range owners {
+		if o = strings.TrimSpace(o); o != "" && strings.EqualFold(o, owner) {
+			return true
+		}
+	}
+	return false
 }
 
 // ViewIssue fetches one issue with its comments.

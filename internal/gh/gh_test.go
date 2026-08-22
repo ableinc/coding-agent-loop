@@ -71,6 +71,27 @@ func TestSearchIssues(t *testing.T) {
 	}
 }
 
+// gh is asked to scope the search with --owner, but a result naming a repo
+// under any other owner must still be dropped before it reaches the caller.
+func TestSearchIssuesDropsResultsOutsideOwners(t *testing.T) {
+	out := `[
+	  {"number":1,"title":"In scope","repository":{"nameWithOwner":"acme/widgets"},
+	   "isPullRequest":false,"state":"open"},
+	  {"number":2,"title":"Wrong owner","repository":{"nameWithOwner":"someoneelse/other"},
+	   "isPullRequest":false,"state":"open"}
+	]`
+	bin, _, _ := stubGH(t, out)
+	c := New(bin, false)
+
+	results, err := c.SearchIssues(context.Background(), "agent-ready", []string{"acme"}, 10)
+	if err != nil {
+		t.Fatalf("SearchIssues: %v", err)
+	}
+	if len(results) != 1 || results[0].Repository.NameWithOwner != "acme/widgets" {
+		t.Fatalf("expected only the acme/widgets issue, got %+v", results)
+	}
+}
+
 // An empty label would match every open issue in every visible repo.
 func TestSearchIssuesRejectsEmptyLabel(t *testing.T) {
 	bin, _, _ := stubGH(t, "[]")

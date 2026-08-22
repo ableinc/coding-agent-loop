@@ -103,6 +103,13 @@ sudo journalctl -u coding-agent-loop # check system daemon logs (or at ~/.agent-
 Label an issue `agent-ready` in one of the repositories you own. The next poll posts a plan as a
 comment on the issue; reply `implement` on that comment to have the daemon carry it out.
 
+`make build` (and everything that depends on it — `check`, `run`, `once`, `dry-run`, `install`,
+`print-service`) refuses to run unless `config.json` and `models.json` are both present next to the
+Makefile, and prints a summary of the settings it found in each (label, owners, poll/search
+settings, concurrency, whether Discord is enabled, and the model ladder) before compiling. Secrets
+like `discord.webhook_url` are deliberately left out of that summary. Override the paths it checks
+with `CONFIG=path/to/config.json MODELS=path/to/models.json make build`.
+
 ## CLI flags
 
 All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `make once` / `make dry-run`):
@@ -159,8 +166,11 @@ flight at a time), controlled by `run.max_concurrent_repos`.
 ## Lifecycle of one issue
 
 1. **Discover** — `gh search issues --label <label> --state open` scoped to `github.owners`, minus
-   `exclude_repos`. The issue is fetched and its comments decide the phase (plan, wait, or
-   implement) before anything is claimed.
+   `exclude_repos`. Any result naming a repository outside `github.owners` is dropped and logged as
+   an error rather than acted on — this is checked independently in the `gh` client, at the top of
+   discovery, and again before an issue is claimed, so a `gh` bug, flag regression, or stale search
+   index can never lead to work on a repo the daemon doesn't own. The issue is fetched and its
+   comments decide the phase (plan, wait, or implement) before anything is claimed.
 2. **Claim** — an atomic SQLite insert with a lease (`run.lease`); losing the race means another
    worker already has it. The issue gets the `agent-working` label and a `runs` row.
 3. **Workspace** — the repo is cloned once (checkout-less) into `workspace.repos_root`, then a
@@ -267,7 +277,7 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `github.label`                                         | trigger label; **must not be empty**, or every open issue would match                                                              |
 | `github.working_label` / `done_label` / `failed_label` | status labels the daemon swaps `label` for                                                                                         |
 | `github.plan_label`                                    | label added while a posted plan awaits an `implement` reply, removed once the change is delivered                                  |
-| `github.owners`                                        | users/orgs to search; empty means every repo the `gh` token can see (a boot-time warning fires if left empty)                      |
+| `github.owners`                                        | users/orgs to search; **required, must list at least one non-blank entry** — the daemon refuses to start otherwise, so it can never fall back to scanning every repo the `gh` token can see |
 | `github.exclude_repos`                                 | `owner/name` repos to never touch, even if labelled                                                                                |
 | `github.search_limit`                                  | max issues fetched per discovery pass                                                                                              |
 | `github.poll_interval`                                 | how often discovery runs                                                                                                           |
@@ -427,6 +437,11 @@ Claude runs with `--permission-mode bypassPermissions`, so within a run it can d
 user can. What constrains it:
 
 - **The label** is per-issue opt-in; **`exclude_repos`** is the per-repo veto.
+- **`github.owners` is a hard allowlist, not a search hint.** It's required at startup (an empty or
+  all-blank list fails config validation), and every repo the daemon is about to act on is checked
+  against it independently in three places — the `gh` client's own post-filter on search results,
+  the top of the discovery loop, and the eligibility check right before a claim — so a `gh` bug or
+  regression can't quietly widen scope to repos the daemon doesn't own.
 - **The remote is re-checked immediately before every push** — a worktree whose `origin` is not the
   repository the run claimed is refused.
 - **The harness owns git and GitHub.** The system prompt forbids the agent from pushing, opening
@@ -528,7 +543,9 @@ without network access or subscription usage.
 | Symptom                                                                           | Likely cause                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `start-up checks failed: gh is not authenticated`                                 | run `gh auth login` with `repo` + `read:org` scopes                                                                                                                                                                                                                                                                                                                                                                            |
-| `github.owners is empty: discovery will scan every repository this token can see` | expected if `owners` is unset; narrow it in `config.json` if that's not what you want                                                                                                                                                                                                                                                                                                                                          |
+| `github.owners must list at least one owner: ...`                                 | `config.json`'s `github.owners` is missing, empty, or all-blank; list at least one user/org                                                                                                                                                                                                                                                                                                                                    |
+| `coding-agent-loop: refusing to build, missing: config.json models.json`          | `make build` (or any target that depends on it) found `config.json` and/or `models.json` missing next to the Makefile; run `make config` and make sure both files exist, or pass `CONFIG=`/`MODELS=` to point elsewhere                                                                                                                                                                                                      |
+| `discovery returned a repo outside github.owners; refusing to touch it`           | a `gh search issues` result named a repo not owned by any entry in `github.owners`; the daemon skips it and logs this rather than acting on it — investigate why `gh` returned it (stale index, `--owner` flag behavior) if it recurs                                                                                                                                                                                        |
 | Nothing ever gets picked up                                                       | confirm an issue actually carries the exact `github.label` value and is open, and its repo isn't in `exclude_repos`                                                                                                                                                                                                                                                                                                            |
 | `/status` shows `claiming_work: false`                                            | check `gates` in the response — either a usage limit is active (wait for `blocked_until`) or someone called `POST /pause`                                                                                                                                                                                                                                                                                                      |
 | A PR opened but tests show as failed                                              | expected behavior, not a bug — verification failures are reported in the draft PR body rather than blocking it                                                                                                                                                                                                                                                                                                                 |
