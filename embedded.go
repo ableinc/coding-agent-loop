@@ -2,10 +2,10 @@
 // models.json into the binary, so one shipped on its own — no repo checkout
 // on the host — still boots with a complete configuration and model ladder.
 //
-// go:embed cannot reach outside the directory of the file that declares it,
-// which is why this lives at the module root next to the files it embeds
-// rather than under cmd/ or internal/: neither of those can reach ../config.json
-// or ../models.json.
+// The embed directive cannot reach outside the directory of the file that
+// declares it, which is why this lives at the module root next to the files
+// it embeds rather than under cmd/ or internal/: neither of those can reach
+// ../config.json or ../models.json.
 //
 // An external config.json or models.json found next to the running binary,
 // or passed via --config, always takes precedence over these — see
