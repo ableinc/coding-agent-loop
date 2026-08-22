@@ -22,7 +22,7 @@ const goodModels = `{"models":[
 ]}`
 
 func TestLoadAndLadderOrder(t *testing.T) {
-	reg, err := Load(writeModels(t, goodModels))
+	reg, err := Load(writeModels(t, goodModels), false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestLoadAndLadderOrder(t *testing.T) {
 }
 
 func TestLadderSkipsCooledDownModels(t *testing.T) {
-	reg, err := Load(writeModels(t, goodModels))
+	reg, err := Load(writeModels(t, goodModels), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestLadderSkipsCooledDownModels(t *testing.T) {
 // Refusing to run at all is worse than retrying a model whose cooldown may be
 // stale — the usage gate is the real brake.
 func TestLadderFallsBackWhenEverythingIsCooledDown(t *testing.T) {
-	reg, err := Load(writeModels(t, goodModels))
+	reg, err := Load(writeModels(t, goodModels), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestRefFallsBackToID(t *testing.T) {
 }
 
 func TestResolveMatchesDatedAndCanonicalIDs(t *testing.T) {
-	reg, err := Load(writeModels(t, goodModels))
+	reg, err := Load(writeModels(t, goodModels), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestResolveMatchesDatedAndCanonicalIDs(t *testing.T) {
 // than failing outright.
 func TestLoadFallsBackToEmbeddedDefaultWhenFileMissing(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
-	reg, err := Load(missing)
+	reg, err := Load(missing, true)
 	if err != nil {
 		t.Fatalf("load should fall back to the embedded default, got: %v", err)
 	}
@@ -140,10 +140,19 @@ func TestLoadFallsBackToEmbeddedDefaultWhenFileMissing(t *testing.T) {
 	}
 }
 
+// An explicitly requested path (allowEmbeddedFallback=false) that doesn't
+// exist is a misconfiguration to report, not something to paper over.
+func TestLoadRejectsMissingExplicitPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	if _, err := Load(missing, false); err == nil {
+		t.Fatal("an explicit path that does not exist must be an error, not a silent embedded fallback")
+	}
+}
+
 // A file present at path is the whole point of letting an operator customize
 // the ladder without rebuilding — it must win over the embedded default.
 func TestLoadPrefersFileOverEmbeddedDefault(t *testing.T) {
-	reg, err := Load(writeModels(t, `{"models":[{"id":"custom-model","alias":"custom","roles":["plan","implement"],"priority":1}]}`))
+	reg, err := Load(writeModels(t, `{"models":[{"id":"custom-model","alias":"custom","roles":["plan","implement"],"priority":1}]}`), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +174,7 @@ func TestValidationRejectsBadRegistries(t *testing.T) {
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := Load(writeModels(t, body)); err == nil {
+			if _, err := Load(writeModels(t, body), false); err == nil {
 				t.Fatal("expected a validation error")
 			}
 		})

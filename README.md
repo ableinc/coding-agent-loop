@@ -29,6 +29,7 @@ gh search issues --label agent-ready
 - [Configuration reference](#configuration-reference)
   - [config.json](#configjson)
   - [models.json](#modelsjson)
+- [Embedded defaults](#embedded-defaults)
 - [When it stops](#when-it-stops)
 - [Control API](#control-api)
 - [Discord notifications](#discord-notifications)
@@ -104,11 +105,16 @@ Label an issue `agent-ready` in one of the repositories you own. The next poll p
 comment on the issue; reply `implement` on that comment to have the daemon carry it out.
 
 `make build` (and everything that depends on it — `check`, `run`, `once`, `dry-run`, `install`,
-`print-service`) refuses to run unless `config.json` and `models.json` are both present next to the
-Makefile, and prints a summary of the settings it found in each (label, owners, poll/search
-settings, concurrency, whether Discord is enabled, and the model ladder) before compiling. Secrets
-like `discord.webhook_url` are deliberately left out of that summary. Override the paths it checks
-with `CONFIG=path/to/config.json MODELS=path/to/models.json make build`.
+`print-service`) refuses to run unless `config.json` and `models.json` are both present at the repo
+root, and prints a summary of the settings it found in each (label, owners, poll/search settings,
+concurrency, whether Discord is enabled, and the model ladder) before compiling. Secrets like
+`discord.webhook_url` are deliberately left out of that summary. This check isn't just a courtesy:
+`go:embed` compiles these two exact files into the binary (see
+[Embedded defaults](#embedded-defaults)), so the build genuinely cannot succeed without them — the
+check exists to fail with a clear message before `go build` fails with a less helpful one. Unlike
+the `CONFIG`/`MODELS` variables used elsewhere in this Makefile (which only set which file the
+*built binary* reads via `--config` at runtime), the files checked and embedded here are always the
+literal `config.json`/`models.json` at the repo root — that pairing can't be parameterized.
 
 ## CLI flags
 
@@ -116,13 +122,14 @@ All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `mak
 
 | Flag              | Default       | Effect                                                                   |
 | ----------------- | ------------- | ------------------------------------------------------------------------ |
-| `--config`        | `config.json` | path to the configuration file                                           |
+| `--config`        | *(none)*      | path to the configuration file; if omitted, looks for `config.json` next to the binary, then falls back to the config embedded at build time — see [Embedded defaults](#embedded-defaults) |
 | `--once`          | off           | run a single discovery pass, then exit (no server)                       |
 | `--dry-run`       | off           | do everything except push branches, open PRs, or edit issues             |
 | `--log-level`     | `info`        | `debug`, `info`, `warn`, or `error`                                      |
 | `--no-server`     | off           | do not start the control API                                             |
 | `--check`         | off           | run start-up checks (binaries, auth, config) and exit                    |
 | `--install`       | off           | install + enable + start the systemd unit; **must run as root**          |
+| `--uninstall`     | off           | stop, disable, and remove everything `--install` created; **must run as root** |
 | `--print-service` | off           | print the embedded systemd unit to stdout and exit; no privileges needed |
 
 ## How work is selected
@@ -215,6 +222,9 @@ neither extends the back-off nor drops the issue down the ladder.
 Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, `"45m"`, `"90m"`).
 `~` is expanded to your home directory.
 
+This repository's own `config.json` is also **compiled into the binary** at build time — see
+[Embedded defaults](#embedded-defaults) for exactly when that copy is used versus an external file.
+
 ```json
 {
   "github": {
@@ -302,7 +312,7 @@ Copy `config.example.json` and edit. Durations are Go duration strings (`"5m"`, 
 | `store.path`                                           | SQLite database path                                                                                                               |
 | `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |
 | `discord.webhook_url`                                  | the channel's incoming webhook URL; **required** if `discord.enabled` is true                                                      |
-| `models_path`                                          | path to `models.json`                                                                                                              |
+| `models_path`                                          | where to look for `models.json`; see [Embedded defaults](#embedded-defaults) for how the default value is resolved                 |
 
 ### models.json
 
@@ -349,11 +359,46 @@ hardcoded in Go — this file is the only place to update one.
   If every candidate is cooled down, the full ladder is used anyway — refusing to run at all is
   worse; the usage gate is the real brake.
 
-The content above is also **embedded in the binary** (`internal/models/default.json`) as of build
-time, so a `coding-agent-loop` binary copied to a host on its own — no repo checkout, no
-`models.json` alongside it — still boots with a working ladder. A `models.json` at `models_path`
-(default `./models.json`, next to wherever the binary runs from) always takes precedence when
-present, so you can still customize the ladder on a given host without rebuilding.
+This repository's own `models.json` is **compiled into the binary** at build time via `go:embed`
+(see [Embedded defaults](#embedded-defaults)), so a `coding-agent-loop` binary copied to a host on
+its own — no repo checkout, no `models.json` alongside it — still boots with a working ladder.
+When `models_path` is left at its default (`"models.json"`), a `models.json` found **next to the
+running binary** always takes precedence over the embedded copy, so you can still customize the
+ladder on a given host without rebuilding. Point `models_path` at a different location and that
+exact file is required to exist — there's no silent fallback for an explicit path.
+
+## Embedded defaults
+
+This repository's own `config.json` and `models.json` — whatever they contain at build time — are
+compiled into the binary via `go:embed` (a small root-level package, `embedded.go`, since `go:embed`
+can't reach outside the directory of the file declaring it, and both files live at the repo root).
+**Building the binary fails outright if either file is missing from the repo root** — there's no way
+to make the embed conditional — so `make build` checks for both up front and refuses to proceed
+otherwise (see `build-check` in the Makefile).
+
+At startup, each file is looked up independently, in this order:
+
+1. **`--config <path>`**, if you pass it: that exact file is used and must exist — no fallback.
+2. Otherwise, **`config.json` next to the running binary itself** (its own directory, not your shell's
+   current directory) — used if present.
+3. Otherwise, the **embedded copy** compiled in at build time.
+
+`models.json` follows the same rule via `models_path` inside whichever config.json won: leaving it
+at the default `"models.json"` means "look next to the binary, then fall back to the embedded copy";
+pointing it at anything else is treated as an explicit path, which must exist.
+
+This means a binary built from this repository as-is ships with **this repository's own settings as
+its fallback** — including `github.owners`, and `discord.webhook_url` if Discord is enabled — for
+anyone who runs it without supplying their own `config.json`. If you're building this for your own
+use, put your real settings in `config.json` before running `make build`, or always pass `--config`
+pointing at your own file.
+
+The systemd unit `--install` writes (see [Deploying with systemd](#deploying-with-systemd)) always
+passes an explicit `--config /opt/coding-agent-loop/config.json`, which is step 1 above — so under
+systemd, step 2 never applies. `--install` itself is what guarantees that file exists: it writes
+either your `--config` file's content there, or — if you ran `--install` without `--config` — the
+embedded config's content, so the installed service still boots on the embedded defaults rather than
+failing to find an explicit path that was never created.
 
 ## When it stops
 
@@ -480,7 +525,11 @@ when both work fine interactively.
    root — in which case you must separately run `sudo -u coding-agent-loop gh auth login` and the
    Claude Code login flow before the service can do anything);
 2. copies the running binary to `/opt/coding-agent-loop/bin/coding-agent-loop`;
-3. copies `--config` to `/opt/coding-agent-loop/config.json` — **never** overwriting one already there;
+3. writes `/opt/coding-agent-loop/config.json` — **never** overwriting one already there. Its content
+   is `--config`'s file if you passed one, otherwise the config embedded in the binary at build time
+   (see [Embedded defaults](#embedded-defaults)): the systemd unit's `ExecStart` always names this
+   exact path explicitly, so it must exist for the service to start regardless of whether you passed
+   `--config`;
 4. writes `/etc/systemd/system/coding-agent-loop.service` with `User=`/`Group=` set to that account;
 5. runs `systemctl daemon-reload` then `enable --now coding-agent-loop.service`;
 6. confirms the unit reached `active`.
@@ -511,23 +560,52 @@ sudo systemctl restart coding-agent-loop
 curl localhost:8787/status            # gate/run state (from the host, not the service user)
 ```
 
+To remove everything `--install` created:
+
+```sh
+sudo bin/coding-agent-loop --uninstall   # or: make uninstall
+```
+
+`--uninstall` (root required) reverses every step of `--install`:
+
+1. stops and disables `coding-agent-loop.service` (fine if it wasn't running);
+2. reads `workspace.root`, `workspace.repos_root`, `workspace.logs_root`, `store.path`, and
+   `claude.usage_cache_path` from `/opt/coding-agent-loop/config.json` (the copy that actually drove
+   the running service — falling back to whatever `--config` points at, default `config.json`, if
+   that copy is already gone, then to the compiled defaults under `~/.agent-loop` if neither is
+   found) and removes exactly those directories/files, resolved against the account the service ran
+   as — **not** `claude.credentials_path`, which is Claude Code's own login and predates this app's
+   install;
+3. removes `/etc/systemd/system/coding-agent-loop.service` and runs `systemctl daemon-reload`;
+4. removes `/opt/coding-agent-loop` entirely (binary and config);
+5. if `--install` ever fell back to creating the dedicated `coding-agent-loop` system user (no
+   `$SUDO_USER` at install time), removes that account and its entire home (`userdel -r`) — safe
+   because that account and home exist solely for this service, and a superset of step 2 for
+   anything under it.
+
+If you moved `workspace.root`/`workspace.repos_root`/`workspace.logs_root`/`store.path`/
+`claude.usage_cache_path` to non-default locations, step 2 follows your config there too — it does
+not assume `~/.agent-loop`. Run `--uninstall` the same way you ran `--install` (`sudo` from your own
+account, or with the same `--config`) so it resolves the same account and config `--install` used.
+
 ## Layout
 
-| Path                    | Role                                                   |
-| ----------------------- | ------------------------------------------------------ |
-| `cmd/agent.go`          | flags, boot checks, wiring                             |
-| `internal/config`       | configuration load and validation                      |
-| `internal/models`       | models.json, ladder selection, embedded default ladder |
-| `internal/store`        | SQLite: claims, runs, gates, events, sessions          |
-| `internal/gh`           | GitHub CLI wrapper                                     |
-| `internal/git`          | clones and worktrees                                   |
-| `internal/claude`       | headless Claude runs, stream-json parsing              |
-| `internal/gate`         | usage-limit detection and pausing                      |
-| `internal/verify`       | detect and run the repo's tests                        |
-| `internal/orchestrator` | the loop, prompts, PR reports                          |
-| `internal/server`       | Fiber v3 control API                                   |
-| `internal/proc`         | process-group isolation                                |
-| `internal/install`      | embedded systemd unit, `--install`                     |
+| Path                    | Role                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `embedded.go`            | `go:embed` for the repo-root `config.json`/`models.json` (see [Embedded defaults](#embedded-defaults)) |
+| `cmd/agent.go`          | flags, boot checks, wiring, resolving config/models paths                    |
+| `internal/config`       | configuration load and validation                                            |
+| `internal/models`       | models.json parsing, ladder selection                                        |
+| `internal/store`        | SQLite: claims, runs, gates, events, sessions                                |
+| `internal/gh`           | GitHub CLI wrapper                                                            |
+| `internal/git`          | clones and worktrees                                                         |
+| `internal/claude`       | headless Claude runs, stream-json parsing                                    |
+| `internal/gate`         | usage-limit detection and pausing                                            |
+| `internal/verify`       | detect and run the repo's tests                                              |
+| `internal/orchestrator` | the loop, prompts, PR reports                                                |
+| `internal/server`       | Fiber v3 control API                                                         |
+| `internal/proc`         | process-group isolation                                                      |
+| `internal/install`      | embedded systemd unit, `--install`/`--uninstall`                             |
 
 ## Tests
 

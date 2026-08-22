@@ -17,17 +17,33 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func TestLoadMissingFileRequiresOwners(t *testing.T) {
-	// Defaults alone are not loadable: github.owners has no sane default, and an
-	// empty list would silently scan every repository the token can see.
-	_, err := Load(filepath.Join(t.TempDir(), "absent.json"))
-	if err == nil || !strings.Contains(err.Error(), "owners") {
-		t.Fatalf("want an owners validation error, got %v", err)
+// An explicitly requested path (allowEmbeddedFallback=false) that doesn't
+// exist is a misconfiguration to report, not something to paper over.
+func TestLoadRejectsMissingExplicitPath(t *testing.T) {
+	_, err := Load(filepath.Join(t.TempDir(), "absent.json"), false)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("want a config-not-found error, got %v", err)
+	}
+}
+
+// A binary shipped without the rest of the repo has nothing at the default
+// path, so Load must fall back to the config embedded at build time (the
+// repo's own, real config.json) rather than failing outright.
+func TestLoadFallsBackToEmbeddedConfigWhenAllowed(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "absent.json"), true)
+	if err != nil {
+		t.Fatalf("load should fall back to the embedded config, got: %v", err)
+	}
+	if cfg.GitHub.Label == "" {
+		t.Fatal("embedded config should produce a usable label")
+	}
+	if len(cfg.GitHub.Owners) == 0 {
+		t.Fatal("embedded config should produce a usable owners list")
 	}
 }
 
 func TestLoadUsesDefaultsWhenOwnersProvided(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]}}`))
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]}}`), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,14 +56,14 @@ func TestLoadUsesDefaultsWhenOwnersProvided(t *testing.T) {
 }
 
 func TestOwnersOfOnlyBlanksIsRejected(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"owners":["  ",""]}}`))
+	_, err := Load(writeConfig(t, `{"github":{"owners":["  ",""]}}`), false)
 	if err == nil || !strings.Contains(err.Error(), "owners") {
 		t.Fatalf("want an owners validation error, got %v", err)
 	}
 }
 
 func TestLoadOverlaysOntoDefaults(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"github":{"label":"claude-please","poll_interval":"90s","owners":["acme"]}}`))
+	cfg, err := Load(writeConfig(t, `{"github":{"label":"claude-please","poll_interval":"90s","owners":["acme"]}}`), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,14 +80,14 @@ func TestLoadOverlaysOntoDefaults(t *testing.T) {
 }
 
 func TestUnknownFieldsAreRejected(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"labl":"typo"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"labl":"typo"}}`), false)
 	if err == nil {
 		t.Fatal("a misspelled key must fail loudly rather than be silently ignored")
 	}
 }
 
 func TestBadDurationIsReportedClearly(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"poll_interval":"5 minutes"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"poll_interval":"5 minutes"}}`), false)
 	if err == nil || !strings.Contains(err.Error(), "invalid duration") {
 		t.Fatalf("want a duration parse error, got %v", err)
 	}
@@ -80,28 +96,28 @@ func TestBadDurationIsReportedClearly(t *testing.T) {
 // A lease shorter than the run timeout means a live run can have its claim
 // stolen mid-flight, so it must be rejected at load time.
 func TestLeaseMustExceedTimeout(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"timeout":"45m","lease":"10m"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"timeout":"45m","lease":"10m"}}`), false)
 	if err == nil || !strings.Contains(err.Error(), "must exceed") {
 		t.Fatalf("want a lease/timeout validation error, got %v", err)
 	}
 }
 
 func TestEmptyLabelIsRejected(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"label":""}}`))
+	_, err := Load(writeConfig(t, `{"github":{"label":""}}`), false)
 	if err == nil || !strings.Contains(err.Error(), "label") {
 		t.Fatalf("an empty label would match every issue; want an error, got %v", err)
 	}
 }
 
 func TestAggressiveUsagePollIsRejected(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"claude":{"usage_poll_interval":"5s"}}`))
+	_, err := Load(writeConfig(t, `{"claude":{"usage_poll_interval":"5s"}}`), false)
 	if err == nil {
 		t.Fatal("the usage endpoint rate-limits hard; a 5s poll must be rejected")
 	}
 }
 
 func TestPathsAreExpandedAndAbsolute(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"store":{"path":"~/.agent-loop/test.db"}}`))
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"store":{"path":"~/.agent-loop/test.db"}}`), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +169,7 @@ func TestDurationRoundTrip(t *testing.T) {
 }
 
 func TestRetryBackoffMaxMustNotBeBelowTheBase(t *testing.T) {
-	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`))
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"run":{"retry_backoff":"1h","retry_backoff_max":"10m"}}`), false)
 	if err == nil || !strings.Contains(err.Error(), "retry_backoff") {
 		t.Fatalf("want a backoff validation error, got %v", err)
 	}

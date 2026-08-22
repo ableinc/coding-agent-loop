@@ -38,6 +38,7 @@ type flags struct {
 	noServer   bool
 	checkOnly  bool
 	install    bool
+	uninstall  bool
 	printUnit  bool
 }
 
@@ -55,6 +56,7 @@ Usage:
   coding-agent-loop --check              verify prerequisites (git, claude, gh, config) and exit
   coding-agent-loop --print-service      print the embedded systemd unit
   sudo coding-agent-loop --install       install, enable, and start the systemd unit
+  sudo coding-agent-loop --uninstall     stop, disable, and remove everything --install created
 
 See README.md for configuration (config.json, models.json) and the control API.
 
@@ -67,13 +69,14 @@ func main() {
 		fmt.Fprint(flag.CommandLine.Output(), usageHeader)
 		flag.PrintDefaults()
 	}
-	flag.StringVar(&f.configPath, "config", "config.json", "path to the configuration file")
+	flag.StringVar(&f.configPath, "config", "", "path to the configuration file (default: config.json next to the binary, falling back to the config.json embedded at build time)")
 	flag.BoolVar(&f.once, "once", false, "run a single discovery pass, then exit")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "do everything except push branches, open PRs, or edit issues")
 	flag.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	flag.BoolVar(&f.noServer, "no-server", false, "do not start the control API")
 	flag.BoolVar(&f.checkOnly, "check", false, "run start-up checks and exit")
 	flag.BoolVar(&f.install, "install", false, "install the systemd unit (embedded in this binary), enable it, and start it; must run as root")
+	flag.BoolVar(&f.uninstall, "uninstall", false, "stop, disable, and remove the systemd unit, /opt/coding-agent-loop, and any ~/.agent-loop or dedicated service user --install created; must run as root")
 	flag.BoolVar(&f.printUnit, "print-service", false, "print the systemd unit --install would write and exit")
 	flag.Parse()
 
@@ -102,12 +105,41 @@ func run(f flags) error {
 			Log:        func(format string, args ...any) { log.Info(format, args...) },
 		})
 	}
+	if f.uninstall {
+		return install.Uninstall(install.UninstallOptions{
+			ConfigPath: f.configPath,
+			Log:        func(format string, args ...any) { log.Info(format, args...) },
+		})
+	}
 
-	cfg, err := config.Load(f.configPath)
+	configPath, allowConfigFallback := f.configPath, f.configPath == ""
+	if allowConfigFallback {
+		dir, err := execDir()
+		if err != nil {
+			return fmt.Errorf("resolve default config.json location: %w", err)
+		}
+		configPath = filepath.Join(dir, "config.json")
+	}
+	cfg, err := config.Load(configPath, allowConfigFallback)
 	if err != nil {
 		return err
 	}
-	registry, err := models.Load(cfg.ModelsPath)
+
+	modelsPath, allowModelsFallback := cfg.ModelsPath, cfg.ModelsPath == "models.json"
+	if allowModelsFallback {
+		dir, err := execDir()
+		if err != nil {
+			return fmt.Errorf("resolve default models.json location: %w", err)
+		}
+		modelsPath = filepath.Join(dir, cfg.ModelsPath)
+	} else {
+		expanded, err := config.ExpandPath(modelsPath)
+		if err != nil {
+			return fmt.Errorf("resolve models_path %q: %w", modelsPath, err)
+		}
+		modelsPath = expanded
+	}
+	registry, err := models.Load(modelsPath, allowModelsFallback)
 	if err != nil {
 		return err
 	}
@@ -208,6 +240,23 @@ func run(f flags) error {
 	notifier.Close(3 * time.Second)
 
 	return err
+}
+
+// execDir returns the directory containing the running binary — resolved
+// through any symlink (e.g. a PATH entry) — not the process's current
+// working directory. This is where a config.json/models.json placed "next to
+// the binary" is looked up by default, so the answer stays the same
+// regardless of where the binary happens to be invoked from.
+func execDir() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve running binary path: %w", err)
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("resolve running binary path: %w", err)
+	}
+	return filepath.Dir(exe), nil
 }
 
 func newLogger(level string) *slog.Logger {

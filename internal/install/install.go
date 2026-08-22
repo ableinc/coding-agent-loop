@@ -14,6 +14,7 @@ package install
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	embedded "github.com/ableinc/coding-agent-loop"
 )
 
 //go:embed coding-agent-loop.service
@@ -227,28 +230,233 @@ func copySelf(dest string) error {
 
 // installConfig copies configPath to dest unless dest already exists — an
 // operator's live config must never be clobbered by a re-run of --install.
+//
+// The systemd unit's ExecStart always passes an explicit --config pointing at
+// dest, so dest must exist for the service to start at all: an explicit
+// --config path is never allowed to fall back silently (see config.Load).
+// When the operator supplied no config (or it couldn't be read), this writes
+// the config embedded in the binary at build time instead, so the freshly
+// installed service still boots rather than failing until someone drops a
+// file in by hand.
 func installConfig(configPath, dest string, t target, log func(string, ...any)) error {
 	if _, err := os.Stat(dest); err == nil {
 		log("config already present, leaving it untouched", "path", dest)
 		return nil
 	}
-	if configPath == "" {
-		log("no config supplied; drop one at " + dest + " before starting the service")
-		return nil
+
+	data := embedded.Config
+	source := "embedded config (compiled in at build time)"
+	if configPath != "" {
+		if fileData, err := os.ReadFile(configPath); err != nil {
+			log("config not readable, installing the embedded config instead", "source", configPath, "err", err.Error())
+		} else {
+			data, source = fileData, configPath
+		}
+	} else {
+		log("no config supplied, installing the embedded config instead")
 	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		log("config not readable; drop one at "+dest+" before starting the service", "source", configPath, "err", err.Error())
-		return nil
-	}
+
 	if err := os.WriteFile(dest, data, 0o640); err != nil {
 		return err
 	}
 	if err := os.Chown(dest, t.uid, t.gid); err != nil {
 		return err
 	}
-	log("config installed", "path", dest)
+	log("config installed", "path", dest, "source", source)
 	return nil
+}
+
+// installedConfigPath is where Run copies the operator's config.json, and the
+// one that actually drives the running service — the definitive source of
+// where it was told to keep its state.
+var installedConfigPath = filepath.Join(installRoot, "config.json")
+
+// UninstallOptions controls uninstall logging and where to read state paths
+// from when the installed config.json is already gone.
+type UninstallOptions struct {
+	// ConfigPath is consulted for workspace/store paths only when
+	// installedConfigPath does not exist. Optional.
+	ConfigPath string
+	Log        func(format string, args ...any)
+}
+
+// Uninstall reverses Run: stops and disables the unit, removes the unit file
+// and /opt/coding-agent-loop, and removes exactly the state directories and
+// files the operator's config.json told the service to use — workspace.root,
+// workspace.repos_root, workspace.logs_root, store.path, and
+// claude.usage_cache_path — resolved against the account the service ran as,
+// the same way Run resolves it. It never touches claude.credentials_path:
+// that file is Claude Code's own login, not something this app created, and
+// other tools may depend on it surviving. It must run as root, since it
+// touches /etc, /opt, and the service account's files.
+func Uninstall(opts UninstallOptions) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("--uninstall must run as root (try: sudo %s --uninstall)", os.Args[0])
+	}
+	log := opts.Log
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+
+	if err := runSystemctl(log, "disable", "--now", "coding-agent-loop.service"); err != nil {
+		log("service was not running or not enabled, continuing", "detail", err.Error())
+	}
+
+	// State paths must be read, and resolved against the service account's
+	// home, before /opt/coding-agent-loop (which holds the installed
+	// config.json) is removed.
+	t, err := resolveTarget()
+	if err != nil {
+		log("could not resolve the service account; skipping its state directories", "error", err.Error())
+	} else {
+		removeConfiguredStatePaths(t.home, opts.ConfigPath, log)
+	}
+
+	if _, err := os.Stat(unitPath); err == nil {
+		if err := os.Remove(unitPath); err != nil {
+			return fmt.Errorf("remove %s: %w", unitPath, err)
+		}
+		log("unit removed", "path", unitPath)
+	}
+	if err := runSystemctl(log, "daemon-reload"); err != nil {
+		log("systemctl daemon-reload failed, continuing", "detail", err.Error())
+	}
+
+	if _, err := os.Stat(installRoot); err == nil {
+		if err := os.RemoveAll(installRoot); err != nil {
+			return fmt.Errorf("remove %s: %w", installRoot, err)
+		}
+		log("removed", "path", installRoot)
+	}
+
+	// The dedicated fallback user, if Run ever created one: its entire home
+	// exists solely for this service, so the account and home go together.
+	// This is a superset of removeConfiguredStatePaths above when state paths
+	// live under that home (the common case), and also mops up anything else
+	// under it.
+	if _, err := user.Lookup(dedicatedUser); err == nil {
+		if _, lookErr := exec.LookPath("userdel"); lookErr != nil {
+			log("userdel not available; remove the service user and its home manually",
+				"user", dedicatedUser, "home", dedicatedHome)
+		} else {
+			cmd := exec.Command("userdel", "-r", dedicatedUser)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				log("could not remove service user, remove it manually",
+					"user", dedicatedUser, "error", err.Error(), "output", string(out))
+			} else {
+				log("service user and home removed", "user", dedicatedUser, "home", dedicatedHome)
+			}
+		}
+	}
+
+	return nil
+}
+
+// statePaths is the subset of config.Config that names files/directories the
+// running service writes to, as raw strings straight from JSON (an optional
+// leading "~" is not yet expanded — resolvePaths does that against the
+// service account's home, not whichever account happens to run --uninstall).
+type statePaths struct {
+	Workspace struct {
+		Root      string `json:"root"`
+		ReposRoot string `json:"repos_root"`
+		LogsRoot  string `json:"logs_root"`
+	} `json:"workspace"`
+	Store struct {
+		Path string `json:"path"`
+	} `json:"store"`
+	Claude struct {
+		UsageCachePath string `json:"usage_cache_path"`
+	} `json:"claude"`
+}
+
+// defaultStatePaths mirrors config.Default()'s values for the fields above,
+// so a missing/unreadable config.json still resolves to where the service
+// would have kept its state out of the box.
+func defaultStatePaths() statePaths {
+	var s statePaths
+	s.Workspace.Root = "~/.agent-loop/work"
+	s.Workspace.ReposRoot = "~/.agent-loop/repos"
+	s.Workspace.LogsRoot = "~/.agent-loop/logs"
+	s.Store.Path = "~/.agent-loop/state.db"
+	s.Claude.UsageCachePath = "~/.agent-loop/usage-cache.json"
+	return s
+}
+
+// loadStatePaths reads workspace/store/usage-cache paths from the first of
+// installedConfigPath or fallbackConfigPath that exists and parses, falling
+// back to defaultStatePaths otherwise. It deliberately does not use
+// config.Load: that requires github.owners and other unrelated fields to
+// validate, and a leftover or partially-removed config here must not block
+// cleanup of the directories it names.
+func loadStatePaths(fallbackConfigPath string, log func(string, ...any)) statePaths {
+	paths := defaultStatePaths()
+	for _, candidate := range []string{installedConfigPath, fallbackConfigPath} {
+		if candidate == "" {
+			continue
+		}
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(data, &paths); err != nil {
+			log("could not parse, falling back to defaults for state paths", "path", candidate, "error", err.Error())
+			continue
+		}
+		log("read state paths", "path", candidate)
+		return paths
+	}
+	log("no config.json found; assuming default state paths under ~/.agent-loop")
+	return paths
+}
+
+// expandHome resolves a leading "~" against home — not os.UserHomeDir(),
+// which under `sudo` resolves to root's home rather than the service
+// account's, silently pointing cleanup at the wrong directory.
+func expandHome(p, home string) string {
+	switch {
+	case p == "~":
+		return home
+	case strings.HasPrefix(p, "~/"):
+		p = filepath.Join(home, strings.TrimPrefix(p, "~/"))
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// removeConfiguredStatePaths removes exactly the directories/file the
+// service's own config told it to use, resolved against home.
+func removeConfiguredStatePaths(home, fallbackConfigPath string, log func(string, ...any)) {
+	paths := loadStatePaths(fallbackConfigPath, log)
+	removeDir(expandHome(paths.Workspace.Root, home), log)
+	removeDir(expandHome(paths.Workspace.ReposRoot, home), log)
+	removeDir(expandHome(paths.Workspace.LogsRoot, home), log)
+	removeFile(expandHome(paths.Store.Path, home), log)
+	removeFile(expandHome(paths.Claude.UsageCachePath, home), log)
+}
+
+func removeDir(dir string, log func(string, ...any)) {
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		log("could not remove, remove it manually", "path", dir, "error", err.Error())
+		return
+	}
+	log("removed", "path", dir)
+}
+
+func removeFile(path string, log func(string, ...any)) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		log("could not remove, remove it manually", "path", path, "error", err.Error())
+		return
+	}
+	log("removed", "path", path)
 }
 
 func runSystemctl(log func(string, ...any), args ...string) error {

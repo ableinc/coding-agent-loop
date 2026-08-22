@@ -4,6 +4,15 @@ GOFILES := $(shell find . -name '*.go' -not -path './vendor/*')
 CONFIG  ?= config.json
 MODELS  ?= models.json
 
+# EMBED_CONFIG/EMBED_MODELS name the exact files go:embed compiles into the
+# binary (embedded.go at the repo root can only embed "config.json" and
+# "models.json" literally — go:embed patterns aren't parameterizable). They
+# are deliberately NOT overridable like CONFIG/MODELS above: those two only
+# affect which file the built binary is told to read via --config at runtime,
+# which is a different question from what got compiled in as its fallback.
+EMBED_CONFIG := config.json
+EMBED_MODELS := models.json
+
 .PHONY: all help build build-check build-summary config check run once dry-run \
         install uninstall print-service \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
@@ -14,30 +23,30 @@ all: build
 help:
 	@grep -E '^## ' Makefile | sed 's/^## /  /'
 
-## build-check: refuse to build unless config.json and models.json exist
+## build-check: refuse to build unless config.json and models.json exist to be embedded
 build-check:
 	@missing=""; \
-	test -f "$(CONFIG)" || missing="$$missing $(CONFIG)"; \
-	test -f "$(MODELS)" || missing="$$missing $(MODELS)"; \
+	test -f "$(EMBED_CONFIG)" || missing="$$missing $(EMBED_CONFIG)"; \
+	test -f "$(EMBED_MODELS)" || missing="$$missing $(EMBED_MODELS)"; \
 	if [ -n "$$missing" ]; then \
 		echo "coding-agent-loop: refusing to build, missing:$$missing"; \
-		echo "  run 'make config' to create $(CONFIG) from config.example.json, and make sure $(MODELS) exists alongside it"; \
+		echo "  go:embed compiles these into the binary as its fallback config/model ladder; run 'make config' to create $(EMBED_CONFIG) from config.example.json, and make sure $(EMBED_MODELS) exists alongside it"; \
 		exit 1; \
 	fi
 
-## build-summary: print the config.json and models.json content the build depends on
+## build-summary: print the config.json and models.json content that will be compiled into the binary
 build-summary:
-	@echo "== $(CONFIG) =="; \
+	@echo "== $(EMBED_CONFIG) (compiled in as the fallback config) =="; \
 	if command -v jq >/dev/null 2>&1; then \
-		jq '{label: .github.label, owners: .github.owners, exclude_repos: .github.exclude_repos, poll_interval: .github.poll_interval, search_limit: .github.search_limit, max_concurrent_repos: .run.max_concurrent_repos, discord_enabled: .discord.enabled}' "$(CONFIG)"; \
+		jq '{label: .github.label, owners: .github.owners, exclude_repos: .github.exclude_repos, poll_interval: .github.poll_interval, search_limit: .github.search_limit, max_concurrent_repos: .run.max_concurrent_repos, discord_enabled: .discord.enabled}' "$(EMBED_CONFIG)"; \
 	else \
-		cat "$(CONFIG)"; \
+		cat "$(EMBED_CONFIG)"; \
 	fi; \
-	echo "== $(MODELS) =="; \
+	echo "== $(EMBED_MODELS) (compiled in as the fallback model ladder) =="; \
 	if command -v jq >/dev/null 2>&1; then \
-		jq '[.models[] | {id, alias, roles, priority}]' "$(MODELS)"; \
+		jq '[.models[] | {id, alias, roles, priority}]' "$(EMBED_MODELS)"; \
 	else \
-		cat "$(MODELS)"; \
+		cat "$(EMBED_MODELS)"; \
 	fi
 
 build: build-check build-summary
@@ -67,11 +76,19 @@ dry-run: build
 install: build
 	sudo $(BINARY) --install --config $(CONFIG)
 
-## uninstall: stop, disable, and remove the systemd unit (requires root; leaves /opt/coding-agent-loop in place)
+## uninstall: stop, disable, and remove everything `make install` created (requires root)
+# Deliberately does not depend on `build`: uninstalling must work even without
+# a config.json/models.json in place, since removing a broken install is
+# exactly when those might be missing or invalid. If a binary from a previous
+# `make build`/`make install` already exists, it's reused as-is instead of
+# rebuilding, since go:embed now requires config.json/models.json to be
+# present at compile time — a state uninstall must still be able to run in.
 uninstall:
-	sudo systemctl disable --now coding-agent-loop.service 2>/dev/null || true
-	sudo rm -f /etc/systemd/system/coding-agent-loop.service
-	sudo systemctl daemon-reload
+	@if [ ! -x "$(BINARY)" ]; then \
+		echo "no existing $(BINARY); building one (requires $(EMBED_CONFIG) and $(EMBED_MODELS) at the repo root, since go:embed compiles them in)"; \
+		go build -ldflags="-w -s" -o $(BINARY) ./cmd; \
+	fi
+	sudo $(BINARY) --uninstall
 
 ## print-service: print the embedded systemd unit without installing anything
 print-service: build

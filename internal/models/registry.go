@@ -6,22 +6,15 @@
 package models
 
 import (
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
-)
 
-// defaultModelsJSON is a copy of the repo-root models.json, embedded so a
-// binary shipped on its own (no repo checkout on the host) still has a
-// working model ladder out of the box. An external file at the configured
-// path always takes precedence when present — see Load.
-//
-//go:embed default.json
-var defaultModelsJSON []byte
+	embedded "github.com/ableinc/coding-agent-loop"
+)
 
 // Roles a model may be used for.
 const (
@@ -70,15 +63,19 @@ type Registry struct {
 	Models []Model `json:"models"`
 }
 
-// Load reads and validates models.json. If path does not exist, the ladder
-// embedded in the binary at build time is used instead, so a binary shipped
-// without the rest of the repo still has a working model ladder; a file at
-// path always takes precedence when present.
-func Load(path string) (*Registry, error) {
+// Load reads and validates models.json at path. When allowEmbeddedFallback is
+// true and path does not exist, the repo-root models.json embedded in the
+// binary at build time (embedded.Models) is used instead, so a binary shipped
+// without the rest of the repo still has a working model ladder out of the
+// box. allowEmbeddedFallback should be false whenever path was explicitly
+// requested (e.g. a non-default models_path, or a --models-style argument):
+// an explicit path that does not exist is a misconfiguration to report, not
+// something to silently paper over.
+func Load(path string, allowEmbeddedFallback bool) (*Registry, error) {
 	data, err := os.ReadFile(path)
 	switch {
-	case errors.Is(err, os.ErrNotExist):
-		data = defaultModelsJSON
+	case errors.Is(err, os.ErrNotExist) && allowEmbeddedFallback:
+		data = embedded.Models
 	case err != nil:
 		return nil, fmt.Errorf("read models file %s: %w", path, err)
 	}

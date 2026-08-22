@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	embedded "github.com/ableinc/coding-agent-loop"
 )
 
 // Duration wraps time.Duration so it can be read from a JSON string.
@@ -46,7 +48,10 @@ type Config struct {
 	Store     StoreConfig     `json:"store"`
 	Discord   DiscordConfig   `json:"discord"`
 
-	// ModelsPath points at models.json. Defaults to ./models.json.
+	// ModelsPath points at models.json, resolved by the caller (cmd/agent.go),
+	// not expanded here: "models.json" (the default) is looked up next to the
+	// running binary, falling back to the embedded models.json when absent;
+	// any other value is an explicit path that must exist.
 	ModelsPath string `json:"models_path"`
 }
 
@@ -192,23 +197,31 @@ func Default() Config {
 	}
 }
 
-// Load reads path over the defaults and validates the result. A missing file
-// is not an error: the defaults are usable on their own.
-func Load(path string) (Config, error) {
+// Load reads path over the defaults and validates the result. When
+// allowEmbeddedFallback is true and path does not exist, the repo-root
+// config.json embedded in the binary at build time (embedded.Config) is used
+// instead, so a binary shipped without the rest of the repo still boots with
+// a complete, working configuration. allowEmbeddedFallback should be false
+// whenever path was explicitly requested (e.g. --config passed on the
+// command line): an explicit path that does not exist is a misconfiguration
+// to report, not something to silently paper over.
+func Load(path string, allowEmbeddedFallback bool) (Config, error) {
 	cfg := Default()
 
 	data, err := os.ReadFile(path)
 	switch {
+	case os.IsNotExist(err) && allowEmbeddedFallback:
+		data = embedded.Config
 	case os.IsNotExist(err):
-		// keep defaults
+		return cfg, fmt.Errorf("config file %s not found", path)
 	case err != nil:
 		return cfg, fmt.Errorf("read config %s: %w", path, err)
-	default:
-		dec := json.NewDecoder(strings.NewReader(string(data)))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&cfg); err != nil {
-			return cfg, fmt.Errorf("parse config %s: %w", path, err)
-		}
+	}
+
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
 	if err := cfg.expandPaths(); err != nil {
@@ -224,7 +237,6 @@ func (c *Config) expandPaths() error {
 	for _, p := range []*string{
 		&c.Workspace.Root, &c.Workspace.ReposRoot, &c.Workspace.LogsRoot,
 		&c.Store.Path, &c.Claude.CredentialsPath, &c.Claude.UsageCachePath,
-		&c.ModelsPath,
 	} {
 		expanded, err := ExpandPath(*p)
 		if err != nil {
