@@ -229,6 +229,101 @@ func TestEditLabelsNoopWhenNothingToDo(t *testing.T) {
 	}
 }
 
+func TestSearchPRsOwnerScoping(t *testing.T) {
+	out := `[
+	  {"number":9,"title":"Fix thing","url":"https://github.com/acme/widgets/pull/9",
+	   "repository":{"nameWithOwner":"acme/widgets"},"updatedAt":"2024-01-01T00:00:00Z"},
+	  {"number":10,"title":"Wrong owner","url":"x","repository":{"nameWithOwner":"someoneelse/other"},
+	   "updatedAt":"2024-01-01T00:00:00Z"}
+	]`
+	bin, argsFile, _ := stubGH(t, out)
+	c := New(bin, false)
+
+	results, err := c.SearchPRs(context.Background(), "coding-agent-bot", []string{"acme"}, 10)
+	if err != nil {
+		t.Fatalf("SearchPRs: %v", err)
+	}
+	if len(results) != 1 || results[0].Repository.NameWithOwner != "acme/widgets" {
+		t.Fatalf("expected only the acme/widgets PR, got %+v", results)
+	}
+
+	args := readFile(t, argsFile)
+	for _, want := range []string{"search", "prs", "--author", "coding-agent-bot", "--state", "open", "--owner", "acme"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("command missing %q:\n%s", want, args)
+		}
+	}
+}
+
+func TestPRCommentsMergesAndSortsBothKinds(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gh-stub.sh")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  *issues/9/comments*) cat <<'EOF'\n" +
+		`[{"id":1,"body":"first","html_url":"u1","user":{"login":"alice"},"author_association":"OWNER","created_at":"2024-01-02T00:00:00Z"}]` + "\n" +
+		"EOF\n" +
+		"    ;;\n" +
+		"  *pulls/9/comments*) cat <<'EOF'\n" +
+		`[{"id":2,"body":"second","html_url":"u2","user":{"login":"bob"},"author_association":"MEMBER","created_at":"2024-01-01T00:00:00Z","path":"main.go","diff_hunk":"@@ -1 +1 @@","line":5}]` + "\n" +
+		"EOF\n" +
+		"    ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	comments, err := New(bin, false).PRComments(context.Background(), "acme/widgets", 9)
+	if err != nil {
+		t.Fatalf("PRComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %+v", comments)
+	}
+	// The review comment (Jan 1) is older than the issue comment (Jan 2).
+	if comments[0].Kind != CommentKindReview || comments[0].Path != "main.go" || comments[0].Line != 5 {
+		t.Fatalf("comments not sorted or review fields not decoded: %+v", comments[0])
+	}
+	if comments[1].Kind != CommentKindIssue || comments[1].Author != "alice" {
+		t.Fatalf("issue comment not decoded: %+v", comments[1])
+	}
+}
+
+func TestReactUsesKindSpecificPathAndHonoursDryRun(t *testing.T) {
+	bin, argsFile, _ := stubGH(t, "")
+	c := New(bin, false)
+
+	if err := c.React(context.Background(), "acme/widgets",
+		PRComment{ID: 42, Kind: CommentKindIssue}, "eyes"); err != nil {
+		t.Fatal(err)
+	}
+	args := readFile(t, argsFile)
+	if !strings.Contains(args, "repos/acme/widgets/issues/comments/42/reactions") {
+		t.Errorf("expected the issues reactions path, got:\n%s", args)
+	}
+	if !strings.Contains(args, "content=eyes") {
+		t.Errorf("expected content=eyes, got:\n%s", args)
+	}
+
+	bin2, argsFile2, _ := stubGH(t, "")
+	if err := New(bin2, false).React(context.Background(), "acme/widgets",
+		PRComment{ID: 7, Kind: CommentKindReview}, "+1"); err != nil {
+		t.Fatal(err)
+	}
+	if args := readFile(t, argsFile2); !strings.Contains(args, "repos/acme/widgets/pulls/comments/7/reactions") {
+		t.Errorf("expected the pulls reactions path, got:\n%s", args)
+	}
+
+	bin3, argsFile3, _ := stubGH(t, "")
+	if err := New(bin3, true).React(context.Background(), "acme/widgets",
+		PRComment{ID: 7, Kind: CommentKindReview}, "+1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(argsFile3); !os.IsNotExist(err) {
+		t.Fatal("dry-run must not invoke gh at all")
+	}
+}
+
 func TestCmdErrorIncludesStderr(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "gh-fail.sh")

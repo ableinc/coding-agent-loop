@@ -30,6 +30,23 @@ const (
 	StatusCanceled  = "canceled"  // terminal, operator cancelled
 	StatusDeferred  = "deferred"  // terminal, stopped by the usage gate; not the issue's fault
 	StatusPlanned   = "planned"   // terminal, a plan was posted and awaits human approval
+	StatusAddressed = "addressed" // terminal, success: a PR review comment was acted on
+)
+
+// Run kinds distinguish an issue-driven run from one triggered by a PR review
+// comment. Both share the runs table and the claim/lease machinery — GitHub
+// numbers PRs in the same sequence as issues, so a PR number is just another
+// "issue" as far as claims are concerned.
+const (
+	RunKindIssue     = "issue"
+	RunKindPRComment = "pr_comment"
+)
+
+// PR comment task statuses.
+const (
+	PRCommentAcked  = "acked"
+	PRCommentDone   = "done"
+	PRCommentFailed = "failed"
 )
 
 // Verify outcomes recorded on a run.
@@ -49,23 +66,25 @@ const (
 // IsTerminal reports whether a run status is final.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred, StatusPlanned:
+	case StatusPROpen, StatusFailed, StatusAbandoned, StatusCanceled, StatusDeferred, StatusPlanned, StatusAddressed:
 		return true
 	}
 	return false
 }
 
-// Run is one attempt at one issue.
+// Run is one attempt at one issue, or at one PR-comment task.
 type Run struct {
-	ID           string
-	Repo         string
-	Issue        int
-	CreatedAt    time.Time
-	Attempt      int
-	ModelID      string
-	Branch       string
-	PRURL        string
-	Status       string
+	ID        string
+	Repo      string
+	Issue     int
+	CreatedAt time.Time
+	Attempt   int
+	ModelID   string
+	Branch    string
+	PRURL     string
+	Status    string
+	// Kind is RunKindIssue or RunKindPRComment.
+	Kind         string
 	StartedAt    time.Time
 	EndedAt      time.Time
 	CostUSD      float64
@@ -248,6 +267,27 @@ var migrations = []string{
 		created_at INTEGER NOT NULL,
 		PRIMARY KEY (repo, issue)
 	);`,
+
+	// Distinguishes an issue-driven run from one triggered by a PR review
+	// comment, and tracks each triggering comment through ack -> done/failed
+	// so a restart between the 👀 and the run retries it instead of stranding
+	// it, and so a failed comment gets its own back-off.
+	`ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue';
+
+	CREATE TABLE IF NOT EXISTS pr_comment_tasks (
+		repo            TEXT    NOT NULL,
+		pr              INTEGER NOT NULL,
+		comment_kind    TEXT    NOT NULL,
+		comment_id      INTEGER NOT NULL,
+		status          TEXT    NOT NULL,
+		attempts        INTEGER NOT NULL DEFAULT 0,
+		last_attempt_at INTEGER NOT NULL DEFAULT 0,
+		run_id          TEXT    NOT NULL DEFAULT '',
+		created_at      INTEGER NOT NULL,
+		updated_at      INTEGER NOT NULL,
+		PRIMARY KEY (comment_kind, comment_id)
+	);
+	CREATE INDEX IF NOT EXISTS pr_comment_tasks_pr ON pr_comment_tasks(repo, pr);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -356,15 +396,19 @@ func (s *Store) ActiveClaims(ctx context.Context) ([]Claim, error) {
 
 // --- runs -------------------------------------------------------------------
 
-// CreateRun inserts a new run row. CreatedAt defaults to now.
+// CreateRun inserts a new run row. CreatedAt defaults to now, and Kind
+// defaults to RunKindIssue.
 func (s *Store) CreateRun(ctx context.Context, r Run) error {
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = time.Now()
 	}
+	if r.Kind == "" {
+		r.Kind = RunKindIssue
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs (id, repo, issue, attempt, model_id, branch, status, created_at, started_at, log_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Repo, r.Issue, r.Attempt, r.ModelID, r.Branch, r.Status,
+		INSERT INTO runs (id, repo, issue, attempt, model_id, branch, status, kind, created_at, started_at, log_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Repo, r.Issue, r.Attempt, r.ModelID, r.Branch, r.Status, r.Kind,
 		r.CreatedAt.Unix(), r.StartedAt.Unix(), r.LogPath)
 	if err != nil {
 		return fmt.Errorf("create run %s: %w", r.ID, err)
@@ -514,13 +558,13 @@ var errNoRows = errors.New("not found")
 // ErrNotFound is returned when a lookup finds nothing.
 var ErrNotFound = errNoRows
 
-const runColumns = `id, repo, issue, attempt, model_id, branch, pr_url, status, created_at, started_at, ended_at,
+const runColumns = `id, repo, issue, attempt, model_id, branch, pr_url, status, kind, created_at, started_at, ended_at,
 	cost_usd, tokens_in, tokens_out, num_turns, session_id, verify_status, error, log_path`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var created, started, ended int64
-	err := sc.Scan(&r.ID, &r.Repo, &r.Issue, &r.Attempt, &r.ModelID, &r.Branch, &r.PRURL, &r.Status,
+	err := sc.Scan(&r.ID, &r.Repo, &r.Issue, &r.Attempt, &r.ModelID, &r.Branch, &r.PRURL, &r.Status, &r.Kind,
 		&created, &started, &ended, &r.CostUSD, &r.TokensIn, &r.TokensOut, &r.NumTurns, &r.SessionID,
 		&r.VerifyStatus, &r.Error, &r.LogPath)
 	if err != nil {
@@ -627,11 +671,11 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
 		        COALESCE(SUM(CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END), 0),
 		        COALESCE(MAX(CASE WHEN status IN (?, ?, ?) THEN ended_at ELSE 0 END), 0)
-		 FROM runs WHERE repo = ? AND issue = ?`,
+		 FROM runs WHERE repo = ? AND issue = ? AND kind = ?`,
 		StatusDeferred, StatusPROpen, StatusAbandoned,
 		StatusFailed, StatusAbandoned, StatusCanceled,
 		StatusFailed, StatusAbandoned, StatusCanceled,
-		repo, issue).
+		repo, issue, RunKindIssue).
 		Scan(&st.Attempts, &succeeded, &abandoned, &st.Failures, &lastFailure)
 	if err != nil {
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
@@ -643,8 +687,8 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 	}
 
 	row := s.db.QueryRowContext(ctx,
-		`SELECT status, pr_url FROM runs WHERE repo = ? AND issue = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`,
-		repo, issue)
+		`SELECT status, pr_url FROM runs WHERE repo = ? AND issue = ? AND kind = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+		repo, issue, RunKindIssue)
 	if err := row.Scan(&st.LastStatus, &st.LastPRURL); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return st, fmt.Errorf("issue history %s#%d: %w", repo, issue, err)
 	}
@@ -683,6 +727,100 @@ func (s *Store) LatestPlan(ctx context.Context, repo string, issue int) (string,
 		return "", fmt.Errorf("latest plan %s#%d: %w", repo, issue, err)
 	}
 	return body, nil
+}
+
+// --- pr comment tasks ---------------------------------------------------
+
+// PRCommentTask tracks one triggering PR comment through ack -> done/failed.
+// It is the only thing that survives a crash between reacting 👀 and running
+// Claude, and it gives each comment its own attempt count and back-off,
+// independent of who else may have reacted to it.
+type PRCommentTask struct {
+	Repo          string
+	PR            int
+	CommentKind   string
+	CommentID     int64
+	Status        string
+	Attempts      int
+	LastAttemptAt time.Time
+	RunID         string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// MarkPRCommentAcked records that a comment has been seen and 👀'd. It is
+// safe to call again for a comment that failed a previous attempt: the
+// PRIMARY KEY upsert takes it back to "acked" and preserves its attempt count.
+func (s *Store) MarkPRCommentAcked(ctx context.Context, repo string, pr int, kind string, commentID int64, runID string) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO pr_comment_tasks (repo, pr, comment_kind, comment_id, status, run_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(comment_kind, comment_id) DO UPDATE SET
+			status     = excluded.status,
+			run_id     = excluded.run_id,
+			updated_at = excluded.updated_at`,
+		repo, pr, kind, commentID, PRCommentAcked, runID, now, now)
+	if err != nil {
+		return fmt.Errorf("ack pr comment %s/%d: %w", kind, commentID, err)
+	}
+	return nil
+}
+
+// MarkPRCommentDone records that a comment has been addressed.
+func (s *Store) MarkPRCommentDone(ctx context.Context, kind string, commentID int64, runID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE pr_comment_tasks SET status = ?, run_id = ?, updated_at = ?
+		WHERE comment_kind = ? AND comment_id = ?`,
+		PRCommentDone, runID, time.Now().Unix(), kind, commentID)
+	if err != nil {
+		return fmt.Errorf("mark pr comment done %s/%d: %w", kind, commentID, err)
+	}
+	return nil
+}
+
+// MarkPRCommentFailed records a failed attempt at a comment, bumping its
+// attempt count and stamping when the attempt happened, which is what the
+// per-comment back-off is measured from.
+func (s *Store) MarkPRCommentFailed(ctx context.Context, kind string, commentID int64, runID string) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE pr_comment_tasks SET status = ?, run_id = ?, attempts = attempts + 1,
+			last_attempt_at = ?, updated_at = ?
+		WHERE comment_kind = ? AND comment_id = ?`,
+		PRCommentFailed, runID, now, now, kind, commentID)
+	if err != nil {
+		return fmt.Errorf("mark pr comment failed %s/%d: %w", kind, commentID, err)
+	}
+	return nil
+}
+
+// PRCommentTasks returns every task recorded for one pull request.
+func (s *Store) PRCommentTasks(ctx context.Context, repo string, pr int) ([]PRCommentTask, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT repo, pr, comment_kind, comment_id, status, attempts, last_attempt_at, run_id, created_at, updated_at
+		FROM pr_comment_tasks WHERE repo = ? AND pr = ?`, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("pr comment tasks %s#%d: %w", repo, pr, err)
+	}
+	defer rows.Close()
+
+	var out []PRCommentTask
+	for rows.Next() {
+		var t PRCommentTask
+		var lastAttempt, created, updated int64
+		if err := rows.Scan(&t.Repo, &t.PR, &t.CommentKind, &t.CommentID, &t.Status, &t.Attempts,
+			&lastAttempt, &t.RunID, &created, &updated); err != nil {
+			return nil, fmt.Errorf("scan pr comment task: %w", err)
+		}
+		if lastAttempt > 0 {
+			t.LastAttemptAt = time.Unix(lastAttempt, 0)
+		}
+		t.CreatedAt = time.Unix(created, 0)
+		t.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // --- gate -------------------------------------------------------------------

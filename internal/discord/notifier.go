@@ -290,6 +290,28 @@ func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duratio
 	})
 }
 
+// PRCommentsAddressed reports that review feedback on a pull request was
+// acted on: code pushed (or not, when the feedback needed only a reply) and
+// verified.
+func (n *Notifier) PRCommentsAddressed(r RunRef, handled int, res *claude.Result, v verify.Result, elapsed time.Duration) {
+	model, cost := "", 0.0
+	if res != nil {
+		model, cost = res.PrimaryModel(), res.TotalCostUSD
+	}
+	n.post(embed{
+		Title:       r.title("PR comments addressed"),
+		Description: r.description(),
+		Color:       colorGreen,
+		Fields: append(r.fields(),
+			embedField{Name: "Comments handled", Value: fmt.Sprintf("%d", handled), Inline: true},
+			embedField{Name: "Model", Value: orNone(model), Inline: true},
+			embedField{Name: "Cost", Value: money(cost), Inline: true},
+			embedField{Name: "Verification", Value: orNone(v.Status), Inline: true},
+			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
+		),
+	})
+}
+
 // RunFailed reports a failed run and when it will be tried again. Retries are
 // unbounded, so "when" is the useful number, not "how many are left".
 func (n *Notifier) RunFailed(r RunRef, cause string, nextAttempt time.Time) {

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -158,14 +159,43 @@ func (i Issue) HasLabel(name string) bool {
 	return false
 }
 
-// PullRequest is an open PR, used to avoid opening a second one for an issue.
+// PullRequest is an open PR, used to avoid opening a second one for an issue,
+// and to view a PR the daemon is watching for review comments.
 type PullRequest struct {
 	Number      int    `json:"number"`
 	URL         string `json:"url"`
 	Body        string `json:"body"`
 	Title       string `json:"title"`
 	HeadRefName string `json:"headRefName"`
+	BaseRefName string `json:"baseRefName"`
 	State       string `json:"state"`
+	IsDraft     bool   `json:"isDraft"`
+}
+
+// Comment kinds a PRComment can come from. The kind decides which REST path
+// segment (issues or pulls) a reaction or reply goes through.
+const (
+	CommentKindIssue  = "issue"
+	CommentKindReview = "review"
+)
+
+// PRComment is one reactable comment on a pull request: either a plain
+// conversation comment or an inline review comment.
+type PRComment struct {
+	// ID is the REST numeric id the reactions endpoint keys on.
+	ID          int64
+	Kind        string
+	Author      string
+	Association string
+	Body        string
+	URL         string
+	CreatedAt   time.Time
+	// Path, DiffHunk, and Line are set only for review comments (Kind ==
+	// CommentKindReview), giving the prompt the anchor a plain issue comment
+	// does not have.
+	Path     string
+	DiffHunk string
+	Line     int
 }
 
 // --- read operations --------------------------------------------------------
@@ -291,6 +321,165 @@ func (c *Client) CloneURL(ctx context.Context, repo string) (string, error) {
 		return "", fmt.Errorf("repo %s reported no url", repo)
 	}
 	return out.URL + ".git", nil
+}
+
+// PRSearchResult is one hit from `gh search prs`.
+type PRSearchResult struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Repository struct {
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"repository"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// CurrentLogin returns the login of the authenticated gh account, i.e. the
+// daemon's own account. Callers should cache it: it never changes within a
+// process's lifetime.
+func (c *Client) CurrentLogin(ctx context.Context) (string, error) {
+	out, err := c.run(ctx, "", "api", "user", "--jq", ".login")
+	if err != nil {
+		return "", err
+	}
+	login := strings.TrimSpace(string(out))
+	if login == "" {
+		return "", fmt.Errorf("gh api user reported no login")
+	}
+	return login, nil
+}
+
+// SearchPRs finds open pull requests authored by author, restricted to owners
+// when given.
+func (c *Client) SearchPRs(ctx context.Context, author string, owners []string, limit int) ([]PRSearchResult, error) {
+	if author == "" {
+		return nil, fmt.Errorf("search requires an author")
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	args := []string{"search", "prs",
+		"--author", author,
+		"--state", "open",
+		"--limit", strconv.Itoa(limit),
+		"--json", "number,title,url,repository,updatedAt",
+	}
+	for _, o := range owners {
+		if o = strings.TrimSpace(o); o != "" {
+			args = append(args, "--owner", o)
+		}
+	}
+
+	var results []PRSearchResult
+	if err := c.runJSON(ctx, &results, args...); err != nil {
+		return nil, err
+	}
+	// Defensive, mirroring SearchIssues: a result naming any other owner must
+	// never reach the caller.
+	filtered := results[:0]
+	for _, r := range results {
+		if len(owners) > 0 && !ownedBy(r.Repository.NameWithOwner, owners) {
+			c.logf("dropping PR search result for %s: repository owner is not in %v", r.Repository.NameWithOwner, owners)
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered, nil
+}
+
+// ViewPR fetches one pull request's detail.
+func (c *Client) ViewPR(ctx context.Context, repo string, number int) (PullRequest, error) {
+	var pr PullRequest
+	err := c.runJSON(ctx, &pr,
+		"pr", "view", strconv.Itoa(number),
+		"--repo", repo,
+		"--json", "number,title,body,url,state,isDraft,headRefName,baseRefName")
+	if err != nil {
+		return PullRequest{}, err
+	}
+	return pr, nil
+}
+
+// rawIssueComment/rawReviewComment decode the shape `gh api` returns for the
+// two comment endpoints, ahead of being reduced to the common PRComment type.
+type rawIssueComment struct {
+	ID    int64  `json:"id"`
+	Body  string `json:"body"`
+	URL   string `json:"html_url"`
+	User  User   `json:"user"`
+	Assoc string `json:"author_association"`
+	At    string `json:"created_at"`
+}
+
+type rawReviewComment struct {
+	ID       int64  `json:"id"`
+	Body     string `json:"body"`
+	URL      string `json:"html_url"`
+	User     User   `json:"user"`
+	Assoc    string `json:"author_association"`
+	At       string `json:"created_at"`
+	Path     string `json:"path"`
+	DiffHunk string `json:"diff_hunk"`
+	Line     int    `json:"line"`
+}
+
+// PRComments returns every reactable comment on a pull request: plain
+// conversation comments and inline review comments, merged and sorted oldest
+// first. Review *summary* bodies are not included here — see PRReviewBodies —
+// because REST has no reactions endpoint for a review as a whole.
+func (c *Client) PRComments(ctx context.Context, repo string, number int) ([]PRComment, error) {
+	var issueRaw []rawIssueComment
+	if err := c.runJSON(ctx, &issueRaw, "api", "--paginate",
+		fmt.Sprintf("repos/%s/issues/%d/comments", repo, number)); err != nil {
+		return nil, err
+	}
+	var reviewRaw []rawReviewComment
+	if err := c.runJSON(ctx, &reviewRaw, "api", "--paginate",
+		fmt.Sprintf("repos/%s/pulls/%d/comments", repo, number)); err != nil {
+		return nil, err
+	}
+
+	out := make([]PRComment, 0, len(issueRaw)+len(reviewRaw))
+	for _, r := range issueRaw {
+		out = append(out, PRComment{
+			ID: r.ID, Kind: CommentKindIssue, Author: r.User.Login, Association: r.Assoc,
+			Body: r.Body, URL: r.URL, CreatedAt: parseGHTime(r.At),
+		})
+	}
+	for _, r := range reviewRaw {
+		out = append(out, PRComment{
+			ID: r.ID, Kind: CommentKindReview, Author: r.User.Login, Association: r.Assoc,
+			Body: r.Body, URL: r.URL, CreatedAt: parseGHTime(r.At),
+			Path: r.Path, DiffHunk: r.DiffHunk, Line: r.Line,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+// PRReviewBodies returns the summary body of every review left on a pull
+// request, context only: they cannot be reacted to over REST, so they can
+// never trigger the agent.
+func (c *Client) PRReviewBodies(ctx context.Context, repo string, number int) ([]string, error) {
+	var raw []struct {
+		Body string `json:"body"`
+	}
+	if err := c.runJSON(ctx, &raw, "api", "--paginate",
+		fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, number)); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		if strings.TrimSpace(r.Body) != "" {
+			out = append(out, r.Body)
+		}
+	}
+	return out, nil
+}
+
+func parseGHTime(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
 }
 
 // ListOpenPRs returns the repo's open pull requests.
@@ -485,6 +674,30 @@ func (c *Client) Comment(ctx context.Context, repo string, number int, body stri
 		return nil
 	}
 	_, err := c.run(ctx, body, args...)
+	return err
+}
+
+// CommentOnPR posts a comment on a pull request. A PR is an issue as far as
+// the comments endpoint is concerned, so this is just Comment under a name
+// that reads correctly at its call sites.
+func (c *Client) CommentOnPR(ctx context.Context, repo string, number int, body string) error {
+	return c.Comment(ctx, repo, number, body)
+}
+
+// React adds a reaction to a PR comment. The path segment is chosen by the
+// comment's kind: plain conversation comments react through the issues
+// endpoint, inline review comments through the pulls endpoint.
+func (c *Client) React(ctx context.Context, repo string, comment PRComment, content string) error {
+	kind := "issues"
+	if comment.Kind == CommentKindReview {
+		kind = "pulls"
+	}
+	path := fmt.Sprintf("repos/%s/%s/comments/%d/reactions", repo, kind, comment.ID)
+	if c.DryRun {
+		c.logf("dry-run: would react %q to %s comment %d on %s", content, comment.Kind, comment.ID, repo)
+		return nil
+	}
+	_, err := c.run(ctx, "", "api", "--method", "POST", path, "-f", "content="+content)
 	return err
 }
 
