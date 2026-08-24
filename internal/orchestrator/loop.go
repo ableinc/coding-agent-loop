@@ -289,6 +289,7 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 		return false, "history lookup failed"
 	}
 	if hist.Succeeded {
+		o.reconcileDelivered(ctx, repo, issue)
 		return false, "already delivered a PR"
 	}
 	if next := o.nextAttemptAt(hist); time.Now().Before(next) {
@@ -301,10 +302,33 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 		o.log.Error("issue view failed", "repo", repo, "issue", issue, "error", err)
 		return false, "issue fetch failed"
 	}
-	if phase, reason := decidePhase(view); phase == phaseWait {
+	if phase, reason := decidePhase(view); phase == phaseWait || phase == phaseDone {
+		if phase == phaseDone {
+			o.reconcileDelivered(ctx, repo, issue)
+		}
 		return false, reason
 	}
 	return true, ""
+}
+
+// reconcileDelivered takes the trigger label off an issue whose work is already
+// done. Without it a delivered issue whose label edit failed — or one a human
+// re-labelled hoping for another attempt — is rediscovered on every single
+// poll and rejected in silence, forever.
+//
+// This is self-limiting rather than repeated work: the trigger label is what
+// puts an issue in the search results, so removing it is the last time the
+// issue is ever seen. EditLabels reduces the edit to what actually changes, so
+// an issue whose labels are already correct costs one read and no mutation.
+func (o *Orchestrator) reconcileDelivered(ctx context.Context, repo string, issue int) {
+	cfg := o.opts.Config
+	err := o.opts.GH.EditLabels(ctx, repo, issue,
+		[]string{cfg.GitHub.DoneLabel},
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
+	if err != nil {
+		o.log.Warn("could not reconcile the labels of a delivered issue",
+			"repo", repo, "issue", issue, "error", err)
+	}
 }
 
 // nextAttemptAt is when a previously failed issue may be claimed again. The
@@ -452,17 +476,27 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		return errSkip{fmt.Sprintf("issue no longer carries the %q label", cfg.GitHub.Label)}
 	}
 
-	if existing, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch); err != nil {
+	// An existing pull request is the durable proof that this issue was already
+	// worked, whatever the store happens to remember. Adopting it — rather than
+	// skipping — is what stops the loop rediscovering the issue on every poll.
+	existing, found, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch, cfg.Workspace.BranchPrefix)
+	if err != nil {
 		log.Warn("existing PR lookup failed, continuing", "error", err)
-	} else if existing != "" {
-		return errSkip{"an open pull request already covers this issue: " + existing}
+	} else if found {
+		return o.adoptPR(ctx, log, cand, runID, issue, existing, attempt)
 	}
 
 	// Discovery's phase decision may be stale by the time execution starts;
 	// decide again from the issue fetched just above.
 	phase, phaseReason := decidePhase(issue)
-	if phase == phaseWait {
+	switch phase {
+	case phaseWait:
 		return errSkip{"waiting for approval: " + phaseReason}
+	case phaseDone:
+		// decidePhase saw a PR announcement but FindPRForIssue found no PR, so
+		// the pull request has since been deleted. Re-doing the work would need
+		// a human to ask for it explicitly.
+		return errSkip{phaseReason}
 	}
 
 	meta, err := o.repoMetadata(ctx, cand.repo)
@@ -535,19 +569,14 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	log.Info("starting claude", "phase", phase, "model", head.ID, "branch", branch, "attempt", attempt)
 
 	var prompt, sysPrompt, permissionMode string
-	var previousPlan string
+	plan := o.approvedPlan(ctx, log, cand, runID, issue)
 	if phase == phasePlan {
-		previousPlan, err = o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
-		if err != nil {
-			log.Warn("could not read previous plan, planning from scratch", "error", err)
-		}
-		prompt = planTaskPrompt(cand.repo, issue, previousPlan)
+		prompt = planTaskPrompt(cand.repo, issue, plan)
 		sysPrompt = planSystemPrompt(cand.repo, worktree)
 		permissionMode = cfg.Claude.PlanPermissionMode
 	} else {
-		plan, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
-		if err != nil {
-			log.Warn("could not read approved plan, implementing without it", "error", err)
+		if strings.TrimSpace(plan) == "" {
+			log.Warn("no approved plan could be found, implementing from the issue alone")
 		}
 		prompt = implementTaskPrompt(cand.repo, issue, plan)
 		sysPrompt = systemPrompt(cand.repo, branch, worktree)
@@ -635,12 +664,17 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		if strings.TrimSpace(result.Result) == "" {
 			return fmt.Errorf("the plan run produced no plan")
 		}
-		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
-			log.Warn("could not save plan", "error", err)
-		}
+		// The comment is posted before the plan is recorded, and a failure to
+		// post it fails the run. decidePhase reads the plan marker off the
+		// issue, so a plan that was stored but never posted leaves the issue
+		// looking unplanned — and it would be re-planned, at the cost of a
+		// Claude run, on every pass from then on.
 		if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
 			planComment(result.Result, runID, usedModel, result.TotalCostUSD)); err != nil {
-			log.Warn("could not comment on issue", "error", err)
+			return fmt.Errorf("post plan comment: %w", err)
+		}
+		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
+			log.Warn("could not save plan", "error", err)
 		}
 		o.setLabels(ctx, log, cand, runID,
 			[]string{cfg.GitHub.PlanLabel}, []string{cfg.GitHub.WorkingLabel})
@@ -731,6 +765,98 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 
 	o.cleanup(ctx, log, repoPath, worktree, true)
 	return nil
+}
+
+// adoptPR reconciles an issue with a pull request that already covers it.
+//
+// This is the recovery path for two situations that look the same from here: a
+// store that was thrown away and rebuilt, and a pull request that was opened
+// but never linked back to its issue (because the run died between creating the
+// PR and announcing it, or because a human opened it by hand). In both cases
+// the work exists and must not be done again, and the issue must be made to say
+// so — otherwise every poll rediscovers it.
+//
+// It returns nil: the run delivered the outcome the issue was claimed for, even
+// though it did not produce the change itself. Reporting it as a skip would
+// record StatusAbandoned, which does not mark the issue as succeeded, and the
+// loop would pick the issue up again on the very next pass.
+func (o *Orchestrator) adoptPR(ctx context.Context, log *slog.Logger, cand candidate, runID string, issue gh.Issue, pr gh.PullRequest, attempt int) error {
+	cfg := o.opts.Config
+	log.Info("adopting an existing pull request for this issue",
+		"pr", pr.URL, "state", pr.State, "branch", pr.HeadRefName)
+
+	// Bookkeeping first: this is what IssueHistory reads back as Succeeded, and
+	// so what keeps the issue from being reclaimed even if the rest fails.
+	if err := o.opts.Store.SetPRURL(ctx, runID, pr.URL); err != nil {
+		return fmt.Errorf("record adopted PR url: %w", err)
+	}
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPROpen); err != nil {
+		return fmt.Errorf("record adopted PR status: %w", err)
+	}
+
+	// Make GitHub itself associate the two, so merging the PR closes the issue.
+	if linked, err := o.opts.GH.LinkPRToIssue(ctx, cand.repo, pr, cand.number); err != nil {
+		log.Warn("could not link the pull request to the issue", "pr", pr.URL, "error", err)
+	} else if linked {
+		o.event(ctx, runID, "pr_linked", pr.URL)
+	}
+
+	// Announce it on the issue, unless the issue already says so. The marker in
+	// this comment is what decidePhase reads on later passes, so posting it is
+	// what makes the adoption stick without the store.
+	if !issueAnnouncesPR(issue, pr.URL) {
+		if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, adoptedComment(pr.URL, runID, pr.State)); err != nil {
+			log.Warn("could not announce the adopted pull request", "pr", pr.URL, "error", err)
+		}
+	}
+
+	o.setLabels(ctx, log, cand, runID,
+		[]string{cfg.GitHub.DoneLabel},
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
+
+	o.event(ctx, runID, "pr_adopted", pr.URL)
+	o.opts.Discord.PRAdopted(cand.ref(runID, attempt), pr.URL, pr.State)
+	// No cleanup: adoption happens before anything is cloned or checked out,
+	// so there is no worktree, and no clone for `git worktree prune` to run in.
+	return nil
+}
+
+// issueAnnouncesPR reports whether the issue already carries a harness comment
+// naming this pull request, so adoption does not re-announce it every poll.
+func issueAnnouncesPR(issue gh.Issue, prURL string) bool {
+	for _, c := range issue.Comments {
+		if isPRComment(c.Body) && strings.Contains(c.Body, prURL) {
+			return true
+		}
+	}
+	return false
+}
+
+// approvedPlan returns the plan an implement or re-plan run should work from.
+//
+// The store is asked first because it is cheap and exact, but the plan the
+// human actually approved is the one posted on the issue, and that survives the
+// store being deleted. Anything recovered is written back so the next run does
+// not have to parse a comment again.
+func (o *Orchestrator) approvedPlan(ctx context.Context, log *slog.Logger, cand candidate, runID string, issue gh.Issue) string {
+	plan, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
+	if err != nil {
+		log.Warn("could not read the stored plan, falling back to the issue", "error", err)
+	}
+	if strings.TrimSpace(plan) != "" {
+		return plan
+	}
+
+	recovered := latestPlanBody(issue)
+	if recovered == "" {
+		return ""
+	}
+	log.Info("recovered the approved plan from the issue comments")
+	if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, recovered); err != nil {
+		log.Warn("could not save the recovered plan", "error", err)
+	}
+	o.event(ctx, runID, "plan_recovered", "read the approved plan back off the issue")
+	return recovered
 }
 
 // handleFailure records a failed run and schedules the next attempt.

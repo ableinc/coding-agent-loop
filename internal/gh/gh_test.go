@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -125,38 +126,155 @@ func TestViewIssue(t *testing.T) {
 }
 
 func TestFindPRForIssue(t *testing.T) {
-	out := `[
-	  {"number":1,"url":"https://github.com/acme/widgets/pull/1","body":"unrelated","headRefName":"feature-x"},
-	  {"number":2,"url":"https://github.com/acme/widgets/pull/2","body":"Closes #42 as discussed","headRefName":"someone-else"}
-	]`
-	bin, _, _ := stubGH(t, out)
-	c := New(bin, false)
+	const prefix = "agent/issue-"
 
-	url, err := c.FindPRForIssue(context.Background(), "acme/widgets", 42, "agent/issue-42")
+	find := func(t *testing.T, out string, issue int, branch string) (PullRequest, bool) {
+		t.Helper()
+		bin, _, _ := stubGH(t, out)
+		pr, found, err := New(bin, false).FindPRForIssue(
+			context.Background(), "acme/widgets", issue, branch, prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pr, found
+	}
+
+	t.Run("closing keyword in the body", func(t *testing.T) {
+		out := `[
+		  {"number":1,"url":"https://github.com/acme/widgets/pull/1","body":"unrelated","headRefName":"feature-x","state":"OPEN"},
+		  {"number":2,"url":"https://github.com/acme/widgets/pull/2","body":"Closes #42 as discussed","headRefName":"someone-else","state":"OPEN"}
+		]`
+		pr, found := find(t, out, 42, "agent/issue-42")
+		if !found || pr.Number != 2 {
+			t.Fatalf("a PR closing the issue should be found, got %+v (found=%v)", pr, found)
+		}
+	})
+
+	t.Run("no match for an unrelated issue", func(t *testing.T) {
+		out := `[{"number":2,"url":"u","body":"Closes #42","headRefName":"someone-else","state":"OPEN"}]`
+		if pr, found := find(t, out, 99, "agent/issue-99"); found {
+			t.Fatalf("expected no match, got %+v", pr)
+		}
+	})
+
+	t.Run("branch match", func(t *testing.T) {
+		out := `[{"number":3,"url":"u3","body":"","headRefName":"agent/issue-7","state":"OPEN"}]`
+		if pr, found := find(t, out, 7, "agent/issue-7"); !found || pr.Number != 3 {
+			t.Fatalf("branch match should be found, got %+v (found=%v)", pr, found)
+		}
+	})
+
+	// The branch slug comes from the issue title, so editing the title changes
+	// the branch this run would use. The PR still has to be found.
+	t.Run("branch prefix match after a title change", func(t *testing.T) {
+		out := `[{"number":4,"url":"u4","body":"","headRefName":"agent/issue-42-the-old-title","state":"OPEN"}]`
+		pr, found := find(t, out, 42, "agent/issue-42-a-brand-new-title")
+		if !found || pr.Number != 4 {
+			t.Fatalf("prefix match should be found, got %+v (found=%v)", pr, found)
+		}
+	})
+
+	// A merged or closed PR is delivered work just as much as an open one.
+	t.Run("merged PR still counts", func(t *testing.T) {
+		out := `[{"number":5,"url":"u5","body":"Closes #42","headRefName":"agent/issue-42","state":"MERGED","mergedAt":"2026-01-02T03:04:05Z"}]`
+		pr, found := find(t, out, 42, "agent/issue-42")
+		if !found || !pr.Merged() {
+			t.Fatalf("a merged PR should be found and reported as merged, got %+v (found=%v)", pr, found)
+		}
+	})
+
+	t.Run("closed PR still counts", func(t *testing.T) {
+		out := `[{"number":6,"url":"u6","body":"Closes #42","headRefName":"agent/issue-42","state":"CLOSED"}]`
+		if _, found := find(t, out, 42, "agent/issue-42"); !found {
+			t.Fatal("a closed PR should still be found")
+		}
+	})
+
+	// Issue 4 and issue 42 share a prefix; only exact numbers may match.
+	t.Run("issue number boundaries", func(t *testing.T) {
+		out := `[{"number":7,"url":"u7","body":"see #42 for context","headRefName":"agent/issue-42-x","state":"OPEN"}]`
+		if pr, found := find(t, out, 4, "agent/issue-4"); found {
+			t.Fatalf("issue 4 must not match issue 42's PR, got %+v", pr)
+		}
+	})
+
+	// A human can edit the closing keyword out of a harness PR; the provenance
+	// footer plus an issue reference is enough to recognise it.
+	t.Run("provenance footer match", func(t *testing.T) {
+		body := ProvenanceMarker + " (run abc)."
+		out := `[{"number":8,"url":"u8","title":"Change your commit name (#42)","body":` +
+			strconv.Quote(body) + `,"headRefName":"whatever","state":"OPEN"}]`
+		if _, found := find(t, out, 42, "agent/issue-42"); !found {
+			t.Fatal("a harness PR should be recognised by its provenance footer and title")
+		}
+	})
+
+	// An agent summary can name any number of issues in passing. Adopting on
+	// that would close out an issue whose work was never done.
+	t.Run("a passing mention in the body is not a match", func(t *testing.T) {
+		body := "Closes #7\n\nRelated to #42, but not fixing it.\n\n" + ProvenanceMarker + " (run abc)."
+		out := `[{"number":8,"url":"u8","title":"Something else (#7)","body":` +
+			strconv.Quote(body) + `,"headRefName":"agent/issue-7-something-else","state":"OPEN"}]`
+		if pr, found := find(t, out, 42, "agent/issue-42-x"); found {
+			t.Fatalf("issue 42 must not be adopted onto issue 7's PR, got %+v", pr)
+		}
+	})
+
+	// An adopting caller should be pointed at the PR a human would care about.
+	t.Run("open is preferred over closed", func(t *testing.T) {
+		out := `[
+		  {"number":9,"url":"u9","body":"Closes #42","headRefName":"agent/issue-42-old","state":"CLOSED"},
+		  {"number":10,"url":"u10","body":"Closes #42","headRefName":"agent/issue-42-new","state":"OPEN"}
+		]`
+		if pr, found := find(t, out, 42, ""); !found || pr.Number != 10 {
+			t.Fatalf("the open PR should win, got %+v (found=%v)", pr, found)
+		}
+	})
+
+	t.Run("searches every state", func(t *testing.T) {
+		bin, argsFile, _ := stubGH(t, `[]`)
+		if _, _, err := New(bin, false).FindPRForIssue(
+			context.Background(), "acme/widgets", 42, "agent/issue-42", prefix); err != nil {
+			t.Fatal(err)
+		}
+		if args := readFile(t, argsFile); !strings.Contains(args, "--state all") &&
+			!strings.Contains(args, "--state\nall") {
+			t.Fatalf("PR discovery must not be limited to open PRs:\n%s", args)
+		}
+	})
+}
+
+func TestLinkPRToIssue(t *testing.T) {
+	// Already linked: nothing is edited.
+	bin, argsFile, _ := stubGH(t, "")
+	pr := PullRequest{Number: 3, Body: "Closes #42\n\nwork"}
+	linked, err := New(bin, false).LinkPRToIssue(context.Background(), "acme/widgets", pr, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if url != "https://github.com/acme/widgets/pull/2" {
-		t.Fatalf("a PR closing the issue should be found, got %q", url)
+	if linked {
+		t.Fatal("a PR that already closes the issue must not be edited")
+	}
+	if _, err := os.Stat(argsFile); err == nil {
+		t.Fatalf("no gh call should have been made, got:\n%s", readFile(t, argsFile))
 	}
 
-	// No match for an unrelated issue.
-	url, err = c.FindPRForIssue(context.Background(), "acme/widgets", 99, "agent/issue-99")
+	// Not linked: the body is rewritten with a closing keyword in front.
+	bin2, argsFile2, stdinFile := stubGH(t, "")
+	pr2 := PullRequest{Number: 3, Body: "just some work"}
+	linked, err = New(bin2, false).LinkPRToIssue(context.Background(), "acme/widgets", pr2, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if url != "" {
-		t.Fatalf("expected no match, got %q", url)
+	if !linked {
+		t.Fatal("an unlinked PR should be edited")
 	}
-
-	// A PR already pushed to our branch also counts.
-	bin2, _, _ := stubGH(t, `[{"number":3,"url":"https://github.com/acme/widgets/pull/3","body":"","headRefName":"agent/issue-7"}]`)
-	url, err = New(bin2, false).FindPRForIssue(context.Background(), "acme/widgets", 7, "agent/issue-7")
-	if err != nil {
-		t.Fatal(err)
+	if args := readFile(t, argsFile2); !strings.Contains(args, "pr") || !strings.Contains(args, "edit") {
+		t.Fatalf("expected a gh pr edit call, got:\n%s", args)
 	}
-	if url != "https://github.com/acme/widgets/pull/3" {
-		t.Fatalf("branch match should be found, got %q", url)
+	body := readFile(t, stdinFile)
+	if !strings.HasPrefix(body, "Closes #42") || !strings.Contains(body, "just some work") {
+		t.Fatalf("body should gain a closing keyword and keep its content, got:\n%s", body)
 	}
 }
 

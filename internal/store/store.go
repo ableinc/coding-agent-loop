@@ -87,15 +87,16 @@ type Gate struct {
 	UpdatedAt    time.Time
 }
 
-// Event is one entry in a run's audit trail. At is both when the event
-// happened and when its row was created; the two cannot differ, so events
-// carries no separate created_at column.
+// Event is one entry in a run's audit trail. At is when the event happened and
+// CreatedAt is when its row was written; for events appended live the two are
+// the same, and they differ only for rows backfilled by a migration.
 type Event struct {
-	ID     int64
-	RunID  string
-	At     time.Time
-	Kind   string
-	Detail string
+	ID        int64
+	RunID     string
+	At        time.Time
+	Kind      string
+	Detail    string
+	CreatedAt time.Time
 }
 
 // Session is one Claude Code session the daemon has driven. Sessions are kept
@@ -158,6 +159,15 @@ func (s *Store) Close() error { return s.db.Close() }
 // DB exposes the handle for tests.
 func (s *Store) DB() *sql.DB { return s.db }
 
+// migrations is the schema, one statement block per version. The daemon is not
+// deployed anywhere that has to be upgraded in place, so this is kept as a
+// single authoritative definition of the current schema rather than a history
+// of how it got here: a database written by an older build is deleted and
+// recreated, not migrated. Everything that matters across a wipe is recoverable
+// from GitHub, which is what makes that safe.
+//
+// Add a new entry rather than editing this one only if in-place upgrades ever
+// start to matter; editing it is otherwise the right way to change the schema.
 var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS runs (
 		id            TEXT PRIMARY KEY,
@@ -177,10 +187,12 @@ var migrations = []string{
 		session_id    TEXT NOT NULL DEFAULT '',
 		verify_status TEXT NOT NULL DEFAULT '',
 		error         TEXT NOT NULL DEFAULT '',
-		log_path      TEXT NOT NULL DEFAULT ''
+		log_path      TEXT NOT NULL DEFAULT '',
+		created_at    INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS runs_repo_issue ON runs(repo, issue);
 	CREATE INDEX IF NOT EXISTS runs_started_at ON runs(started_at DESC);
+	CREATE INDEX IF NOT EXISTS runs_created_at ON runs(created_at DESC);
 
 	CREATE TABLE IF NOT EXISTS claims (
 		repo         TEXT NOT NULL,
@@ -188,6 +200,7 @@ var migrations = []string{
 		run_id       TEXT NOT NULL,
 		worker       TEXT NOT NULL,
 		leased_until INTEGER NOT NULL,
+		created_at   INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (repo, issue)
 	);
 
@@ -195,35 +208,27 @@ var migrations = []string{
 		kind          TEXT PRIMARY KEY,
 		blocked_until INTEGER NOT NULL,
 		reason        TEXT NOT NULL DEFAULT '',
-		updated_at    INTEGER NOT NULL
+		updated_at    INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL DEFAULT 0
 	);
 
+	-- events.at is when the event happened and created_at is when the row was
+	-- written. For a live append the two are the same; they are kept apart so
+	-- events line up with every other table.
 	CREATE TABLE IF NOT EXISTS events (
-		id     INTEGER PRIMARY KEY AUTOINCREMENT,
-		run_id TEXT NOT NULL,
-		at     INTEGER NOT NULL,
-		kind   TEXT NOT NULL,
-		detail TEXT NOT NULL DEFAULT ''
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id     TEXT NOT NULL,
+		at         INTEGER NOT NULL,
+		kind       TEXT NOT NULL,
+		detail     TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL DEFAULT 0
 	);
-	CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);`,
+	CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);
 
-	// When each row came into existence, which the original schema only
-	// implied. runs.started_at is when the run began and gate.updated_at moves
-	// on every refresh, so neither answers "when was this row created"; both
-	// are used to backfill it here. events.at already is the row's creation
-	// time, so events needs no new column.
-	`ALTER TABLE runs   ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-	ALTER TABLE claims ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-	ALTER TABLE gate   ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-	UPDATE runs   SET created_at = started_at WHERE created_at = 0;
-	UPDATE gate   SET created_at = updated_at WHERE created_at = 0;
-	UPDATE claims SET created_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE created_at = 0;
-	CREATE INDEX IF NOT EXISTS runs_created_at ON runs(created_at DESC);`,
-
-	// Claude Code session IDs, indexed by what you would look them up by: the
-	// issue they were spent on. runs.session_id holds the same value, but only
-	// for as long as you know which run to ask about.
-	`CREATE TABLE IF NOT EXISTS sessions (
+	-- Claude Code session IDs, indexed by what you would look them up by: the
+	-- issue they were spent on. runs.session_id holds the same value, but only
+	-- for as long as you know which run to ask about.
+	CREATE TABLE IF NOT EXISTS sessions (
 		session_id TEXT NOT NULL,
 		run_id     TEXT NOT NULL,
 		repo       TEXT NOT NULL,
@@ -234,13 +239,11 @@ var migrations = []string{
 	);
 	CREATE INDEX IF NOT EXISTS sessions_repo_issue ON sessions(repo, issue, created_at DESC);
 	CREATE INDEX IF NOT EXISTS sessions_run ON sessions(run_id);
-	INSERT OR IGNORE INTO sessions (session_id, run_id, repo, issue, model_id, created_at)
-		SELECT session_id, id, repo, issue, model_id, created_at FROM runs WHERE session_id <> '';`,
 
-	// One plan per issue: the latest plan posted, kept so the implement prompt
-	// can carry it verbatim even though the issue comment itself may have been
-	// truncated when it was read back as discussion.
-	`CREATE TABLE IF NOT EXISTS plans (
+	-- One plan per issue: the latest plan posted. The issue comment it came
+	-- from is the durable copy; this is the one the implement prompt carries
+	-- verbatim without having to be parsed back out of a comment.
+	CREATE TABLE IF NOT EXISTS plans (
 		repo       TEXT NOT NULL,
 		issue      INTEGER NOT NULL,
 		run_id     TEXT NOT NULL,
@@ -254,6 +257,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
+	}
+	// A database written by a build with a different schema history cannot be
+	// upgraded in place, because the schema is kept as one definition rather
+	// than a chain of alterations. Say so plainly: the alternative is a
+	// confusing "no such column" from the first query that touches it.
+	if version > len(migrations) {
+		return fmt.Errorf("database schema version %d is newer than this build understands (%d); "+
+			"delete the database and let it be recreated", version, len(migrations))
 	}
 	for i := version; i < len(migrations); i++ {
 		if _, err := s.db.ExecContext(ctx, migrations[i]); err != nil {
@@ -757,9 +768,10 @@ func (s *Store) CooledDownModels(ctx context.Context) (map[string]bool, error) {
 
 // AppendEvent adds to a run's audit trail.
 func (s *Store) AppendEvent(ctx context.Context, runID, kind, detail string) error {
+	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (run_id, at, kind, detail) VALUES (?, ?, ?, ?)`,
-		runID, time.Now().Unix(), kind, detail)
+		`INSERT INTO events (run_id, at, kind, detail, created_at) VALUES (?, ?, ?, ?, ?)`,
+		runID, now, kind, detail, now)
 	if err != nil {
 		return fmt.Errorf("append event for run %s: %w", runID, err)
 	}
@@ -769,7 +781,7 @@ func (s *Store) AppendEvent(ctx context.Context, runID, kind, detail string) err
 // ListEvents returns a run's audit trail in order.
 func (s *Store) ListEvents(ctx context.Context, runID string) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, run_id, at, kind, detail FROM events WHERE run_id = ? ORDER BY id`, runID)
+		`SELECT id, run_id, at, kind, detail, created_at FROM events WHERE run_id = ? ORDER BY id`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list events for run %s: %w", runID, err)
 	}
@@ -778,11 +790,12 @@ func (s *Store) ListEvents(ctx context.Context, runID string) ([]Event, error) {
 	var out []Event
 	for rows.Next() {
 		var e Event
-		var at int64
-		if err := rows.Scan(&e.ID, &e.RunID, &at, &e.Kind, &e.Detail); err != nil {
+		var at, createdAt int64
+		if err := rows.Scan(&e.ID, &e.RunID, &at, &e.Kind, &e.Detail, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		e.At = time.Unix(at, 0)
+		e.CreatedAt = time.Unix(createdAt, 0)
 		out = append(out, e)
 	}
 	return out, rows.Err()

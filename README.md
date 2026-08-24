@@ -70,9 +70,11 @@ handed to an agent running `--permission-mode bypassPermissions`.
   loop runs continuously and stops only when Claude actually reports a rate/usage limit, or when you
   pause it. This is a deliberate trade-off: it uses subscription usage that would otherwise be idle,
   including while you're working. `POST /pause` is the brake.
-- **State lives in SQLite, not in GitHub labels.** Labels are a human-readable mirror; the `claims`
-  table with lease expiry is what actually prevents double-work and is what survives a crash.
-  A label can be edited by a human mid-run without corrupting anything.
+- **GitHub is the record; SQLite is a cache and a lease table.** What was planned, approved, and
+  delivered lives in the issue's own comments, so throwing the database away costs some redundant
+  API reads and nothing else. The `claims` table with lease expiry is what prevents two workers
+  doing the same issue at once; labels are a human-readable mirror and can be edited mid-run
+  without corrupting anything.
 - **Everything autonomous is inspectable.** Every run is logged to a JSONL transcript and a SQLite
   row with cost, tokens, and outcome; the control API exposes all of it.
 
@@ -139,15 +141,17 @@ An issue is worked only if **all** of these hold:
 - it carries the trigger label (`github.label`, default `agent-ready`) and is open
 - its repository is not in `github.exclude_repos`
 - no other issue in that repository is currently in flight
-- no previous run delivered a PR for it, and it is not currently backing off after a failure
-  (`run.retry_backoff`)
-- no open pull request already closes it
+- it is not currently backing off after a failure (`run.retry_backoff`)
+- no pull request already covers it, in any state — open, merged, or closed
 - the issue's comment history says it's this issue's turn to be worked (see below)
 
 **The issue's own comments are what decide the phase**, not a label or a database column. Every
 comment the daemon posts is tagged with an invisible HTML marker, so it can tell its own narration
 apart from a human reply:
 
+- A pull request has already been announced on the issue → **done**: the work was delivered, so
+  nothing is re-done. The trigger label is taken off, which is the last time the issue is seen.
+  Comment `implement` again to ask for another attempt.
 - No plan comment yet → **plan**: post a plan, then stop.
 - A plan is posted and nothing from a human has followed it → **wait**: do nothing this poll. This
   costs one `gh issue view` per poll, never a claim, a worktree, or a Claude run.
@@ -156,9 +160,16 @@ apart from a human reply:
 - The newest human reply after the plan is anything else → **plan**: treat it as feedback and post a
   revised plan.
 
+**The database is disposable; GitHub is not.** Delete `state.db` and the daemon still will not re-plan
+an issue that has a plan, re-implement one that has a pull request, or discard an approval a human
+already gave — every one of those facts is recovered from the issue itself. The plan body is read
+back out of its own comment when the store has none, and a pull request that exists but was never
+linked to its issue is adopted: recorded, given a `Closes #<n>` line if it lacks one, announced on
+the issue, and labelled done. SQLite is a cache and a lease table, not the record of what happened.
+
 Labels mirror this state (`agent-planned` while waiting on a reply, `agent-working` →
-`agent-done` / `agent-failed` around a run), but the SQLite claim table and the issue's own comments
-are the source of truth — labels can be edited by humans mid-run, leases and comment history cannot.
+`agent-done` / `agent-failed` around a run), but the issue's own comments are the source of truth —
+labels can be edited by humans mid-run, comment history cannot.
 
 Label edits are reconciled rather than fired blindly: the issue's current labels are read first, the
 edit is reduced to what actually changes, a status label the repository does not define yet is
@@ -177,7 +188,9 @@ flight at a time), controlled by `run.max_concurrent_repos`.
    an error rather than acted on — this is checked independently in the `gh` client, at the top of
    discovery, and again before an issue is claimed, so a `gh` bug, flag regression, or stale search
    index can never lead to work on a repo the daemon doesn't own. The issue is fetched and its
-   comments decide the phase (plan, wait, or implement) before anything is claimed.
+   comments decide the phase (done, plan, wait, or implement) before anything is claimed. An issue
+   already covered by a pull request is adopted rather than worked: the PR is recorded, linked to
+   the issue if it was not already, and the issue is labelled done.
 2. **Claim** — an atomic SQLite insert with a lease (`run.lease`); losing the race means another
    worker already has it. The issue gets the `agent-working` label and a `runs` row.
 3. **Workspace** — the repo is cloned once (checkout-less) into `workspace.repos_root`, then a

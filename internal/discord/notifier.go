@@ -271,6 +271,20 @@ func (n *Notifier) PROpened(r RunRef, prURL string, res *claude.Result, v verify
 	})
 }
 
+// PRAdopted reports that an existing pull request was found for an issue and
+// linked to it, so no new work was done.
+func (n *Notifier) PRAdopted(r RunRef, prURL, state string) {
+	n.post(embed{
+		Title:       r.title("Existing PR adopted"),
+		Description: prURL,
+		Color:       colorBlurple,
+		Fields: append(r.fields(),
+			embedField{Name: "PR state", Value: orNone(state), Inline: true},
+			embedField{Name: "Outcome", Value: "No new work: the issue was already covered.", Inline: false},
+		),
+	})
+}
+
 // PlanPosted reports that a plan was posted for human review and the run is
 // now waiting on an "implement" reply.
 func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duration) {
