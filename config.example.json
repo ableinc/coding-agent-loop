@@ -20,7 +20,11 @@
       "ack_reaction": "eyes",
       "done_reaction": "+1",
       "allowed_authors": [],
-      "allowed_associations": ["OWNER", "MEMBER", "COLLABORATOR"]
+      "allowed_associations": [
+        "OWNER",
+        "MEMBER",
+        "COLLABORATOR"
+      ]
     }
   },
   "workspace": {
@@ -50,7 +54,10 @@
   },
   "verify": {
     "auto_detect": true,
-    "commands": {}
+    "commands": {},
+    "env": {
+      "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
+    }
   },
   "server": {
     "addr": "127.0.0.1:8787"

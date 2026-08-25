@@ -54,6 +54,12 @@ const (
 	VerifySkipped = "skipped"
 	VerifyPassed  = "passed"
 	VerifyFailed  = "failed"
+	// VerifyUnavailable means the command could not be run at all — the
+	// toolchain it needs is not on the daemon's PATH, or the environment
+	// forbade it. It is deliberately not VerifyFailed: the tests did not fail,
+	// they never ran, and telling a reviewer otherwise blames the agent's code
+	// for the operator's environment.
+	VerifyUnavailable = "unavailable"
 )
 
 // Gate kinds. Model cooldowns use the prefix GateModelPrefix + model ID.

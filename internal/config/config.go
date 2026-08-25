@@ -163,6 +163,12 @@ type VerifyConfig struct {
 	AutoDetect bool `json:"auto_detect"`
 	// Commands maps "owner/name" to an explicit shell command.
 	Commands map[string]string `json:"commands"`
+	// Env is added to the environment of every verification command. It exists
+	// mainly for PATH: a daemon started by systemd does not inherit a login
+	// shell's PATH, so language toolchains installed outside /usr/bin (Go under
+	// /usr/local/go/bin, anything under ~/go/bin or a version manager) are
+	// invisible to it and the repository's own test command cannot run.
+	Env map[string]string `json:"env"`
 }
 
 type ServerConfig struct {
