@@ -542,6 +542,125 @@ func TestStatusPlannedIsTerminalButNotSuccessOrFailure(t *testing.T) {
 	}
 }
 
+// A run created without a Kind defaults to RunKindIssue, so existing call
+// sites that predate the PR-comment feature still get a sensible value.
+func TestCreateRunDefaultsKindToIssue(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 1, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != RunKindIssue {
+		t.Fatalf("kind = %q, want %q", got.Kind, RunKindIssue)
+	}
+}
+
+// PR-comment runs must never move an issue's own retry back-off: they share
+// the runs table and the issue number space, but not the history.
+func TestIssueHistoryIgnoresPRCommentRuns(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.CreateRun(ctx, Run{ID: "pr1", Repo: "o/r", Issue: 9, Kind: RunKindPRComment,
+		Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FailRun(ctx, "pr1", StatusFailed, "boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	hist, err := st.IssueHistory(ctx, "o/r", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Attempts != 0 || hist.Failures != 0 {
+		t.Fatalf("a pr_comment run must not count toward issue history, got %+v", hist)
+	}
+}
+
+func TestPRCommentTaskLifecycle(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.MarkPRCommentAcked(ctx, "o/r", 5, "issue", 100, "run-1"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	tasks, err := st.PRCommentTasks(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != PRCommentAcked || tasks[0].Attempts != 0 {
+		t.Fatalf("unexpected tasks after ack: %+v", tasks)
+	}
+
+	if err := st.MarkPRCommentFailed(ctx, "issue", 100, "run-1"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	tasks, err = st.PRCommentTasks(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tasks[0].Status != PRCommentFailed || tasks[0].Attempts != 1 || tasks[0].LastAttemptAt.IsZero() {
+		t.Fatalf("failure not recorded correctly: %+v", tasks[0])
+	}
+
+	// A retry re-acks the same comment, which must not reset its attempt count.
+	if err := st.MarkPRCommentAcked(ctx, "o/r", 5, "issue", 100, "run-2"); err != nil {
+		t.Fatalf("re-ack: %v", err)
+	}
+	if err := st.MarkPRCommentDone(ctx, "issue", 100, "run-2"); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	tasks, err = st.PRCommentTasks(ctx, "o/r", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tasks[0].Status != PRCommentDone || tasks[0].Attempts != 1 || tasks[0].RunID != "run-2" {
+		t.Fatalf("unexpected final task state: %+v", tasks[0])
+	}
+}
+
+// The migration that adds runs.kind and pr_comment_tasks must apply cleanly
+// to a database that predates it.
+func TestMigrationAddsKindAndPRCommentTasks(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 1, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkPRCommentAcked(ctx, "o/r", 2, "issue", 1, "run-x"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// Reopening re-runs migrate(), exercising it against an already-migrated
+	// database, which must be a no-op rather than an error.
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+
+	got, err := st2.GetRun(ctx, "r1")
+	if err != nil || got.Kind != RunKindIssue {
+		t.Fatalf("kind not preserved across reopen: %+v, err=%v", got, err)
+	}
+	tasks, err := st2.PRCommentTasks(ctx, "o/r", 2)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("pr comment task not preserved across reopen: %+v, err=%v", tasks, err)
+	}
+}
+
 // A run stopped from outside is nobody's fault. Counting it would back the
 // issue off for hours because someone restarted the daemon.
 func TestCancelledRunsAreNeitherAttemptsNorFailures(t *testing.T) {

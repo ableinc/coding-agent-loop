@@ -65,6 +65,9 @@ type Orchestrator struct {
 	activeRepos map[string]bool
 	cancels     map[string]context.CancelFunc
 	repoInfo    map[string]repoMeta
+	// botLogin caches the daemon's own GitHub login, used to scope PR
+	// discovery and to make sure the daemon never reacts to its own comments.
+	botLogin string
 }
 
 type repoMeta struct {
@@ -168,6 +171,13 @@ func (o *Orchestrator) tick(ctx context.Context) {
 	}
 
 	capacity := o.capacity()
+	if capacity <= 0 {
+		return
+	}
+
+	// A reviewer waiting on a reply outranks starting a new issue, and both
+	// draw from the same per-repo concurrency budget.
+	capacity = o.tickPRComments(ctx, capacity)
 	if capacity <= 0 {
 		return
 	}

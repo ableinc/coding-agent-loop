@@ -60,3 +60,39 @@ func TestPlanSystemPromptForbidsEditing(t *testing.T) {
 		}
 	}
 }
+
+func TestPRCommentTaskPromptIncludesEveryCommentAndDiffHunk(t *testing.T) {
+	pr := gh.PullRequest{Number: 12, Title: "Add retry logic", URL: "https://github.com/acme/widgets/pull/12"}
+	comments := []gh.PRComment{
+		{Kind: gh.CommentKindIssue, Author: "alice", Body: "please rename Foo to Bar"},
+		{Kind: gh.CommentKindReview, Author: "bob", Body: "this is unsafe",
+			Path: "main.go", Line: 42, DiffHunk: "@@ -1,3 +1,3 @@\n-old\n+new"},
+	}
+	p := prCommentTaskPrompt("acme/widgets", pr, comments, []string{"looks good overall"})
+
+	for _, want := range []string{
+		"#12", "Add retry logic", "please rename Foo to Bar", "@bob", "this is unsafe",
+		"main.go", "42", "@@ -1,3 +1,3 @@", "looks good overall",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("pr comment task prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
+func TestPRCommentTaskPromptWithoutReviews(t *testing.T) {
+	pr := gh.PullRequest{Number: 12, Title: "Add retry logic"}
+	p := prCommentTaskPrompt("acme/widgets", pr, []gh.PRComment{{Author: "alice", Body: "fix this"}}, nil)
+	if strings.Contains(p, "Review summaries") {
+		t.Fatalf("no review section should appear when there are no reviews:\n%s", p)
+	}
+}
+
+func TestPRCommentSystemPromptForbidsCreatingPRs(t *testing.T) {
+	p := prCommentSystemPrompt("acme/widgets", "agent/issue-9", "/work/widgets/issue-9")
+	for _, want := range []string{"Do NOT create branches, tags, pull requests", "already exists", "final summary"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("pr comment system prompt missing %q:\n%s", want, p)
+		}
+	}
+}
