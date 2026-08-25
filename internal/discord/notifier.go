@@ -319,6 +319,20 @@ func (n *Notifier) PROpened(r RunRef, prURL string, res *claude.Result, v verify
 	})
 }
 
+// PRAdopted reports that an existing pull request was found for an issue and
+// linked to it, so no new work was done.
+func (n *Notifier) PRAdopted(r RunRef, prURL, state string) {
+	n.post(embed{
+		Title:       r.title("Existing PR adopted"),
+		Description: prURL,
+		Color:       colorBlurple,
+		Fields: append(r.fields(),
+			embedField{Name: "PR state", Value: orNone(state), Inline: true},
+			embedField{Name: "Outcome", Value: "No new work: the issue was already covered.", Inline: false},
+		),
+	})
+}
+
 // PlanPosted reports that a plan was posted for human review and the run is
 // now waiting on an "implement" reply.
 func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duration) {
@@ -334,6 +348,19 @@ func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duratio
 			embedField{Name: "Model", Value: orNone(model), Inline: true},
 			embedField{Name: "Cost", Value: money(cost), Inline: true},
 			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
+		),
+	})
+}
+
+// RunCanceled reports a run stopped from outside — a daemon shutdown or an
+// operator cancelling it. It is deliberately not styled as a failure.
+func (n *Notifier) RunCanceled(r RunRef, reason string) {
+	n.post(embed{
+		Title:       r.title("Run canceled"),
+		Description: truncate(reason, 500),
+		Color:       colorBlurple,
+		Fields: append(r.fields(),
+			embedField{Name: "Outcome", Value: "Stopped from outside; the issue is untouched and will be picked up again.", Inline: false},
 		),
 	})
 }
@@ -372,21 +399,6 @@ func (n *Notifier) RunDeferred(r RunRef, reason string) {
 		Description: r.describe(truncate(reason, 500)),
 		Color:       colorYellow,
 		Fields:      r.fields(),
-	})
-}
-
-// RunCanceled reports that an operator cancelled an in-flight run. r may have
-// no repo/issue (e.g. when the run row could not be looked up), in which case
-// the title stays plain rather than rendering as "#0".
-func (n *Notifier) RunCanceled(r RunRef) {
-	title := "Run cancelled by operator"
-	if r.Repo != "" {
-		title = r.title("Run cancelled by operator")
-	}
-	n.postRun(r, embed{
-		Title:  title,
-		Color:  colorYellow,
-		Fields: r.fields(),
 	})
 }
 

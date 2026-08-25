@@ -47,6 +47,9 @@ type Options struct {
 	Verify   *verify.Runner
 	Logger   *slog.Logger
 	DryRun   bool
+	// Rehearse reports what each issue would get without doing any of it: no
+	// clone, no worktree, no Claude run, no claim, and no database writes.
+	Rehearse bool
 	WorkerID string
 	Discord  *discord.Notifier
 }
@@ -289,6 +292,7 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 		return false, "history lookup failed"
 	}
 	if hist.Succeeded {
+		o.reconcileDelivered(ctx, repo, issue)
 		return false, "already delivered a PR"
 	}
 	if next := o.nextAttemptAt(hist); time.Now().Before(next) {
@@ -301,10 +305,33 @@ func (o *Orchestrator) eligible(ctx context.Context, repo string, issue int) (bo
 		o.log.Error("issue view failed", "repo", repo, "issue", issue, "error", err)
 		return false, "issue fetch failed"
 	}
-	if phase, reason := decidePhase(view); phase == phaseWait {
+	if phase, reason := decidePhase(view); phase == phaseWait || phase == phaseDone {
+		if phase == phaseDone {
+			o.reconcileDelivered(ctx, repo, issue)
+		}
 		return false, reason
 	}
 	return true, ""
+}
+
+// reconcileDelivered takes the trigger label off an issue whose work is already
+// done. Without it a delivered issue whose label edit failed — or one a human
+// re-labelled hoping for another attempt — is rediscovered on every single
+// poll and rejected in silence, forever.
+//
+// This is self-limiting rather than repeated work: the trigger label is what
+// puts an issue in the search results, so removing it is the last time the
+// issue is ever seen. EditLabels reduces the edit to what actually changes, so
+// an issue whose labels are already correct costs one read and no mutation.
+func (o *Orchestrator) reconcileDelivered(ctx context.Context, repo string, issue int) {
+	cfg := o.opts.Config
+	err := o.opts.GH.EditLabels(ctx, repo, issue,
+		[]string{cfg.GitHub.DoneLabel},
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
+	if err != nil {
+		o.log.Warn("could not reconcile the labels of a delivered issue",
+			"repo", repo, "issue", issue, "error", err)
+	}
 }
 
 // nextAttemptAt is when a previously failed issue may be claimed again. The
@@ -348,6 +375,11 @@ func retryDelay(failures int, base, max time.Duration) time.Duration {
 
 // work runs the full lifecycle for one issue.
 func (o *Orchestrator) work(ctx context.Context, cand candidate) {
+	if o.opts.Rehearse {
+		o.rehearse(ctx, cand)
+		return
+	}
+
 	cfg := o.opts.Config
 	runID := uuid.NewString()
 	log := o.log.With("run", runID, "repo", cand.repo, "issue", cand.number)
@@ -410,6 +442,102 @@ func (o *Orchestrator) work(ctx context.Context, cand candidate) {
 	}
 }
 
+// rehearse reports what would happen to an issue without doing any of it.
+//
+// Everything here is read-only: it decides the phase, looks for a pull request
+// that already covers the issue, and picks the model — but it never claims the
+// issue, writes a run, clones anything, or spends a token. That is the whole
+// point. A dry run that quietly spends money and rewrites a worktree is not a
+// dry run, and the mutation-suppressing variant is `--no-mutate`.
+func (o *Orchestrator) rehearse(ctx context.Context, cand candidate) {
+	cfg := o.opts.Config
+	log := o.log.With("repo", cand.repo, "issue", cand.number)
+
+	issue, err := o.opts.GH.ViewIssue(ctx, cand.repo, cand.number)
+	if err != nil {
+		log.Error("dry-run: could not fetch issue", "error", err)
+		return
+	}
+	branch := branchName(cfg.Workspace.BranchPrefix, cand.number, cand.title)
+
+	if !strings.EqualFold(issue.State, "OPEN") {
+		log.Info("dry-run: would skip", "reason", "issue is "+strings.ToLower(issue.State))
+		return
+	}
+	if !issue.HasLabel(cfg.GitHub.Label) {
+		log.Info("dry-run: would skip", "reason", "issue no longer carries "+cfg.GitHub.Label)
+		return
+	}
+
+	if pr, found, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch, cfg.Workspace.BranchPrefix); err != nil {
+		log.Warn("dry-run: existing PR lookup failed", "error", err)
+	} else if found {
+		log.Info("dry-run: would adopt an existing pull request, doing no new work",
+			"pr", pr.URL, "state", pr.State, "already_linked", gh.PRLinksIssue(pr, cand.number))
+		return
+	}
+
+	phase, reason := decidePhase(issue)
+	if phase == phaseWait || phase == phaseDone {
+		log.Info("dry-run: would not work this issue", "phase", phase, "reason", reason)
+		return
+	}
+
+	// Where the plan would come from matters more than its contents: "store"
+	// means the database still has it, "issue" means it would be recovered
+	// after the database was lost, "none" means the implement run would have to
+	// work from the issue text alone.
+	planSource := "none"
+	if stored, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number); err == nil && strings.TrimSpace(stored) != "" {
+		planSource = "store"
+	} else if latestPlanBody(issue) != "" {
+		planSource = "issue"
+	}
+
+	model, fallbacks := "unresolved", ""
+	if head, fb, err := o.selectModel(ctx, log, cand, phase); err != nil {
+		log.Warn("dry-run: no model could be selected", "error", err)
+	} else {
+		model, fallbacks = head.ID, fb
+	}
+
+	log.Info("dry-run: would run claude",
+		"phase", phase, "reason", reason, "branch", branch,
+		"model", model, "fallbacks", orNone(fallbacks), "plan_source", planSource)
+}
+
+// selectModel picks the model for a phase and the comma-separated fallbacks
+// behind it. It is read-only, so both the real run and a rehearsal can use it.
+func (o *Orchestrator) selectModel(ctx context.Context, log *slog.Logger, cand candidate, phase string) (models.Model, string, error) {
+	role := models.RoleImplement
+	if phase == phasePlan {
+		role = models.RolePlan
+	}
+	cooled, err := o.opts.Store.CooledDownModels(ctx)
+	if err != nil {
+		log.Warn("cooldown lookup failed, using full ladder", "error", err)
+		cooled = nil
+	}
+	ladder := o.opts.Registry.Ladder(role, cooled)
+	// On a retry, start one rung lower: the previous attempt already showed the
+	// model above it did not get there. Retries are unbounded, so this wraps
+	// rather than pinning the issue to the weakest model forever — by the time
+	// the ladder has been walked once, the top of it is worth another try.
+	//
+	// This keys off failures, not the attempt number: a successful plan run
+	// also advances the attempt counter, and demoting the implement run that
+	// follows it for that reason would be wrong.
+	if len(ladder) > 0 {
+		hist, err := o.opts.Store.IssueHistory(ctx, cand.repo, cand.number)
+		if err != nil {
+			log.Warn("issue history lookup failed, using full ladder", "error", err)
+		} else if drop := hist.Failures % len(ladder); drop > 0 {
+			ladder = ladder[drop:]
+		}
+	}
+	return models.Head(ladder)
+}
+
 // renewLease extends the claim periodically until the returned func is called.
 func (o *Orchestrator) renewLease(ctx context.Context, cand candidate, runID string) func() {
 	lease := o.opts.Config.Run.Lease.D()
@@ -452,17 +580,27 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		return errSkip{fmt.Sprintf("issue no longer carries the %q label", cfg.GitHub.Label)}
 	}
 
-	if existing, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch); err != nil {
+	// An existing pull request is the durable proof that this issue was already
+	// worked, whatever the store happens to remember. Adopting it — rather than
+	// skipping — is what stops the loop rediscovering the issue on every poll.
+	existing, found, err := o.opts.GH.FindPRForIssue(ctx, cand.repo, cand.number, branch, cfg.Workspace.BranchPrefix)
+	if err != nil {
 		log.Warn("existing PR lookup failed, continuing", "error", err)
-	} else if existing != "" {
-		return errSkip{"an open pull request already covers this issue: " + existing}
+	} else if found {
+		return o.adoptPR(ctx, log, cand, runID, issue, existing, attempt)
 	}
 
 	// Discovery's phase decision may be stale by the time execution starts;
 	// decide again from the issue fetched just above.
 	phase, phaseReason := decidePhase(issue)
-	if phase == phaseWait {
+	switch phase {
+	case phaseWait:
 		return errSkip{"waiting for approval: " + phaseReason}
+	case phaseDone:
+		// decidePhase saw a PR announcement but FindPRForIssue found no PR, so
+		// the pull request has since been deleted. Re-doing the work would need
+		// a human to ask for it explicitly.
+		return errSkip{phaseReason}
 	}
 
 	meta, err := o.repoMetadata(ctx, cand.repo)
@@ -485,33 +623,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	o.event(ctx, runID, "worktree", worktree)
 
 	// Pick the model. Plan and implement draw from separate ladders.
-	role := models.RoleImplement
-	if phase == phasePlan {
-		role = models.RolePlan
-	}
-	cooled, err := o.opts.Store.CooledDownModels(ctx)
-	if err != nil {
-		log.Warn("cooldown lookup failed, using full ladder", "error", err)
-		cooled = nil
-	}
-	ladder := o.opts.Registry.Ladder(role, cooled)
-	// On a retry, start one rung lower: the previous attempt already showed the
-	// model above it did not get there. Retries are unbounded, so this wraps
-	// rather than pinning the issue to the weakest model forever — by the time
-	// the ladder has been walked once, the top of it is worth another try.
-	//
-	// This keys off failures, not the attempt number: a successful plan run
-	// also advances the attempt counter, and demoting the implement run that
-	// follows it for that reason would be wrong.
-	if len(ladder) > 0 {
-		hist, err := o.opts.Store.IssueHistory(ctx, cand.repo, cand.number)
-		if err != nil {
-			log.Warn("issue history lookup failed, using full ladder", "error", err)
-		} else if drop := hist.Failures % len(ladder); drop > 0 {
-			ladder = ladder[drop:]
-		}
-	}
-	head, fallbacks, err := models.Head(ladder)
+	head, fallbacks, err := o.selectModel(ctx, log, cand, phase)
 	if err != nil {
 		return fmt.Errorf("select model: %w", err)
 	}
@@ -535,19 +647,14 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	log.Info("starting claude", "phase", phase, "model", head.ID, "branch", branch, "attempt", attempt)
 
 	var prompt, sysPrompt, permissionMode string
-	var previousPlan string
+	plan := o.approvedPlan(ctx, log, cand, runID, issue)
 	if phase == phasePlan {
-		previousPlan, err = o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
-		if err != nil {
-			log.Warn("could not read previous plan, planning from scratch", "error", err)
-		}
-		prompt = planTaskPrompt(cand.repo, issue, previousPlan)
+		prompt = planTaskPrompt(cand.repo, issue, plan)
 		sysPrompt = planSystemPrompt(cand.repo, worktree)
 		permissionMode = cfg.Claude.PlanPermissionMode
 	} else {
-		plan, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
-		if err != nil {
-			log.Warn("could not read approved plan, implementing without it", "error", err)
+		if strings.TrimSpace(plan) == "" {
+			log.Warn("no approved plan could be found, implementing from the issue alone")
 		}
 		prompt = implementTaskPrompt(cand.repo, issue, plan)
 		sysPrompt = systemPrompt(cand.repo, branch, worktree)
@@ -559,6 +666,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	// or times out still leaves a session behind to refer back to.
 	var sessionOnce sync.Once
 	claudeStarted := time.Now()
+	progress := newProgress(log, claudeStarted)
 	result, runErr := o.opts.Runner.Run(ctx, claude.Options{
 		Binary:         cfg.Claude.Binary,
 		Prompt:         prompt,
@@ -570,7 +678,9 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		ExtraArgs:      cfg.Claude.ExtraArgs,
 		LogPath:        logPath,
 		Timeout:        cfg.Run.Timeout.D(),
-		OnEvent: func(_ string, raw json.RawMessage) {
+		OnEvent: func(kind string, raw json.RawMessage) {
+			progress.observe(kind, raw)
+
 			var probe struct {
 				SessionID string `json:"session_id"`
 			}
@@ -585,13 +695,17 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		},
 	})
 
-	// Record spend even on failure: the tokens were burned either way.
+	// Record spend even on failure: the tokens were burned either way. This uses
+	// a context that outlives the run's own, because the most common reason a
+	// run ends early is that context being cancelled — and that is exactly when
+	// the spend still needs writing down.
+	bookkeeping := context.WithoutCancel(ctx)
 	usedModel := head.ID
 	if result != nil {
 		if m := result.PrimaryModel(); m != "" {
 			usedModel = m
 		}
-		if err := o.opts.Store.RecordUsage(ctx, runID, usedModel, result.SessionID,
+		if err := o.opts.Store.RecordUsage(bookkeeping, runID, usedModel, result.SessionID,
 			result.TotalCostUSD, result.TokensIn(), result.TokensOut(), result.NumTurns); err != nil {
 			log.Warn("usage record failed", "error", err)
 		}
@@ -600,12 +714,19 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	}
 
 	if runErr != nil {
+		// The daemon shutting down, or an operator cancelling the run, is not
+		// the issue's fault: it must not consume an attempt, extend the issue's
+		// back-off, sideline the model, or leave a failure comment saying the
+		// agent could not do the work.
+		if errors.Is(runErr, claude.ErrCanceled) {
+			return errCanceled{runErr}
+		}
 		if hit, limited := gate.DetectLimit(result, runErr); limited {
-			until, gerr := o.opts.Gate.RecordLimit(ctx, hit)
+			until, gerr := o.opts.Gate.RecordLimit(bookkeeping, hit)
 			if gerr != nil {
 				log.Error("could not record usage limit", "error", gerr)
 			}
-			if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, hit.Reason); err != nil {
+			if err := o.opts.Gate.CoolDownModel(bookkeeping, head.ID, modelCooldown, hit.Reason); err != nil {
 				log.Warn("could not cool down model", "error", err)
 			} else {
 				o.opts.Discord.ModelCooledDown(head.ID, time.Now().Add(modelCooldown), hit.Reason)
@@ -617,7 +738,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		}
 		// A model that failed for another reason still gets sidelined briefly so
 		// the retry does not immediately land on it again.
-		if err := o.opts.Gate.CoolDownModel(ctx, head.ID, modelCooldown, "run failed"); err != nil {
+		if err := o.opts.Gate.CoolDownModel(bookkeeping, head.ID, modelCooldown, "run failed"); err != nil {
 			log.Warn("could not cool down model", "error", err)
 		} else {
 			o.opts.Discord.ModelCooledDown(head.ID, time.Now().Add(modelCooldown), "run failed")
@@ -635,12 +756,17 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		if strings.TrimSpace(result.Result) == "" {
 			return fmt.Errorf("the plan run produced no plan")
 		}
-		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
-			log.Warn("could not save plan", "error", err)
-		}
+		// The comment is posted before the plan is recorded, and a failure to
+		// post it fails the run. decidePhase reads the plan marker off the
+		// issue, so a plan that was stored but never posted leaves the issue
+		// looking unplanned — and it would be re-planned, at the cost of a
+		// Claude run, on every pass from then on.
 		if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
 			planComment(result.Result, runID, usedModel, result.TotalCostUSD)); err != nil {
-			log.Warn("could not comment on issue", "error", err)
+			return fmt.Errorf("post plan comment: %w", err)
+		}
+		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
+			log.Warn("could not save plan", "error", err)
 		}
 		o.setLabels(ctx, log, ref,
 			[]string{cfg.GitHub.PlanLabel}, []string{cfg.GitHub.WorkingLabel})
@@ -733,6 +859,98 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	return nil
 }
 
+// adoptPR reconciles an issue with a pull request that already covers it.
+//
+// This is the recovery path for two situations that look the same from here: a
+// store that was thrown away and rebuilt, and a pull request that was opened
+// but never linked back to its issue (because the run died between creating the
+// PR and announcing it, or because a human opened it by hand). In both cases
+// the work exists and must not be done again, and the issue must be made to say
+// so — otherwise every poll rediscovers it.
+//
+// It returns nil: the run delivered the outcome the issue was claimed for, even
+// though it did not produce the change itself. Reporting it as a skip would
+// record StatusAbandoned, which does not mark the issue as succeeded, and the
+// loop would pick the issue up again on the very next pass.
+func (o *Orchestrator) adoptPR(ctx context.Context, log *slog.Logger, cand candidate, runID string, issue gh.Issue, pr gh.PullRequest, attempt int) error {
+	cfg := o.opts.Config
+	log.Info("adopting an existing pull request for this issue",
+		"pr", pr.URL, "state", pr.State, "branch", pr.HeadRefName)
+
+	// Bookkeeping first: this is what IssueHistory reads back as Succeeded, and
+	// so what keeps the issue from being reclaimed even if the rest fails.
+	if err := o.opts.Store.SetPRURL(ctx, runID, pr.URL); err != nil {
+		return fmt.Errorf("record adopted PR url: %w", err)
+	}
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPROpen); err != nil {
+		return fmt.Errorf("record adopted PR status: %w", err)
+	}
+
+	// Make GitHub itself associate the two, so merging the PR closes the issue.
+	if linked, err := o.opts.GH.LinkPRToIssue(ctx, cand.repo, pr, cand.number); err != nil {
+		log.Warn("could not link the pull request to the issue", "pr", pr.URL, "error", err)
+	} else if linked {
+		o.event(ctx, runID, "pr_linked", pr.URL)
+	}
+
+	// Announce it on the issue, unless the issue already says so. The marker in
+	// this comment is what decidePhase reads on later passes, so posting it is
+	// what makes the adoption stick without the store.
+	if !issueAnnouncesPR(issue, pr.URL) {
+		if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, adoptedComment(pr.URL, runID, pr.State)); err != nil {
+			log.Warn("could not announce the adopted pull request", "pr", pr.URL, "error", err)
+		}
+	}
+
+	o.setLabels(ctx, log, cand.ref(runID, attempt),
+		[]string{cfg.GitHub.DoneLabel},
+		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
+
+	o.event(ctx, runID, "pr_adopted", pr.URL)
+	o.opts.Discord.PRAdopted(cand.ref(runID, attempt), pr.URL, pr.State)
+	// No cleanup: adoption happens before anything is cloned or checked out,
+	// so there is no worktree, and no clone for `git worktree prune` to run in.
+	return nil
+}
+
+// issueAnnouncesPR reports whether the issue already carries a harness comment
+// naming this pull request, so adoption does not re-announce it every poll.
+func issueAnnouncesPR(issue gh.Issue, prURL string) bool {
+	for _, c := range issue.Comments {
+		if isPRComment(c.Body) && strings.Contains(c.Body, prURL) {
+			return true
+		}
+	}
+	return false
+}
+
+// approvedPlan returns the plan an implement or re-plan run should work from.
+//
+// The store is asked first because it is cheap and exact, but the plan the
+// human actually approved is the one posted on the issue, and that survives the
+// store being deleted. Anything recovered is written back so the next run does
+// not have to parse a comment again.
+func (o *Orchestrator) approvedPlan(ctx context.Context, log *slog.Logger, cand candidate, runID string, issue gh.Issue) string {
+	plan, err := o.opts.Store.LatestPlan(ctx, cand.repo, cand.number)
+	if err != nil {
+		log.Warn("could not read the stored plan, falling back to the issue", "error", err)
+	}
+	if strings.TrimSpace(plan) != "" {
+		return plan
+	}
+
+	recovered := latestPlanBody(issue)
+	if recovered == "" {
+		return ""
+	}
+	log.Info("recovered the approved plan from the issue comments")
+	if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, recovered); err != nil {
+		log.Warn("could not save the recovered plan", "error", err)
+	}
+	o.event(ctx, runID, "plan_recovered", "read the approved plan back off the issue")
+	return recovered
+}
+
 // handleFailure records a failed run and schedules the next attempt.
 func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand candidate, runID string, attempt int, cause error) {
 	cfg := o.opts.Config
@@ -749,6 +967,23 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		}
 		o.opts.Discord.RunAbandoned(ref, "skipped: "+skip.reason,
 			o.scheduleRetry(ctx, log, cand, runID))
+		o.setLabels(ctx, log, ref, nil, []string{cfg.GitHub.WorkingLabel})
+		o.finishCleanup(ctx, log, cand)
+		return
+	}
+
+	// A cancelled run is nobody's fault either, and unlike a usage limit there
+	// is nothing to report to the issue: the operator already knows, because
+	// the operator is what stopped it. No comment, no back-off, no retry
+	// scheduling — the next poll picks the issue straight back up.
+	var canceled errCanceled
+	if errors.As(cause, &canceled) {
+		log.Info("run canceled", "reason", cause)
+		if err := o.opts.Store.FailRun(ctx, runID, store.StatusCanceled, cause.Error()); err != nil {
+			log.Error("could not record cancellation", "error", err)
+		}
+		o.event(ctx, runID, "canceled", cause.Error())
+		o.opts.Discord.RunCanceled(ref, cause.Error())
 		o.setLabels(ctx, log, ref, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
@@ -771,7 +1006,14 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		return
 	}
 
-	log.Error("run failed", "error", cause, "attempt", attempt)
+	// Name the transcript: the error says what went wrong, the transcript is
+	// where the operator finds out why. It is only looked up on the failure
+	// path, so it costs nothing on a healthy run.
+	transcript := ""
+	if run, err := o.opts.Store.GetRun(ctx, runID); err == nil {
+		transcript = run.LogPath
+	}
+	log.Error("run failed", "error", cause, "attempt", attempt, "transcript", transcript)
 	if err := o.opts.Store.FailRun(ctx, runID, store.StatusFailed, cause.Error()); err != nil {
 		log.Error("could not record failure", "error", err)
 	}
@@ -907,6 +1149,15 @@ type errRetryable struct{ err error }
 
 func (e errRetryable) Error() string { return e.err.Error() }
 func (e errRetryable) Unwrap() error { return e.err }
+
+// errCanceled means the run was stopped from outside — the daemon is shutting
+// down, or an operator cancelled it through the control API. Like errRetryable
+// it is nobody's fault, but it is reported separately so the issue's history
+// says what actually happened.
+type errCanceled struct{ err error }
+
+func (e errCanceled) Error() string { return e.err.Error() }
+func (e errCanceled) Unwrap() error { return e.err }
 
 // --- naming helpers ---------------------------------------------------------
 

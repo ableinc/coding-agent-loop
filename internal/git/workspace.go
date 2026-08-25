@@ -291,7 +291,7 @@ func (m *Manager) Push(ctx context.Context, worktreePath, branch, wantRepo strin
 		return err
 	}
 	if m.DryRun {
-		m.logf("dry-run: would push %s to %s", branch, wantRepo)
+		m.logf("not mutating: would push %s to %s", branch, wantRepo)
 		return nil
 	}
 	// Explicit refspec, never a bare `git push origin`.

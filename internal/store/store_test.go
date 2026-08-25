@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -352,42 +354,25 @@ func TestReclosingAGateKeepsItsCreatedAt(t *testing.T) {
 	}
 }
 
-// Databases written by an earlier version have no created_at column at all;
-// the migration has to add it and backfill something meaningful.
-func TestCreatedAtIsBackfilledOnUpgrade(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "old.db")
-
-	old, err := sql.Open("sqlite", path)
+// The schema is one definition rather than a chain of alterations, so a
+// database from a build with a different history is not upgraded in place. It
+// has to say so, rather than failing later on a missing column.
+func TestARewindableDatabaseIsRejectedRatherThanSilentlyKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "future.db")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.ExecContext(ctx, migrations[0]); err != nil {
-		t.Fatalf("apply v1 schema: %v", err)
-	}
-	started := time.Now().Add(-time.Hour)
-	if _, err := old.ExecContext(ctx,
-		`INSERT INTO runs (id, repo, issue, attempt, status, started_at) VALUES ('old-run', 'o/r', 1, 1, 'pr_open', ?)`,
-		started.Unix()); err != nil {
+	if _, err := db.ExecContext(context.Background(),
+		fmt.Sprintf(`PRAGMA user_version = %d`, len(migrations)+1)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
-		t.Fatal(err)
-	}
-	old.Close()
+	db.Close()
 
-	st, err := Open(path)
-	if err != nil {
-		t.Fatalf("upgrade: %v", err)
-	}
-	defer st.Close()
-
-	run, err := st.GetRun(ctx, "old-run")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if run.CreatedAt.Unix() != started.Unix() {
-		t.Fatalf("created_at should be backfilled from started_at, got %v want %v", run.CreatedAt, started)
+	if _, err := Open(path); err == nil {
+		t.Fatal("a database from an unknown schema version should be rejected")
+	} else if !strings.Contains(err.Error(), "delete the database") {
+		t.Fatalf("the error should say what to do about it, got: %v", err)
 	}
 }
 
@@ -486,45 +471,6 @@ func TestSessionsAreRecordedAndLookedUpByIssue(t *testing.T) {
 	}
 }
 
-// Runs recorded before there was a sessions table still carry a session ID.
-func TestExistingRunSessionsAreBackfilled(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "old.db")
-
-	old, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range migrations[:2] {
-		if _, err := old.ExecContext(ctx, m); err != nil {
-			t.Fatalf("apply schema: %v", err)
-		}
-	}
-	if _, err := old.ExecContext(ctx,
-		`INSERT INTO runs (id, repo, issue, attempt, status, session_id, model_id, created_at, started_at)
-		 VALUES ('old-run', 'o/r', 3, 1, 'pr_open', 'sess-old', 'claude-opus-5', 100, 100)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := old.ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
-		t.Fatal(err)
-	}
-	old.Close()
-
-	st, err := Open(path)
-	if err != nil {
-		t.Fatalf("upgrade: %v", err)
-	}
-	defer st.Close()
-
-	sessions, err := st.ListSessions(ctx, "o/r", 3, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sessions) != 1 || sessions[0].SessionID != "sess-old" || sessions[0].RunID != "old-run" {
-		t.Fatalf("existing sessions should be carried over, got %+v", sessions)
-	}
-}
-
 func TestPlanSaveAndOverwrite(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -593,5 +539,37 @@ func TestStatusPlannedIsTerminalButNotSuccessOrFailure(t *testing.T) {
 	}
 	if hist.Failures != 0 {
 		t.Fatalf("a planned run must not count as a failure, got %d", hist.Failures)
+	}
+}
+
+// A run stopped from outside is nobody's fault. Counting it would back the
+// issue off for hours because someone restarted the daemon.
+func TestCancelledRunsAreNeitherAttemptsNorFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	for i, status := range []string{StatusCanceled, StatusFailed, StatusDeferred} {
+		id := fmt.Sprintf("run-%d", i)
+		if err := st.CreateRun(ctx, Run{
+			ID: id, Repo: "o/r", Issue: 7, Attempt: i + 1,
+			Status: StatusClaimed, StartedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.FailRun(ctx, id, status, "because"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hist, err := st.IssueHistory(ctx, "o/r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the genuinely failed run counts, on both axes.
+	if hist.Failures != 1 {
+		t.Errorf("Failures = %d, want 1 (only the failed run)", hist.Failures)
+	}
+	if hist.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1 (cancelled and deferred runs are not attempts)", hist.Attempts)
 	}
 }

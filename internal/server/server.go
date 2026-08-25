@@ -260,14 +260,11 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 	if s.ctrl == nil || !s.ctrl.Cancel(id) {
 		return s.fail(c, http.StatusNotFound, errors.New("run is not in flight on this process"))
 	}
+	// The run's own outcome notification follows from the orchestrator, and
+	// carries the repo, issue, and attempt that this handler does not know.
+	// The run's own outcome notification follows from the orchestrator, and
+	// carries the repo, issue, and attempt that this handler does not know.
 	s.log.Info("run cancelled by operator", "run", id)
-	ref := discord.RunRef{RunID: id}
-	if run, err := s.store.GetRun(c.Context(), id); err != nil {
-		s.log.Warn("could not look up cancelled run for notification", "run", id, "error", err)
-	} else {
-		ref = discord.RunRef{Repo: run.Repo, Issue: run.Issue, RunID: id, Attempt: run.Attempt}
-	}
-	s.discord.RunCanceled(ref)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
 }
 

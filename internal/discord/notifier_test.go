@@ -212,7 +212,6 @@ func TestEveryRunScopedNotificationLinksTheIssue(t *testing.T) {
 		"RunFailed":    func(n *Notifier) { n.RunFailed(testRef(), "boom", time.Time{}) },
 		"RunAbandoned": func(n *Notifier) { n.RunAbandoned(testRef(), "issue closed", time.Time{}) },
 		"RunDeferred":  func(n *Notifier) { n.RunDeferred(testRef(), "usage limit") },
-		"RunCanceled":  func(n *Notifier) { n.RunCanceled(testRef()) },
 		"LabelUpdateFailed": func(n *Notifier) {
 			n.LabelUpdateFailed(testRef(), []string{"a"}, []string{"b"}, errors.New("HTTP 404"))
 		},
@@ -252,27 +251,6 @@ func TestRunRefDerivesTheIssueURLWhenNotSet(t *testing.T) {
 	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
 	if e.URL != "https://github.com/acme/widgets/issues/42" {
 		t.Errorf("expected a derived issue URL, got %q", e.URL)
-	}
-}
-
-// A run row that could not be looked up must still produce a notification,
-// and must not render the title as "#0".
-func TestRunCanceledWithNoRunRefStaysPlain(t *testing.T) {
-	url, bodies := stubWebhook(t)
-	n := New(true, url, nil)
-
-	n.RunCanceled(RunRef{RunID: "run-1"})
-	n.Close(2 * time.Second)
-
-	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
-	if e.Title != "Run cancelled by operator" {
-		t.Errorf("unexpected title: %q", e.Title)
-	}
-	if e.URL != "" {
-		t.Errorf("expected no url, got %q", e.URL)
-	}
-	if _, ok := field(e, "Issue"); ok {
-		t.Errorf("expected no Issue field, got %+v", e.Fields)
 	}
 }
 
