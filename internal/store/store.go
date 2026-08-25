@@ -66,6 +66,7 @@ const (
 const (
 	GateUsageLimit  = "usage_limit"
 	GatePause       = "pause"
+	GateAuthExpired = "auth_expired"
 	GateModelPrefix = "model:"
 )
 

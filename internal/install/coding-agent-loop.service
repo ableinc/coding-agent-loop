@@ -34,11 +34,18 @@ TimeoutStopSec=50m
 # it can do anything this user can. It runs as {{USER}} because gh and Claude
 # Code store their auth under that account's home — a different user has no
 # credentials to use. Keep the rest of the filesystem read-only.
+#
+# {{HOME}}/.claude must stay writable: Claude Code's OAuth access token is
+# short-lived and the CLI refreshes it transparently, rewriting
+# ~/.claude/.credentials.json on use. Under a read-only home the CLI can read
+# the token but never persist the refreshed one, so it silently keeps reusing
+# the same token until it hard-expires and every run starts failing with
+# "OAuth access token has expired".
 User={{USER}}
 Group={{GROUP}}
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/coding-agent-loop {{HOME}}/.agent-loop
+ReadWritePaths=/opt/coding-agent-loop {{HOME}}/.agent-loop {{HOME}}/.claude
 PrivateTmp=true
 NoNewPrivileges=true
 

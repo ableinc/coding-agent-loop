@@ -681,7 +681,11 @@ The unit itself: `Type=simple`, restarts on failure, `KillSignal=SIGTERM` with
 `TimeoutStopSec=50m` (longer than one run timeout, so a SIGTERM drains in-flight work instead of
 killing it mid-push), and hardened with `ProtectSystem=strict`, `ProtectHome=read-only`,
 `NoNewPrivileges=true`, and `ReadWritePaths` scoped to `/opt/coding-agent-loop` and the service
-account's own `~/.agent-loop`.
+account's own `~/.agent-loop` and `~/.claude`. `~/.claude` has to stay writable because Claude
+Code's OAuth access token is short-lived and the CLI refreshes it transparently, rewriting
+`~/.claude/.credentials.json` on use — under a read-only home the CLI can read the token but never
+persist the refreshed one, so it keeps reusing the same token until it hard-expires and every run
+starts failing with `OAuth access token has expired`.
 
 Common operations once installed:
 

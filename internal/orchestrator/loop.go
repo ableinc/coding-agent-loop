@@ -732,6 +732,15 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		if errors.Is(runErr, claude.ErrCanceled) {
 			return errCanceled{runErr}
 		}
+		if hit, expired := gate.DetectAuthExpired(result, runErr); expired {
+			until, gerr := o.opts.Gate.RecordAuthExpired(bookkeeping, hit)
+			if gerr != nil {
+				log.Error("could not record auth expiry", "error", gerr)
+			}
+			o.event(ctx, runID, "auth_expired", hit.Reason)
+			o.opts.Discord.GateClosed(hit.Reason, until)
+			return errRetryable{fmt.Errorf("oauth token expired: %s", hit.Reason)}
+		}
 		if hit, limited := gate.DetectLimit(result, runErr); limited {
 			until, gerr := o.opts.Gate.RecordLimit(bookkeeping, hit)
 			if gerr != nil {

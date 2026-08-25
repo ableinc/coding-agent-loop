@@ -62,6 +62,14 @@ var (
 		"you've reached your usage limit",
 		"upgrade to increase your usage limit",
 	}
+	// authExpiredPhrases catch a hard-expired OAuth token. Unlike a usage
+	// limit this cannot self-heal on a timer: the CLI needs to persist a
+	// refreshed token (or an operator needs to re-run `claude login`), so it
+	// is classified and gated separately — see DetectAuthExpired.
+	authExpiredPhrases = []string{
+		"oauth access token has expired",
+		"re-authenticate to continue",
+	}
 )
 
 // DetectLimit classifies a failed run. It is pure so it can be tested against
@@ -110,6 +118,37 @@ func DetectLimit(res *claude.Result, runErr error) (LimitHit, bool) {
 		}
 	}
 	return hit, true
+}
+
+// AuthExpiredHit describes a detected hard OAuth token expiry.
+type AuthExpiredHit struct {
+	// Reason is a short human-readable explanation for /status.
+	Reason string
+}
+
+// DetectAuthExpired classifies a failed run as a hard OAuth expiry, distinct
+// from DetectLimit's usage limits: this cannot resolve itself on a timer, so
+// it must not be folded into LimitHit's backoff-and-retry semantics.
+func DetectAuthExpired(res *claude.Result, runErr error) (AuthExpiredHit, bool) {
+	var parts []string
+	if res != nil {
+		parts = append(parts, res.Result, res.Stderr, res.Subtype, res.TerminalReason)
+	}
+	if runErr != nil {
+		parts = append(parts, runErr.Error())
+	}
+	haystack := strings.ToLower(strings.Join(parts, "\n"))
+	if strings.TrimSpace(haystack) == "" {
+		return AuthExpiredHit{}, false
+	}
+	for _, p := range authExpiredPhrases {
+		if strings.Contains(haystack, p) {
+			return AuthExpiredHit{
+				Reason: "OAuth token expired — check that ~/.claude/.credentials.json is writable by the service account so the CLI can persist its refreshed token",
+			}, true
+		}
+	}
+	return AuthExpiredHit{}, false
 }
 
 // Snapshot is the advisory usage picture shown on /status.
@@ -199,6 +238,17 @@ func (g *Gate) RecordLimit(ctx context.Context, hit LimitHit) (time.Time, error)
 		return time.Time{}, err
 	}
 	g.logf("usage gate closed until %s: %s", until.Format(time.RFC3339), hit.Reason)
+	return until, nil
+}
+
+// RecordAuthExpired closes the gate indefinitely on a hard OAuth expiry: it
+// cannot self-heal on a timer the way a usage limit does, so — like Pause —
+// it stays closed until an operator fixes the credentials and calls Resume.
+func (g *Gate) RecordAuthExpired(ctx context.Context, hit AuthExpiredHit) (time.Time, error) {
+	until := time.Now().Add(100 * 365 * 24 * time.Hour)
+	if err := g.store.SetGate(ctx, store.GateAuthExpired, until, hit.Reason); err != nil {
+		return time.Time{}, err
+	}
 	return until, nil
 }
 

@@ -439,6 +439,15 @@ func (o *Orchestrator) executePRComments(ctx context.Context, log *slog.Logger, 
 	}
 
 	if runErr != nil {
+		if hit, expired := gate.DetectAuthExpired(result, runErr); expired {
+			until, gerr := o.opts.Gate.RecordAuthExpired(ctx, hit)
+			if gerr != nil {
+				log.Error("could not record auth expiry", "error", gerr)
+			}
+			o.event(ctx, runID, "auth_expired", hit.Reason)
+			o.opts.Discord.GateClosed(hit.Reason, until)
+			return errRetryable{fmt.Errorf("oauth token expired: %s", hit.Reason)}
+		}
 		if hit, limited := gate.DetectLimit(result, runErr); limited {
 			until, gerr := o.opts.Gate.RecordLimit(ctx, hit)
 			if gerr != nil {

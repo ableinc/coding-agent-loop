@@ -103,6 +103,53 @@ func TestDetectLimit(t *testing.T) {
 	}
 }
 
+func TestDetectAuthExpired(t *testing.T) {
+	tests := []struct {
+		name        string
+		result      *claude.Result
+		runErr      error
+		wantExpired bool
+	}{
+		{
+			name:        "no signal at all",
+			result:      &claude.Result{},
+			wantExpired: false,
+		},
+		{
+			name:        "ordinary failure is not an auth expiry",
+			result:      &claude.Result{IsError: true, Result: "file not found: main.go"},
+			wantExpired: false,
+		},
+		{
+			name:        "usage limit is not an auth expiry",
+			result:      &claude.Result{IsError: true, Result: "Claude AI usage limit reached|1999999999"},
+			wantExpired: false,
+		},
+		{
+			name:        "expired oauth token reported in the result",
+			result:      &claude.Result{IsError: true, Result: "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue."},
+			wantExpired: true,
+		},
+		{
+			name:        "expired oauth token only visible in the run error",
+			runErr:      errString("API Error: 401 OAuth access token has expired. Re-authenticate to continue."),
+			wantExpired: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hit, expired := DetectAuthExpired(tc.result, tc.runErr)
+			if expired != tc.wantExpired {
+				t.Fatalf("expired = %v, want %v (reason %q)", expired, tc.wantExpired, hit.Reason)
+			}
+			if expired && hit.Reason == "" {
+				t.Fatal("a detected auth expiry must carry a reason for /status")
+			}
+		})
+	}
+}
+
 func TestMinorToUnits(t *testing.T) {
 	two := 2
 	zero := 0

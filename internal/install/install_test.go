@@ -37,7 +37,7 @@ func TestRenderSubstitutesPlaceholders(t *testing.T) {
 	if !strings.Contains(unit, "User=alice") || !strings.Contains(unit, "Group=alice") {
 		t.Errorf("expected User=alice / Group=alice, got:\n%s", unit)
 	}
-	if !strings.Contains(unit, "ReadWritePaths=/opt/coding-agent-loop /home/alice/.agent-loop") {
+	if !strings.Contains(unit, "ReadWritePaths=/opt/coding-agent-loop /home/alice/.agent-loop /home/alice/.claude") {
 		t.Errorf("expected the home-scoped ReadWritePaths entry, got:\n%s", unit)
 	}
 }
