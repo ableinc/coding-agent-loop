@@ -28,9 +28,10 @@ const approvalKeyword = "implement"
 const markerPrefix = "<!-- coding-agent-loop:"
 
 const (
-	markerPlan    = markerPrefix + "plan -->"
-	markerPR      = markerPrefix + "pr -->"
-	markerFailure = markerPrefix + "failure -->"
+	markerPlan      = markerPrefix + "plan -->"
+	markerPR        = markerPrefix + "pr -->"
+	markerFailure   = markerPrefix + "failure -->"
+	markerPRComment = markerPrefix + "pr-comment -->"
 )
 
 func isAgentComment(body string) bool {

@@ -82,6 +82,7 @@ func (n *Notifier) Close(drain time.Duration) {
 type embed struct {
 	Title       string       `json:"title"`
 	Description string       `json:"description,omitempty"`
+	URL         string       `json:"url,omitempty"`
 	Color       int          `json:"color"`
 	Fields      []embedField `json:"fields,omitempty"`
 	Timestamp   string       `json:"timestamp"`
@@ -139,6 +140,22 @@ func (n *Notifier) post(e embed) {
 	}()
 }
 
+// postRun sends e to the webhook after making sure it carries a clickable
+// link to the run's issue: the title becomes a link (unless e.URL is already
+// set, e.g. to a PR) and an "Issue" field is always added. A RunRef with no
+// repo/issue (e.g. a run row that could not be read) posts e unchanged.
+func (n *Notifier) postRun(r RunRef, e embed) {
+	if u := r.issueURL(); u != "" {
+		if e.URL == "" {
+			e.URL = u
+		}
+		e.Fields = append(e.Fields, embedField{
+			Name: "Issue", Value: fmt.Sprintf("[%s#%d](%s)", r.Repo, r.Issue, u),
+		})
+	}
+	n.post(e)
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -180,6 +197,35 @@ func (r RunRef) description() string {
 	}
 }
 
+// issueURL is the link a notification should point at: the issue's own URL
+// when known, otherwise one derived from repo and issue number. Derivation
+// assumes github.com, which is correct everywhere this codebase talks to
+// GitHub today.
+func (r RunRef) issueURL() string {
+	if r.URL != "" {
+		return r.URL
+	}
+	if r.Repo != "" && r.Issue > 0 {
+		return fmt.Sprintf("https://github.com/%s/issues/%d", r.Repo, r.Issue)
+	}
+	return ""
+}
+
+// describe combines the issue's own description with a notification's own
+// message, so a notification that overwrites Description for a cause or
+// reason does not lose the linked issue title in the process.
+func (r RunRef) describe(body string) string {
+	d := r.description()
+	switch {
+	case body == "":
+		return d
+	case d == "":
+		return body
+	default:
+		return d + "\n" + body
+	}
+}
+
 func (r RunRef) fields() []embedField {
 	return []embedField{
 		{Name: "Run ID", Value: r.RunID, Inline: true},
@@ -197,7 +243,7 @@ func (n *Notifier) RunClaimed(r RunRef, failures int) {
 			Name: "Previous failures", Value: fmt.Sprintf("%d", failures), Inline: true,
 		})
 	}
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Run claimed"),
 		Description: r.description(),
 		Color:       colorBlurple,
@@ -212,7 +258,7 @@ func (n *Notifier) ClaudeFinished(r RunRef, res *claude.Result, elapsed time.Dur
 	if res == nil {
 		return
 	}
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Claude finished"),
 		Description: r.description(),
 		Color:       colorGray,
@@ -247,7 +293,7 @@ func (n *Notifier) VerifyResult(r RunRef, v verify.Result) {
 			fields = append(fields, embedField{Name: "Output (tail)", Value: codeBlock(tail(out, 900)), Inline: false})
 		}
 	}
-	n.post(embed{Title: r.title(what), Description: r.description(), Color: color, Fields: fields})
+	n.postRun(r, embed{Title: r.title(what), Description: r.description(), Color: color, Fields: fields})
 }
 
 // PROpened reports that a draft pull request was opened.
@@ -256,11 +302,13 @@ func (n *Notifier) PROpened(r RunRef, prURL string, res *claude.Result, v verify
 	if res != nil {
 		model, session, cost = res.PrimaryModel(), res.SessionID, res.TotalCostUSD
 	}
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Draft PR opened"),
-		Description: prURL,
+		Description: r.describe(prURL),
+		URL:         prURL,
 		Color:       colorGreen,
 		Fields: append(r.fields(),
+			embedField{Name: "Pull request", Value: prURL, Inline: false},
 			embedField{Name: "Model", Value: orNone(model), Inline: true},
 			embedField{Name: "Cost", Value: money(cost), Inline: true},
 			embedField{Name: "Verification", Value: orNone(v.Status), Inline: true},
@@ -292,13 +340,35 @@ func (n *Notifier) PlanPosted(r RunRef, res *claude.Result, elapsed time.Duratio
 	if res != nil {
 		model, cost = res.PrimaryModel(), res.TotalCostUSD
 	}
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Plan posted, awaiting approval"),
-		Description: "Reply `implement` on the issue to start the change.",
+		Description: r.describe("Reply `implement` on the issue to start the change."),
 		Color:       colorBlurple,
 		Fields: append(r.fields(),
 			embedField{Name: "Model", Value: orNone(model), Inline: true},
 			embedField{Name: "Cost", Value: money(cost), Inline: true},
+			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
+		),
+	})
+}
+
+// PRCommentsAddressed reports that review feedback on a pull request was
+// acted on: code pushed (or not, when the feedback needed only a reply) and
+// verified.
+func (n *Notifier) PRCommentsAddressed(r RunRef, handled int, res *claude.Result, v verify.Result, elapsed time.Duration) {
+	model, cost := "", 0.0
+	if res != nil {
+		model, cost = res.PrimaryModel(), res.TotalCostUSD
+	}
+	n.post(embed{
+		Title:       r.title("PR comments addressed"),
+		Description: r.description(),
+		Color:       colorGreen,
+		Fields: append(r.fields(),
+			embedField{Name: "Comments handled", Value: fmt.Sprintf("%d", handled), Inline: true},
+			embedField{Name: "Model", Value: orNone(model), Inline: true},
+			embedField{Name: "Cost", Value: money(cost), Inline: true},
+			embedField{Name: "Verification", Value: orNone(v.Status), Inline: true},
 			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
 		),
 	})
@@ -320,9 +390,9 @@ func (n *Notifier) RunCanceled(r RunRef, reason string) {
 // RunFailed reports a failed run and when it will be tried again. Retries are
 // unbounded, so "when" is the useful number, not "how many are left".
 func (n *Notifier) RunFailed(r RunRef, cause string, nextAttempt time.Time) {
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Run failed"),
-		Description: truncate(cause, 500),
+		Description: r.describe(truncate(cause, 500)),
 		Color:       colorOrange,
 		Fields: append(r.fields(),
 			embedField{Name: "Next attempt", Value: when(nextAttempt), Inline: true},
@@ -333,9 +403,9 @@ func (n *Notifier) RunFailed(r RunRef, cause string, nextAttempt time.Time) {
 // RunAbandoned reports a run that was skipped rather than attempted — the
 // issue closed, lost its label, or is already covered by a pull request.
 func (n *Notifier) RunAbandoned(r RunRef, reason string, nextAttempt time.Time) {
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Run abandoned"),
-		Description: truncate(reason, 500),
+		Description: r.describe(truncate(reason, 500)),
 		Color:       colorRed,
 		Fields: append(r.fields(),
 			embedField{Name: "Next attempt", Value: when(nextAttempt), Inline: true},
@@ -346,9 +416,9 @@ func (n *Notifier) RunAbandoned(r RunRef, reason string, nextAttempt time.Time) 
 // RunDeferred reports a run the usage gate stopped. It is neither an attempt
 // nor a failure, so the issue keeps its place in the queue.
 func (n *Notifier) RunDeferred(r RunRef, reason string) {
-	n.post(embed{
+	n.postRun(r, embed{
 		Title:       r.title("Run deferred"),
-		Description: truncate(reason, 500),
+		Description: r.describe(truncate(reason, 500)),
 		Color:       colorYellow,
 		Fields:      r.fields(),
 	})
@@ -356,16 +426,15 @@ func (n *Notifier) RunDeferred(r RunRef, reason string) {
 
 // LabelUpdateFailed reports that the issue's labels could not be brought in
 // line with the run's state, so what GitHub shows now disagrees with the store.
-func (n *Notifier) LabelUpdateFailed(repo string, issue int, runID string, add, remove []string, err error) {
-	n.post(embed{
-		Title:       fmt.Sprintf("Label update failed: %s#%d", repo, issue),
-		Description: truncate(err.Error(), 500),
+func (n *Notifier) LabelUpdateFailed(r RunRef, add, remove []string, err error) {
+	n.postRun(r, embed{
+		Title:       r.title("Label update failed"),
+		Description: r.describe(truncate(err.Error(), 500)),
 		Color:       colorYellow,
-		Fields: []embedField{
-			{Name: "Add", Value: labelList(add), Inline: true},
-			{Name: "Remove", Value: labelList(remove), Inline: true},
-			{Name: "Run ID", Value: runID, Inline: true},
-		},
+		Fields: append(r.fields(),
+			embedField{Name: "Add", Value: labelList(add), Inline: true},
+			embedField{Name: "Remove", Value: labelList(remove), Inline: true},
+		),
 	})
 }
 

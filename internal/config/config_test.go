@@ -215,3 +215,49 @@ func TestGitIdentityEmailWithAngleBracketIsRejected(t *testing.T) {
 		t.Fatalf("want a git.author_email validation error, got %v", err)
 	}
 }
+
+func TestPRCommentsDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := cfg.GitHub.PRComments
+	if !pc.Enabled {
+		t.Fatal("pr_comments should be enabled by default")
+	}
+	if pc.Mention != "@coding-agent" {
+		t.Fatalf("unexpected default mention %q", pc.Mention)
+	}
+	if pc.AckReaction != "eyes" || pc.DoneReaction != "+1" {
+		t.Fatalf("unexpected default reactions: ack=%q done=%q", pc.AckReaction, pc.DoneReaction)
+	}
+	if len(pc.AllowedAssociations) == 0 {
+		t.Fatal("default allowed associations should not be empty")
+	}
+}
+
+// A config file written before this feature existed has no pr_comments block
+// at all; it must still load using the defaults.
+func TestConfigWithoutPRCommentsBlockStillLoads(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"],"label":"agent-ready"}}`), false)
+	if err != nil {
+		t.Fatalf("a config predating pr_comments must still load: %v", err)
+	}
+	if !cfg.GitHub.PRComments.Enabled {
+		t.Fatal("defaults should still populate pr_comments")
+	}
+}
+
+func TestPRCommentsRejectsInvalidReaction(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"],"pr_comments":{"enabled":true,"mention":"@coding-agent","search_limit":30,"ack_reaction":"nope","done_reaction":"+1"}}}`), false)
+	if err == nil || !strings.Contains(err.Error(), "ack_reaction") {
+		t.Fatalf("want an invalid reaction error, got %v", err)
+	}
+}
+
+func TestPRCommentsRejectsMentionWithoutAt(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"],"pr_comments":{"enabled":true,"mention":"coding-agent","search_limit":30,"ack_reaction":"eyes","done_reaction":"+1"}}}`), false)
+	if err == nil || !strings.Contains(err.Error(), "mention") {
+		t.Fatalf("want a mention validation error, got %v", err)
+	}
+}

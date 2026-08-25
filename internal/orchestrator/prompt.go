@@ -92,6 +92,98 @@ final message should be the plan itself, headed by a short one-line summary of t
 change.`, repo, worktree)
 }
 
+// prCommentSystemPrompt states the harness contract for addressing review
+// feedback on an already-open pull request: the same rules as systemPrompt,
+// reframed around a branch and PR that already exist rather than one about
+// to be created.
+func prCommentSystemPrompt(repo, branch, worktree string) string {
+	return fmt.Sprintf(`You are running unattended as an automated coding agent.
+
+Working context:
+- Repository: %s
+- Branch: %s (already created and checked out for you; an open pull request already exists from it)
+- Worktree: %s
+
+You are addressing reviewer feedback left as comments on that open pull request. Keep
+the change to what the feedback below asks for; do not re-litigate the rest of the PR.
+
+The harness, not you, owns version control and GitHub. Specifically:
+- Do NOT run git push, git rebase, git reset --hard, or any force operation.
+- Do NOT create branches, tags, pull requests, or comments.
+- Do NOT amend or rewrite any commit that already exists.
+- You MAY commit your work locally. If you do not, the harness commits it for you.
+
+Scope rules:
+- Confine all edits to the worktree above. Do not modify files elsewhere on this machine.
+- Do not modify CI configuration, deployment manifests, or anything holding credentials.
+- Address every comment listed below, at the scope it asks for. Do not opportunistically
+  refactor, reformat, or "clean up" code the comments did not ask you to touch.
+- Follow the conventions already present in the repository.
+
+Autonomy:
+- Nobody is watching and nobody can answer a question mid-task. Do not ask for
+  confirmation and do not end your turn with a proposal you did not carry out.
+- If a comment is a question rather than a change request, answer it in your final
+  summary instead of editing code for it.
+- If you conclude a requested change should not be made, make no edits and explain why
+  in your final summary.
+
+Finish with a short summary addressing each comment in turn: what you changed (or why
+you didn't), and anything a reviewer should look at closely. This summary is posted
+back to the pull request.`, repo, branch, worktree)
+}
+
+// prCommentTaskPrompt renders the PR and its triggering comments into the
+// instruction for the review-feedback pass. reviews are review summary
+// bodies, included as context only: they cannot be reacted to, so they never
+// appear in comments.
+func prCommentTaskPrompt(repo string, pr gh.PullRequest, comments []gh.PRComment, reviews []string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Address reviewer feedback on pull request #%d in %s.\n\n", pr.Number, repo)
+	fmt.Fprintf(&b, "## Pull request #%d: %s\n\n", pr.Number, pr.Title)
+	if pr.URL != "" {
+		fmt.Fprintf(&b, "<%s>\n\n", pr.URL)
+	}
+	body := strings.TrimSpace(pr.Body)
+	if body != "" {
+		fmt.Fprintf(&b, "%s\n\n", truncate(body, maxBodyChars))
+	}
+
+	b.WriteString("### Comments to address\n\n")
+	for _, c := range comments {
+		author := c.Author
+		if author == "" {
+			author = "unknown"
+		}
+		fmt.Fprintf(&b, "**@%s**: %s\n\n", author, truncate(strings.TrimSpace(c.Body), maxCommentChars))
+		if c.Path != "" {
+			fmt.Fprintf(&b, "On `%s`", c.Path)
+			if c.Line > 0 {
+				fmt.Fprintf(&b, " (line %d)", c.Line)
+			}
+			b.WriteString(":\n\n")
+			if c.DiffHunk != "" {
+				b.WriteString("```diff\n")
+				b.WriteString(truncate(c.DiffHunk, maxCommentChars))
+				b.WriteString("\n```\n\n")
+			}
+		}
+	}
+
+	if len(reviews) > 0 {
+		b.WriteString("### Review summaries (context only)\n\n")
+		for _, r := range reviews {
+			fmt.Fprintf(&b, "%s\n\n", truncate(strings.TrimSpace(r), maxCommentChars))
+		}
+	}
+
+	b.WriteString("\nAddress every comment listed above. If one is a question rather than a change " +
+		"request, answer it in your final summary instead of editing code for it. Read the relevant " +
+		"parts of the repository before editing, then make the change.\n")
+	return b.String()
+}
+
 // issueContext renders the issue itself: title, labels, description, and
 // recent discussion. Shared by the plan and implement prompts so the two
 // phases see the same view of the issue.

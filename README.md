@@ -5,16 +5,16 @@ isolated git worktree, and opens a **draft** pull request for you to review. It 
 anything.
 
 ```
-gh search issues --label agent-ready
-        │
-        ▼
-   claim (SQLite lease, one issue per repo at a time)
-        │
-        ▼
+gh search issues --label agent-ready          gh search prs --author <bot>
+        │                                              │
+        ▼                                              ▼
+   claim (SQLite lease, one issue per repo at a time, shared with the PR path)
+        │                                              │
+        ▼                                              ▼
    git worktree ──▶ claude -p --output-format stream-json
-        │
-        ▼
-   run the repo's tests ──▶ commit ──▶ push ──▶ gh pr create --draft
+        │                                              │
+        ▼                                              ▼
+   run the repo's tests ──▶ commit ──▶ push ──▶ gh pr create --draft   react 👀 ──▶ push ──▶ react 👍
 ```
 
 ## Table of contents
@@ -26,6 +26,7 @@ gh search issues --label agent-ready
 - [CLI flags](#cli-flags)
 - [How work is selected](#how-work-is-selected)
 - [Lifecycle of one issue](#lifecycle-of-one-issue)
+- [Responding to PR comments](#responding-to-pr-comments)
 - [Configuration reference](#configuration-reference)
   - [config.json](#configjson)
   - [models.json](#modelsjson)
@@ -243,6 +244,39 @@ issue is worked at all: remove `agent-ready` to stop the retries.
 A usage limit hit mid-run is recorded as `deferred` — neither an attempt nor a failure, so it
 neither extends the back-off nor drops the issue down the ladder.
 
+## Responding to PR comments
+
+Once a draft PR is open, a reviewer can hand feedback back to the agent without re-labelling
+anything: comment on the PR mentioning the handle in `github.pr_comments.mention` (`@coding-agent`
+by default), and the daemon picks it up on its next poll.
+
+1. **Discover** — `gh search prs --author <the daemon's own login>` scoped to `github.owners`, run
+   before issue discovery in every tick and drawing from the same per-repo concurrency budget: a
+   reviewer waiting on a reply outranks starting a new issue. Only PRs the daemon itself opened, on a
+   branch starting with `workspace.branch_prefix`, are ever considered — a hard rule, not a config
+   knob, so the daemon only ever pushes to branches it created itself.
+2. **Match** — every conversation comment and inline review comment is checked for the mention.
+   Quoted lines (`>`) and fenced code blocks don't count, so a comment that merely quotes or shows a
+   previous mention can't re-trigger the agent, and the daemon skips its own comments and marker-
+   tagged replies. Only commenters whose `author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`
+   (or who appear in `github.pr_comments.allowed_authors`) can trigger a run — review summary bodies
+   are shown to the model as context but can never trigger one, since GitHub's REST API has no
+   reactions endpoint for a review as a whole.
+3. **Acknowledge** — every matching comment gets `github.pr_comments.ack_reaction` (👀 by default)
+   immediately, before any cloning: that's the visible promise that it was seen.
+4. **Address** — the PR's own branch is checked out as-is (not reset against the default branch), and
+   Claude is given the PR and its triggering comments, with the same no-git/no-GitHub-mutation
+   contract as the issue flow, reframed around a branch and PR that already exist. If the feedback is
+   a question rather than a change request, the agent answers it in its final summary instead of
+   editing code — that still counts as addressed.
+5. **Deliver** — if there's a code change, it's committed, verified, and pushed to the PR's branch;
+   either way a reply is posted summarising what was done, and each comment gets
+   `github.pr_comments.done_reaction` (👍 by default).
+6. **Retry** — a failed attempt leaves the 👀 in place (the comment was seen) and retries after the
+   same exponential back-off as a failed issue, tracked per comment so one stuck comment doesn't hold
+   up others on the same PR. A daemon restart between the 👀 and the reply is not stranded: the task
+   is recorded as soon as the reaction goes out, and a subsequent pass retries it.
+
 ## Configuration reference
 
 ### config.json
@@ -265,7 +299,17 @@ This repository's own `config.json` is also **compiled into the binary** at buil
     "exclude_repos": [],
     "search_limit": 50,
     "poll_interval": "5m",
-    "binary": "gh"
+    "binary": "gh",
+    "pr_comments": {
+      "enabled": true,
+      "mention": "@coding-agent",
+      "search_limit": 30,
+      "max_age": "168h",
+      "ack_reaction": "eyes",
+      "done_reaction": "+1",
+      "allowed_authors": [],
+      "allowed_associations": ["OWNER", "MEMBER", "COLLABORATOR"]
+    }
   },
   "workspace": {
     "root": "~/.agent-loop/work",
@@ -323,6 +367,13 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `github.exclude_repos`                                 | `owner/name` repos to never touch, even if labelled                                                                                |
 | `github.search_limit`                                  | max issues fetched per discovery pass                                                                                              |
 | `github.poll_interval`                                 | how often discovery runs                                                                                                           |
+| `github.pr_comments.enabled`                           | watch the daemon's own open PRs for `@`-mentions and act on them (see [Responding to PR comments](#responding-to-pr-comments))     |
+| `github.pr_comments.mention`                            | handle a comment must contain to trigger a response; **must start with `@`**                                                       |
+| `github.pr_comments.search_limit`                      | max of the daemon's own open PRs checked per pass                                                                                  |
+| `github.pr_comments.max_age`                           | ignore comments older than this; `0` disables the limit                                                                            |
+| `github.pr_comments.ack_reaction` / `done_reaction`    | GitHub reaction content applied on pickup / once addressed; one of `+1 -1 laugh confused heart hooray rocket eyes`                 |
+| `github.pr_comments.allowed_authors`                   | explicit login allowlist for who may trigger the agent; empty falls back to `allowed_associations`                                 |
+| `github.pr_comments.allowed_associations`               | `author_association` values permitted to trigger the agent (`OWNER`, `MEMBER`, `COLLABORATOR`, ...) when `allowed_authors` is empty |
 | `workspace.root`                                       | where per-issue worktrees live                                                                                                     |
 | `workspace.repos_root`                                 | where the one-per-repo checkout-less clones live                                                                                   |
 | `workspace.logs_root`                                  | where JSONL run transcripts are written                                                                                            |
@@ -458,7 +509,7 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | ---------------------------- | ------------------------------------------------------------------- |
 | `GET /healthz`               | liveness                                                            |
 | `GET /status`                | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
-| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps |
+| `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps; `kind` distinguishes an issue run from a PR-comment run |
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
 | `GET /sessions?repo=&issue=&limit=` | Claude session IDs recorded per repo/issue, newest first     |
@@ -484,21 +535,24 @@ To enable it:
    }
    ```
 
-Once enabled, every one of these posts an embed. Run notifications lead with the issue's own title,
-linked, and carry the run ID and attempt number:
+Once enabled, every one of these posts an embed. Every run notification's title links straight to
+the GitHub issue, and carries an `Issue` field with the same link, the run ID, and attempt number —
+one click reaches the issue from any message, even ones (like a failure or a cancellation) that
+would otherwise show only its plain-text `owner/name#42`:
 
 - **Run claimed** — plus how many earlier attempts on that issue failed, when it is a retry.
 - **Claude finished** — model, session ID, turns, cost, tokens in/out, wall-clock duration.
 - **Verification** — passed, failed, or skipped, with the command and, on failure, the tail of the
   test output, so the channel says what broke without opening the PR.
-- **Draft PR opened** — link, model, session ID, cost, verification status, total run duration,
-  diffstat.
+- **Draft PR opened** — title links the PR (with the issue link kept in the `Issue` field), model,
+  session ID, cost, verification status, total run duration, diffstat.
 - **Run failed** — the cause and **when the next attempt is due** (retries are unbounded, so "when"
   is the useful number).
 - **Run abandoned** — a run that was skipped rather than attempted: the issue closed, lost its
   label, or is already covered by a PR.
 - **Run deferred** — a run the usage gate stopped. Neither an attempt nor a failure.
-- **Run cancelled** — `POST /runs/{id}/cancel`.
+- **Run cancelled** — `POST /runs/{id}/cancel`, linking the issue when the run's repo/issue could
+  be looked up.
 - **Label update failed** — the labels on GitHub now disagree with the store, and which edit was
   refused. Otherwise invisible.
 - **Model cooled down** — which model, until when, and why, so a run served from lower on the ladder
@@ -531,6 +585,13 @@ user can. What constrains it:
 - **Nothing is ever merged**, and every PR is a draft.
 - Child processes run in their own process group and are killed as a group on timeout, so a
   runaway grandchild (a stray build/test process) can't outlive the run.
+- **PR comments only ever act on PRs the daemon itself opened, on a branch under
+  `workspace.branch_prefix`.** A mention on any other pull request is ignored outright.
+- **Only permitted commenters can trigger a run from a PR comment** — `author_association` in
+  `OWNER`/`MEMBER`/`COLLABORATOR`, or an explicit `github.pr_comments.allowed_authors` entry —
+  otherwise an arbitrary commenter on a public repo could drive a `bypassPermissions` Claude run.
+- `--dry-run` suppresses PR-comment reactions and replies exactly like it does labels, comments, and
+  pushes on the issue path.
 
 `--install` below scopes the systemd unit's filesystem access to `/opt/coding-agent-loop` and its
 own `~/.agent-loop` regardless of which account it runs as (see

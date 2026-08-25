@@ -11,7 +11,17 @@
     "exclude_repos": [],
     "search_limit": 50,
     "poll_interval": "5m",
-    "binary": "gh"
+    "binary": "gh",
+    "pr_comments": {
+      "enabled": true,
+      "mention": "@coding-agent",
+      "search_limit": 30,
+      "max_age": "168h",
+      "ack_reaction": "eyes",
+      "done_reaction": "+1",
+      "allowed_authors": [],
+      "allowed_associations": ["OWNER", "MEMBER", "COLLABORATOR"]
+    }
   },
   "workspace": {
     "root": "~/.agent-loop/work",

@@ -75,6 +75,34 @@ type GitHubConfig struct {
 	PollInterval Duration `json:"poll_interval"`
 	// Binary is the gh executable; overridable for tests.
 	Binary string `json:"binary"`
+	// PRComments controls responding to @-mentions on the daemon's own pull requests.
+	PRComments PRCommentsConfig `json:"pr_comments"`
+}
+
+// PRCommentsConfig controls watching the daemon's own pull requests for
+// review comments that @-mention it, and acting on them.
+type PRCommentsConfig struct {
+	Enabled bool `json:"enabled"`
+	// Mention is the handle a comment must contain to trigger a response,
+	// e.g. "@coding-agent".
+	Mention string `json:"mention"`
+	// SearchLimit caps how many of the daemon's own open PRs one pass checks.
+	SearchLimit int `json:"search_limit"`
+	// MaxAge bounds how old a comment may be and still trigger a response. 0
+	// means no limit.
+	MaxAge Duration `json:"max_age"`
+	// AckReaction/DoneReaction are GitHub reaction content values (one of
+	// "+1 -1 laugh confused heart hooray rocket eyes") applied to a triggering
+	// comment when it is picked up and when it has been addressed.
+	AckReaction  string `json:"ack_reaction"`
+	DoneReaction string `json:"done_reaction"`
+	// AllowedAuthors is an explicit login allowlist of commenters who may
+	// trigger the agent. Empty falls back to AllowedAssociations.
+	AllowedAuthors []string `json:"allowed_authors"`
+	// AllowedAssociations lists the author_association values (OWNER, MEMBER,
+	// COLLABORATOR, ...) permitted to trigger the agent when AllowedAuthors is
+	// empty.
+	AllowedAssociations []string `json:"allowed_associations"`
 }
 
 type WorkspaceConfig struct {
@@ -174,6 +202,15 @@ func Default() Config {
 			SearchLimit:  50,
 			PollInterval: Duration(5 * time.Minute),
 			Binary:       "gh",
+			PRComments: PRCommentsConfig{
+				Enabled:             true,
+				Mention:             "@coding-agent",
+				SearchLimit:         30,
+				MaxAge:              Duration(168 * time.Hour),
+				AckReaction:         "eyes",
+				DoneReaction:        "+1",
+				AllowedAssociations: []string{"OWNER", "MEMBER", "COLLABORATOR"},
+			},
 		},
 		Workspace: WorkspaceConfig{
 			Root:         "~/.agent-loop/work",
@@ -308,6 +345,21 @@ func (c *Config) Validate() error {
 	if containsCommitHeaderBreakingChars(c.Git.AuthorEmail) {
 		return fmt.Errorf("git.author_email must not contain '<', '>', or a newline")
 	}
+	if c.GitHub.PRComments.Enabled {
+		pc := c.GitHub.PRComments
+		if !strings.HasPrefix(pc.Mention, "@") {
+			return fmt.Errorf("github.pr_comments.mention must start with '@', got %q", pc.Mention)
+		}
+		if pc.SearchLimit < 1 {
+			return fmt.Errorf("github.pr_comments.search_limit must be >= 1, got %d", pc.SearchLimit)
+		}
+		if !validReaction(pc.AckReaction) {
+			return fmt.Errorf("github.pr_comments.ack_reaction %q is not a valid GitHub reaction", pc.AckReaction)
+		}
+		if !validReaction(pc.DoneReaction) {
+			return fmt.Errorf("github.pr_comments.done_reaction %q is not a valid GitHub reaction", pc.DoneReaction)
+		}
+	}
 	return nil
 }
 
@@ -316,6 +368,14 @@ func (c *Config) Validate() error {
 func containsCommitHeaderBreakingChars(s string) bool {
 	return strings.ContainsAny(s, "<>\n")
 }
+
+// validReactions are the only content values GitHub's reactions API accepts.
+var validReactions = map[string]bool{
+	"+1": true, "-1": true, "laugh": true, "confused": true,
+	"heart": true, "hooray": true, "rocket": true, "eyes": true,
+}
+
+func validReaction(r string) bool { return validReactions[r] }
 
 // validOwners returns the entries of owners that are non-blank after trimming.
 func validOwners(owners []string) []string {

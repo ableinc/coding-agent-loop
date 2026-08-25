@@ -134,6 +134,67 @@ func failureComment(runID string, attempt int, reason string, nextAttempt time.T
 	return b.String()
 }
 
+// prCommentComment is the reply posted on a pull request once its triggering
+// comments have been addressed: one line per comment linking back to it, the
+// agent's own summary, and the verification outcome.
+func prCommentComment(handled []gh.PRComment, summary, runID string, v verify.Result, pushed bool) string {
+	var b strings.Builder
+	b.WriteString(markerPRComment)
+	b.WriteString("\n\n")
+
+	b.WriteString("Addressed the following comment")
+	if len(handled) != 1 {
+		b.WriteString("s")
+	}
+	b.WriteString(":\n\n")
+	for _, c := range handled {
+		fmt.Fprintf(&b, "- %s\n", c.URL)
+	}
+	b.WriteString("\n")
+
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		s = "_The agent produced no closing summary._"
+	}
+	b.WriteString(s)
+	b.WriteString("\n\n")
+
+	if pushed {
+		switch v.Status {
+		case store.VerifyPassed:
+			fmt.Fprintf(&b, "Tests passed (`%s`).\n", v.Command)
+		case store.VerifyFailed:
+			fmt.Fprintf(&b, "Tests failed (`%s`).\n", v.Command)
+		default:
+			b.WriteString("No test command was detected for this repository.\n")
+		}
+	} else {
+		b.WriteString("No code changes were needed.\n")
+	}
+	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
+	return b.String()
+}
+
+// prCommentFailureComment explains an unsuccessful attempt at addressing PR
+// review feedback. The 👀 reaction stays regardless: the comment was seen, and
+// the next pass retries it after its own back-off.
+func prCommentFailureComment(runID string, reason string, nextAttempt time.Time) string {
+	var b strings.Builder
+	b.WriteString(markerPRComment)
+	b.WriteString("\n\n")
+	b.WriteString("Could not address this review feedback.\n\n")
+	b.WriteString("```\n")
+	b.WriteString(strings.TrimSpace(reason))
+	b.WriteString("\n```\n\n")
+	if nextAttempt.IsZero() {
+		b.WriteString("It will try again on a later pass.\n")
+	} else {
+		fmt.Fprintf(&b, "It will try again after %s.\n", nextAttempt.UTC().Format(time.RFC1123))
+	}
+	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
+	return b.String()
+}
+
 // maxPlanCommentChars keeps a plan comment under GitHub's ~65536-character
 // comment body limit, leaving room for the marker and footer.
 const maxPlanCommentChars = 60000
