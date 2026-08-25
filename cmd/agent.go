@@ -229,7 +229,10 @@ func run(f flags) error {
 
 	errCh := make(chan error, 2)
 	if !f.noServer {
-		srv := server.New(cfg.Server.Addr, st, gateway, orch, log, notifier)
+		srv := server.New(server.Options{
+			Addr: cfg.Server.Addr, Store: st, Gate: gateway, Ctrl: orch,
+			Log: log, Discord: notifier, Config: cfg, Registry: registry,
+		})
 		go func() { errCh <- srv.Listen(ctx) }()
 	}
 	go func() { errCh <- orch.Run(ctx) }()

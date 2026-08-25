@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,8 @@ type fakeController struct {
 	cancelled  []string
 	cancelOK   bool
 	activeRepo []string
+	pollOK     bool
+	polled     int
 }
 
 func (f *fakeController) Cancel(runID string) bool {
@@ -31,7 +34,17 @@ func (f *fakeController) Cancel(runID string) bool {
 
 func (f *fakeController) ActiveRepos() []string { return f.activeRepo }
 
+func (f *fakeController) Poll() bool {
+	f.polled++
+	return f.pollOK
+}
+
 func testServer(t *testing.T) (*Server, *store.Store, *fakeController) {
+	t.Helper()
+	return testServerWithConfig(t, config.Default())
+}
+
+func testServerWithConfig(t *testing.T, cfg config.Config) (*Server, *store.Store, *fakeController) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -39,11 +52,14 @@ func testServer(t *testing.T) (*Server, *store.Store, *fakeController) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	cfg := config.Default()
 	cfg.Claude.CredentialsPath = filepath.Join(t.TempDir(), "absent.json")
 	g := gate.New(st, cfg.Claude, nil)
-	ctrl := &fakeController{cancelOK: true, activeRepo: []string{"acme/widgets"}}
-	return New("127.0.0.1:0", st, g, ctrl, nil, discord.New(false, "", nil)), st, ctrl
+	ctrl := &fakeController{cancelOK: true, pollOK: true, activeRepo: []string{"acme/widgets"}}
+	s := New(Options{
+		Addr: "127.0.0.1:0", Store: st, Gate: g, Ctrl: ctrl,
+		Discord: discord.New(false, "", nil), Config: cfg,
+	})
+	return s, st, ctrl
 }
 
 func do(t *testing.T, s *Server, method, target string, body io.Reader) (int, map[string]any) {
@@ -267,5 +283,142 @@ func TestListSessions(t *testing.T) {
 	}
 	if id := sessions[0].(map[string]any)["SessionID"]; id != "sess-1" {
 		t.Fatalf("unexpected session %v", id)
+	}
+}
+
+func TestUIServedAndRootRedirects(t *testing.T) {
+	s, _, _ := testServer(t) // config.Default() has server.ui = true
+
+	req := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+	resp, err := s.app.Test(req, fiberTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /ui/ = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("GET /ui/ content-type = %q", ct)
+	}
+	if !strings.Contains(string(raw), "app.js") {
+		t.Fatalf("GET /ui/ body does not reference app.js: %s", raw)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/ui/app.js", nil)
+	resp, err = s.app.Test(req, fiberTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /ui/app.js = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Fatalf("GET /ui/app.js content-type = %q", ct)
+	}
+
+	if code, _ := do(t, s, http.MethodGet, "/ui/nope.js", nil); code != http.StatusNotFound {
+		t.Fatalf("GET /ui/nope.js = %d, want 404", code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	resp, err = s.app.Test(req, fiberTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("GET / = %d, want 302", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/ui/" {
+		t.Fatalf("GET / Location = %q, want /ui/", loc)
+	}
+
+	// The static mount must not shadow the JSON API.
+	code, body := do(t, s, http.MethodGet, "/status", nil)
+	if code != http.StatusOK || body["claiming_work"] != true {
+		t.Fatalf("GET /status after UI mount = %d %v", code, body)
+	}
+}
+
+func TestUIDisabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.UI = false
+	s, _, _ := testServerWithConfig(t, cfg)
+
+	if code, _ := do(t, s, http.MethodGet, "/ui/", nil); code != http.StatusNotFound {
+		t.Fatalf("GET /ui/ with server.ui=false = %d, want 404", code)
+	}
+	code, body := do(t, s, http.MethodGet, "/status", nil)
+	if code != http.StatusOK || body["claiming_work"] != true {
+		t.Fatalf("GET /status with server.ui=false = %d %v", code, body)
+	}
+}
+
+func TestSameOriginGuard(t *testing.T) {
+	s, _, _ := testServer(t)
+
+	post := func(origin string) int {
+		req := httptest.NewRequest(http.MethodPost, "/pause", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := s.app.Test(req, fiberTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := post("https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-origin POST = %d, want 403", code)
+	}
+	if code := post(""); code != http.StatusOK {
+		t.Fatalf("no-Origin POST (curl-style) = %d, want 200", code)
+	}
+	// Resume so the next assertion isn't affected by the pause above.
+	do(t, s, http.MethodPost, "/resume", nil)
+	if code := post("http://127.0.0.1:8787"); code != http.StatusOK {
+		t.Fatalf("loopback-origin POST = %d, want 200", code)
+	}
+}
+
+func TestGetConfigRedactsWebhook(t *testing.T) {
+	cfg := config.Default()
+	cfg.Discord.Enabled = true
+	cfg.Discord.WebhookURL = "https://discord.com/api/webhooks/super-secret"
+	s, _, _ := testServerWithConfig(t, cfg)
+
+	code, body := do(t, s, http.MethodGet, "/config", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /config = %d", code)
+	}
+	if body["discord_webhook_set"] != true {
+		t.Fatalf("discord_webhook_set = %v, want true", body["discord_webhook_set"])
+	}
+	cfgBody, _ := body["config"].(map[string]any)
+	discord, _ := cfgBody["discord"].(map[string]any)
+	if discord["webhook_url"] != "" {
+		t.Fatalf("webhook_url leaked: %v", discord["webhook_url"])
+	}
+}
+
+func TestPollNow(t *testing.T) {
+	s, _, ctrl := testServer(t)
+
+	code, body := do(t, s, http.MethodPost, "/poll", nil)
+	if code != http.StatusOK || body["queued"] != true {
+		t.Fatalf("poll = %d %v", code, body)
+	}
+	if ctrl.polled != 1 {
+		t.Fatalf("controller.Poll() calls = %d, want 1", ctrl.polled)
+	}
+
+	ctrl.pollOK = false
+	if code, _ := do(t, s, http.MethodPost, "/poll", nil); code != http.StatusConflict {
+		t.Fatalf("poll when already queued = %d, want 409", code)
 	}
 }

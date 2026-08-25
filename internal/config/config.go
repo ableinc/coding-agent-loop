@@ -174,6 +174,10 @@ type VerifyConfig struct {
 type ServerConfig struct {
 	// Addr should stay on loopback: this API can pause and cancel work.
 	Addr string `json:"addr"`
+	// UI mounts the browser console at /ui (and redirects / to it). It shares
+	// the same loopback-only, no-authentication posture as the rest of the
+	// control API.
+	UI bool `json:"ui"`
 }
 
 type StoreConfig struct {
@@ -243,7 +247,7 @@ func Default() Config {
 			UsageCachePath:     "~/.agent-loop/usage-cache.json",
 		},
 		Verify:  VerifyConfig{AutoDetect: true, Commands: map[string]string{}},
-		Server:  ServerConfig{Addr: "127.0.0.1:8787"},
+		Server:  ServerConfig{Addr: "127.0.0.1:8787", UI: true},
 		Store:   StoreConfig{Path: "~/.agent-loop/state.db"},
 		Discord: DiscordConfig{Enabled: false},
 		Git: GitConfig{
