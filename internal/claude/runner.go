@@ -139,6 +139,8 @@ type Options struct {
 	PermissionMode string
 	// WorkDir is the process cwd, i.e. the worktree.
 	WorkDir string
+	// Env is appended to the subprocess's inherited environment.
+	Env []string
 	// ExtraArgs are appended verbatim.
 	ExtraArgs []string
 	// LogPath receives the raw JSONL transcript. Required.
@@ -224,6 +226,9 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Result, error) {
 
 	cmd := exec.CommandContext(ctx, opts.Binary, args...)
 	cmd.Dir = opts.WorkDir
+	if len(opts.Env) > 0 {
+		cmd.Env = append(os.Environ(), opts.Env...)
+	}
 	cmd.Stdin = strings.NewReader(opts.Prompt)
 	// Claude Code spawns children (the bash tool, language servers); kill the
 	// whole group on cancellation or a timed-out run leaves the worker stuck.

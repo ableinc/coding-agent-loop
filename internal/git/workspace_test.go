@@ -158,6 +158,9 @@ func TestWorktreeLifecycle(t *testing.T) {
 	if err != nil || !committed {
 		t.Fatalf("CommitAll: committed=%v err=%v", committed, err)
 	}
+	if got := git(t, wt, "log", "-1", "--format=%an <%ae>"); strings.TrimSpace(got) != "agent <agent@example.com>" {
+		t.Fatalf("commit author = %q, want the configured identity", got)
+	}
 	// Committed work still counts as work, via the commit-ahead check.
 	if work, err := m.HasWork(ctx, wt, "main"); err != nil || !work {
 		t.Fatalf("committed work should still register: work=%v err=%v", work, err)
@@ -188,6 +191,67 @@ func TestWorktreeLifecycle(t *testing.T) {
 	// Removing again must be safe.
 	if err := m.RemoveWorktree(ctx, repoPath, wt); err != nil {
 		t.Fatalf("RemoveWorktree when absent: %v", err)
+	}
+}
+
+// This is the case the issue actually cares about: Claude, or any other
+// subprocess, commits directly with a bare `git commit` (no -c flags, unlike
+// CommitAll). EnsureRepo must have already written the harness identity into
+// the shared clone's own config, so that commit picks it up instead of
+// falling through to the host's global gitconfig — which is what caused
+// agent commits to be attributed to the human repo owner.
+func TestEnsureRepoAppliesIdentityOverridingGlobalConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	origin := originRepo(t)
+	root := t.TempDir()
+
+	globalConfig := filepath.Join(root, "global-gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[user]\n\tname = Human Author\n\temail = human@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	m := &Manager{
+		ReposRoot:   filepath.Join(root, "repos"),
+		WorkRoot:    filepath.Join(root, "work"),
+		AuthorName:  "agent",
+		AuthorEmail: "agent@example.com",
+	}
+
+	repoPath, err := m.EnsureRepo(ctx, "acme/widgets", origin)
+	if err != nil {
+		if strings.Contains(err.Error(), "unknown option") || strings.Contains(err.Error(), "unknown environment variable") {
+			t.Skip("git too old to support GIT_CONFIG_GLOBAL")
+		}
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+
+	wt := m.WorktreePath("acme/widgets", 7)
+	if err := m.AddWorktree(ctx, repoPath, wt, "agent/issue-7", "main"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("implemented\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate Claude: a bare commit, no -c user.name/user.email.
+	cmd := exec.Command("git", "add", "-A")
+	cmd.Dir = wt
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "commit", "-m", "add feature")
+	cmd.Dir = wt
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	got := git(t, wt, "log", "-1", "--format=%an <%ae>")
+	if strings.TrimSpace(got) != "agent <agent@example.com>" {
+		t.Fatalf("bare commit author = %q, want the harness identity, not the host's global gitconfig", got)
 	}
 }
 

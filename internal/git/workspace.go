@@ -145,6 +145,9 @@ func (m *Manager) EnsureRepo(ctx context.Context, repo, cloneURL string) (string
 	if _, err := m.run(ctx, path, "fetch", "--prune", "--quiet", "origin"); err != nil {
 		return "", fmt.Errorf("fetch %s: %w", repo, err)
 	}
+	if err := m.applyIdentity(ctx, path); err != nil {
+		return "", err
+	}
 	return path, nil
 }
 
@@ -265,14 +268,43 @@ func (m *Manager) author() string {
 	if m.AuthorName != "" {
 		return m.AuthorName
 	}
-	return "coding-agent-loop"
+	return "coding-agent-loop[bot]"
 }
 
 func (m *Manager) email() string {
 	if m.AuthorEmail != "" {
 		return m.AuthorEmail
 	}
-	return "coding-agent-loop@localhost"
+	return "coding-agent-loop@users.noreply.github.com"
+}
+
+// IdentityEnv returns the GIT_AUTHOR_*/GIT_COMMITTER_* environment variables
+// for the harness's configured identity, so a subprocess that commits on its
+// own (e.g. Claude, via `git commit` with no -c flags) picks up the same
+// identity as CommitAll, regardless of what its own git config resolves to.
+func (m *Manager) IdentityEnv() []string {
+	author, email := m.author(), m.email()
+	return []string{
+		"GIT_AUTHOR_NAME=" + author,
+		"GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + author,
+		"GIT_COMMITTER_EMAIL=" + email,
+	}
+}
+
+// applyIdentity sets user.name/user.email in repoPath's own git config, so
+// every worktree that shares this repo's $GIT_COMMON_DIR/config — including
+// ones a subprocess like Claude commits in directly, with no -c flags —
+// resolves to the harness's identity rather than the host's global gitconfig.
+// Idempotent; safe to call on every EnsureRepo pass.
+func (m *Manager) applyIdentity(ctx context.Context, repoPath string) error {
+	if _, err := m.run(ctx, repoPath, "config", "user.name", m.author()); err != nil {
+		return fmt.Errorf("set commit identity: %w", err)
+	}
+	if _, err := m.run(ctx, repoPath, "config", "user.email", m.email()); err != nil {
+		return fmt.Errorf("set commit identity: %w", err)
+	}
+	return nil
 }
 
 // DiffStat summarises the branch against origin/base, for the PR body.

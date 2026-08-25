@@ -47,6 +47,7 @@ type Config struct {
 	Server    ServerConfig    `json:"server"`
 	Store     StoreConfig     `json:"store"`
 	Discord   DiscordConfig   `json:"discord"`
+	Git       GitConfig       `json:"git"`
 
 	// ModelsPath points at models.json, resolved by the caller (cmd/agent.go),
 	// not expanded here: "models.json" (the default) is looked up next to the
@@ -180,6 +181,14 @@ type DiscordConfig struct {
 	WebhookURL string `json:"webhook_url"`
 }
 
+// GitConfig identifies the author of commits the loop produces, so they are
+// visibly distinct from the human repo owner's own commits. Empty means "use
+// the built-in default" — see git.Manager's author()/email().
+type GitConfig struct {
+	AuthorName  string `json:"author_name"`
+	AuthorEmail string `json:"author_email"`
+}
+
 // Default returns a Config with every field populated to a sane value.
 func Default() Config {
 	return Config{
@@ -231,6 +240,10 @@ func Default() Config {
 		Server:  ServerConfig{Addr: "127.0.0.1:8787"},
 		Store:   StoreConfig{Path: "~/.agent-loop/state.db"},
 		Discord: DiscordConfig{Enabled: false},
+		Git: GitConfig{
+			AuthorName:  "coding-agent-loop[bot]",
+			AuthorEmail: "coding-agent-loop@users.noreply.github.com",
+		},
 	}
 }
 
@@ -326,6 +339,12 @@ func (c *Config) Validate() error {
 	if c.Discord.Enabled && c.Discord.WebhookURL == "" {
 		return fmt.Errorf("discord.webhook_url must be set when discord.enabled is true")
 	}
+	if containsCommitHeaderBreakingChars(c.Git.AuthorName) {
+		return fmt.Errorf("git.author_name must not contain '<', '>', or a newline")
+	}
+	if containsCommitHeaderBreakingChars(c.Git.AuthorEmail) {
+		return fmt.Errorf("git.author_email must not contain '<', '>', or a newline")
+	}
 	if c.GitHub.PRComments.Enabled {
 		pc := c.GitHub.PRComments
 		if !strings.HasPrefix(pc.Mention, "@") {
@@ -342,6 +361,12 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// containsCommitHeaderBreakingChars reports whether s has a character that
+// would corrupt the "Name <email>" line git writes into a commit header.
+func containsCommitHeaderBreakingChars(s string) bool {
+	return strings.ContainsAny(s, "<>\n")
 }
 
 // validReactions are the only content values GitHub's reactions API accepts.

@@ -685,6 +685,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		Fallbacks:      fallbacks,
 		PermissionMode: permissionMode,
 		WorkDir:        worktree,
+		Env:            o.opts.Git.IdentityEnv(),
 		ExtraArgs:      cfg.Claude.ExtraArgs,
 		LogPath:        logPath,
 		Timeout:        cfg.Run.Timeout.D(),

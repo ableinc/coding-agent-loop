@@ -175,6 +175,25 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 	}
 }
 
+// Env must reach the child process, since this is how the harness's commit
+// identity is delivered to Claude when it commits on its own.
+func TestEnvReachesTheChildProcess(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$GIT_AUTHOR_NAME"
+`)
+	res, err := (&Runner{}).Run(context.Background(), Options{
+		Binary:  bin,
+		LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+		Env:     []string{"GIT_AUTHOR_NAME=coding-agent-loop[bot]"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Result != "coding-agent-loop[bot]" {
+		t.Fatalf("Env did not reach the child process, got result %q", res.Result)
+	}
+}
+
 func TestLogPathRequired(t *testing.T) {
 	if _, err := (&Runner{}).Run(context.Background(), Options{Binary: "true"}); err == nil {
 		t.Fatal("LogPath must be required so every run leaves a transcript")

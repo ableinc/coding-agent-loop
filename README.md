@@ -226,7 +226,11 @@ flight at a time), controlled by `run.max_concurrent_repos`.
    in the PR body so a human sees it immediately.
 7. **Deliver** — the remote is re-checked, then pushed; a draft PR is opened with `Closes #<n>`,
    verification result, model used, and cost; the issue is commented with the PR link;
-   `agent-working` and `agent-planned` are swapped for `agent-done` or `agent-failed`.
+   `agent-working` and `agent-planned` are swapped for `agent-done` or `agent-failed`. Every commit on
+   the branch — whether made by the harness or by Claude itself during step 5 — carries the
+   `git.author_name`/`git.author_email` identity, not your own; the PR itself is still opened under
+   the `gh` token's account, since that is a GitHub-level attribution the identity config does not
+   touch.
 8. **Cleanup** — the worktree is removed (kept on disk if `workspace.keep_failed` and the run
    failed, for post-mortem). The claim is always released, on every exit path.
 
@@ -346,6 +350,10 @@ This repository's own `config.json` is also **compiled into the binary** at buil
     "enabled": false,
     "webhook_url": ""
   },
+  "git": {
+    "author_name": "coding-agent-loop[bot]",
+    "author_email": "coding-agent-loop@users.noreply.github.com"
+  },
   "models_path": "models.json"
 }
 ```
@@ -387,6 +395,8 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `store.path`                                           | SQLite database path                                                                                                               |
 | `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |
 | `discord.webhook_url`                                  | the channel's incoming webhook URL; **required** if `discord.enabled` is true                                                      |
+| `git.author_name`                                      | commit author name for work the loop produces; distinct from your own so agent commits are easy to spot; empty falls back to `coding-agent-loop[bot]` |
+| `git.author_email`                                     | commit author email to go with `git.author_name`; empty falls back to `coding-agent-loop@users.noreply.github.com`                |
 | `models_path`                                          | where to look for `models.json`; see [Embedded defaults](#embedded-defaults) for how the default value is resolved                 |
 
 ### models.json

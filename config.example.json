@@ -62,5 +62,9 @@
     "enabled": false,
     "webhook_url": ""
   },
+  "git": {
+    "author_name": "coding-agent-loop[bot]",
+    "author_email": "coding-agent-loop@users.noreply.github.com"
+  },
   "models_path": "models.json"
 }
