@@ -3,6 +3,7 @@ package verify
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +12,26 @@ import (
 	"github.com/ableinc/coding-agent-loop/internal/config"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 )
+
+// toolsOnlyPath builds a directory containing only symlinks to the named
+// tools (resolved via the real PATH) and returns it as a PATH value. Unlike a
+// hard-coded "/usr/bin:/bin", this can't accidentally pick up a toolchain
+// (e.g. a system Go package) that happens to live in one of those
+// directories on a given host.
+func toolsOnlyPath(t *testing.T, tools ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, tool := range tools {
+		src, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("%s not available on this host: %v", tool, err)
+		}
+		if err := os.Symlink(src, filepath.Join(dir, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
 
 func repoWith(t *testing.T, files map[string]string) string {
 	t.Helper()
@@ -150,9 +171,13 @@ func TestMissingToolchainIsNotATestFailure(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "Makefile"), "test:\n\t@go test ./...\n")
 	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/x\n")
 
-	// A PATH with a shell and make, but deliberately no Go.
+	// A PATH with a shell and make, but deliberately no Go. Built from
+	// symlinks rather than hard-coded system directories: some CI images
+	// install a system Go under /usr/bin, which would let "go test ./..."
+	// actually run and turn this into a false failure instead of the
+	// "unavailable" this test exists to check.
 	r := &Runner{
-		Cfg:     config.VerifyConfig{AutoDetect: true, Env: map[string]string{"PATH": "/usr/bin:/bin"}},
+		Cfg:     config.VerifyConfig{AutoDetect: true, Env: map[string]string{"PATH": toolsOnlyPath(t, "sh", "make")}},
 		Timeout: 30 * time.Second,
 	}
 	res := r.Run(context.Background(), "acme/widgets", dir)
