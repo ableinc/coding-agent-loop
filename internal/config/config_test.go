@@ -175,6 +175,47 @@ func TestRetryBackoffMaxMustNotBeBelowTheBase(t *testing.T) {
 	}
 }
 
+// Agent-authored commits should carry their own identity by default, distinct
+// from whatever the host's global gitconfig would otherwise resolve to.
+func TestGitIdentityDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Git.AuthorName != "coding-agent-loop[bot]" {
+		t.Fatalf("unexpected default git author name %q", cfg.Git.AuthorName)
+	}
+	if cfg.Git.AuthorEmail != "coding-agent-loop@users.noreply.github.com" {
+		t.Fatalf("unexpected default git author email %q", cfg.Git.AuthorEmail)
+	}
+}
+
+func TestGitIdentityOverlaysFromConfig(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"git":{"author_name":"Acme Bot","author_email":"bot@acme.example"}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Git.AuthorName != "Acme Bot" {
+		t.Fatalf("author_name = %q", cfg.Git.AuthorName)
+	}
+	if cfg.Git.AuthorEmail != "bot@acme.example" {
+		t.Fatalf("author_email = %q", cfg.Git.AuthorEmail)
+	}
+}
+
+// A name/email containing '<', '>', or a newline would corrupt the commit
+// header line git builds ("Name <email>").
+func TestGitIdentityWithAngleBracketIsRejected(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"git":{"author_name":"evil>name"}}`), false)
+	if err == nil || !strings.Contains(err.Error(), "author_name") {
+		t.Fatalf("want a git.author_name validation error, got %v", err)
+	}
+}
+
+func TestGitIdentityEmailWithAngleBracketIsRejected(t *testing.T) {
+	_, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"git":{"author_email":"<bad@example.com"}}`), false)
+	if err == nil || !strings.Contains(err.Error(), "author_email") {
+		t.Fatalf("want a git.author_email validation error, got %v", err)
+	}
+}
+
 func TestPRCommentsDefaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]}}`), false)
 	if err != nil {

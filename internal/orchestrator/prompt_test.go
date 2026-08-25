@@ -52,6 +52,17 @@ func TestPlanTaskPromptIncludesThePreviousPlanOnReplan(t *testing.T) {
 	}
 }
 
+// The harness sets the commit identity for the worktree before Claude runs;
+// this stops a helpful model from "fixing" an unfamiliar author.
+func TestSystemPromptForbidsChangingGitIdentity(t *testing.T) {
+	p := systemPrompt("acme/widgets", "agent/issue-9", "/work/widgets/issue-9")
+	for _, want := range []string{"user.name", "user.email", "--author", "already set the commit identity"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("system prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
 func TestPlanSystemPromptForbidsEditing(t *testing.T) {
 	p := planSystemPrompt("acme/widgets", "/work/widgets/issue-9")
 	for _, want := range []string{"Do NOT edit", "Do NOT", "plan"} {

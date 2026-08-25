@@ -652,7 +652,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	if phase == phasePlan {
 		removeLabels = append(removeLabels, cfg.GitHub.PlanLabel)
 	}
-	o.setLabels(ctx, log, cand, runID, []string{cfg.GitHub.WorkingLabel}, removeLabels)
+	o.setLabels(ctx, log, ref, []string{cfg.GitHub.WorkingLabel}, removeLabels)
 	o.event(ctx, runID, "model", fmt.Sprintf("%s (fallbacks: %s)", head.ID, orNone(fallbacks)))
 	log.Info("starting claude", "phase", phase, "model", head.ID, "branch", branch, "attempt", attempt)
 
@@ -685,6 +685,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		Fallbacks:      fallbacks,
 		PermissionMode: permissionMode,
 		WorkDir:        worktree,
+		Env:            o.opts.Git.IdentityEnv(),
 		ExtraArgs:      cfg.Claude.ExtraArgs,
 		LogPath:        logPath,
 		Timeout:        cfg.Run.Timeout.D(),
@@ -778,7 +779,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, result.Result); err != nil {
 			log.Warn("could not save plan", "error", err)
 		}
-		o.setLabels(ctx, log, cand, runID,
+		o.setLabels(ctx, log, ref,
 			[]string{cfg.GitHub.PlanLabel}, []string{cfg.GitHub.WorkingLabel})
 		if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPlanned); err != nil {
 			log.Warn("status update failed", "error", err)
@@ -854,7 +855,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, issueComment(prURL, runID, vres)); err != nil {
 		log.Warn("could not comment on issue", "error", err)
 	}
-	o.setLabels(ctx, log, cand, runID,
+	o.setLabels(ctx, log, ref,
 		[]string{cfg.GitHub.DoneLabel},
 		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
 
@@ -912,7 +913,7 @@ func (o *Orchestrator) adoptPR(ctx context.Context, log *slog.Logger, cand candi
 		}
 	}
 
-	o.setLabels(ctx, log, cand, runID,
+	o.setLabels(ctx, log, cand.ref(runID, attempt),
 		[]string{cfg.GitHub.DoneLabel},
 		[]string{cfg.GitHub.WorkingLabel, cfg.GitHub.Label, cfg.GitHub.FailedLabel, cfg.GitHub.PlanLabel})
 
@@ -967,6 +968,7 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 	// context.WithoutCancel: the run's context may already be cancelled, but
 	// the bookkeeping still has to be written.
 	ctx = context.WithoutCancel(ctx)
+	ref := cand.ref(runID, attempt)
 
 	var skip errSkip
 	if errors.As(cause, &skip) {
@@ -974,9 +976,9 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 		if err := o.opts.Store.FailRun(ctx, runID, store.StatusAbandoned, "skipped: "+skip.reason); err != nil {
 			log.Error("could not record skip", "error", err)
 		}
-		o.opts.Discord.RunAbandoned(cand.ref(runID, attempt), "skipped: "+skip.reason,
+		o.opts.Discord.RunAbandoned(ref, "skipped: "+skip.reason,
 			o.scheduleRetry(ctx, log, cand, runID))
-		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
+		o.setLabels(ctx, log, ref, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
@@ -992,8 +994,8 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 			log.Error("could not record cancellation", "error", err)
 		}
 		o.event(ctx, runID, "canceled", cause.Error())
-		o.opts.Discord.RunCanceled(cand.ref(runID, attempt), cause.Error())
-		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
+		o.opts.Discord.RunCanceled(ref, cause.Error())
+		o.setLabels(ctx, log, ref, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
@@ -1009,8 +1011,8 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 			log.Error("could not record deferral", "error", err)
 		}
 		o.event(ctx, runID, "deferred", cause.Error())
-		o.opts.Discord.RunDeferred(cand.ref(runID, attempt), cause.Error())
-		o.setLabels(ctx, log, cand, runID, nil, []string{cfg.GitHub.WorkingLabel})
+		o.opts.Discord.RunDeferred(ref, cause.Error())
+		o.setLabels(ctx, log, ref, nil, []string{cfg.GitHub.WorkingLabel})
 		o.finishCleanup(ctx, log, cand)
 		return
 	}
@@ -1029,12 +1031,12 @@ func (o *Orchestrator) handleFailure(ctx context.Context, log *slog.Logger, cand
 	o.event(ctx, runID, "failed", cause.Error())
 
 	nextAttempt := o.scheduleRetry(ctx, log, cand, runID)
-	o.opts.Discord.RunFailed(cand.ref(runID, attempt), cause.Error(), nextAttempt)
+	o.opts.Discord.RunFailed(ref, cause.Error(), nextAttempt)
 
 	// The trigger label always stays put: it, and only it, decides whether the
 	// issue is worked. agent-failed mirrors the outcome until the next attempt
 	// clears it.
-	o.setLabels(ctx, log, cand, runID,
+	o.setLabels(ctx, log, ref,
 		[]string{cfg.GitHub.FailedLabel}, []string{cfg.GitHub.WorkingLabel})
 	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number,
 		failureComment(runID, attempt, cause.Error(), nextAttempt, cfg.GitHub.Label)); err != nil {
@@ -1085,15 +1087,15 @@ func (o *Orchestrator) recordSession(ctx context.Context, log *slog.Logger, cand
 // run, but it is also never silently dropped: a failure that goes unrecorded
 // leaves an issue whose labels disagree with the store, which is precisely
 // what a human reading the issue would be misled by.
-func (o *Orchestrator) setLabels(ctx context.Context, log *slog.Logger, cand candidate, runID string, add, remove []string) {
+func (o *Orchestrator) setLabels(ctx context.Context, log *slog.Logger, ref discord.RunRef, add, remove []string) {
 	ctx = context.WithoutCancel(ctx)
-	if err := o.opts.GH.EditLabels(ctx, cand.repo, cand.number, add, remove); err != nil {
+	if err := o.opts.GH.EditLabels(ctx, ref.Repo, ref.Issue, add, remove); err != nil {
 		log.Warn("could not update labels", "add", add, "remove", remove, "error", err)
-		o.event(ctx, runID, "labels_failed", fmt.Sprintf("add %v remove %v: %v", add, remove, err))
-		o.opts.Discord.LabelUpdateFailed(cand.repo, cand.number, runID, add, remove, err)
+		o.event(ctx, ref.RunID, "labels_failed", fmt.Sprintf("add %v remove %v: %v", add, remove, err))
+		o.opts.Discord.LabelUpdateFailed(ref, add, remove, err)
 		return
 	}
-	o.event(ctx, runID, "labels", fmt.Sprintf("add %v remove %v", add, remove))
+	o.event(ctx, ref.RunID, "labels", fmt.Sprintf("add %v remove %v", add, remove))
 }
 
 func (o *Orchestrator) finishCleanup(ctx context.Context, log *slog.Logger, cand candidate) {

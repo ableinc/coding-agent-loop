@@ -192,13 +192,112 @@ func TestRunFailedStatesTheNextAttempt(t *testing.T) {
 	}
 }
 
+// Every run-scoped notification must carry a clickable link to the issue —
+// a linked title plus an "Issue" field — so a future method that forgets it
+// fails this test.
+func TestEveryRunScopedNotificationLinksTheIssue(t *testing.T) {
+	const wantIssueURL = "https://github.com/acme/widgets/issues/42"
+
+	res := &claude.Result{SessionID: "sess-abc", NumTurns: 1, TotalCostUSD: 0.1}
+	vres := verify.Result{Status: store.VerifyPassed}
+
+	cases := map[string]func(n *Notifier){
+		"RunClaimed":     func(n *Notifier) { n.RunClaimed(testRef(), 0) },
+		"ClaudeFinished": func(n *Notifier) { n.ClaudeFinished(testRef(), res, time.Second) },
+		"VerifyResult":   func(n *Notifier) { n.VerifyResult(testRef(), vres) },
+		"PROpened": func(n *Notifier) {
+			n.PROpened(testRef(), "https://github.com/acme/widgets/pull/7", res, vres, "+1 -1", time.Second)
+		},
+		"PlanPosted":   func(n *Notifier) { n.PlanPosted(testRef(), res, time.Second) },
+		"RunFailed":    func(n *Notifier) { n.RunFailed(testRef(), "boom", time.Time{}) },
+		"RunAbandoned": func(n *Notifier) { n.RunAbandoned(testRef(), "issue closed", time.Time{}) },
+		"RunDeferred":  func(n *Notifier) { n.RunDeferred(testRef(), "usage limit") },
+		"LabelUpdateFailed": func(n *Notifier) {
+			n.LabelUpdateFailed(testRef(), []string{"a"}, []string{"b"}, errors.New("HTTP 404"))
+		},
+	}
+
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			url, bodies := stubWebhook(t)
+			n := New(true, url, nil)
+
+			call(n)
+			n.Close(2 * time.Second)
+
+			e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+			if e.URL == "" {
+				t.Errorf("%s: expected a non-empty embed URL", name)
+			}
+			issue, ok := field(e, "Issue")
+			if !ok || !strings.Contains(issue, wantIssueURL) {
+				t.Errorf("%s: expected an Issue field linking %s, got %+v", name, wantIssueURL, e.Fields)
+			}
+		})
+	}
+}
+
+// A RunRef with no explicit URL still links the issue, derived from repo and
+// issue number, because the store does not carry an issue-URL column.
+func TestRunRefDerivesTheIssueURLWhenNotSet(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	ref := testRef()
+	ref.URL = ""
+	n.RunClaimed(ref, 0)
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	if e.URL != "https://github.com/acme/widgets/issues/42" {
+		t.Errorf("expected a derived issue URL, got %q", e.URL)
+	}
+}
+
+// PROpened's title links the PR, not the issue, but the issue is still
+// reachable from the Issue field.
+func TestPROpenedLinksThePRAndTheIssue(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	prURL := "https://github.com/acme/widgets/pull/7"
+	n.PROpened(testRef(), prURL, &claude.Result{TotalCostUSD: 0.1}, verify.Result{Status: store.VerifyPassed}, "+1 -1", time.Second)
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	if e.URL != prURL {
+		t.Errorf("expected the embed url to be the PR, got %q", e.URL)
+	}
+	if issue, ok := field(e, "Issue"); !ok || !strings.Contains(issue, "issues/42") {
+		t.Errorf("expected an Issue field linking the issue, got %+v", e.Fields)
+	}
+}
+
+// RunFailed must not lose the issue link just because Description is
+// overwritten with the cause.
+func TestRunFailedDescriptionKeepsTheIssueLink(t *testing.T) {
+	url, bodies := stubWebhook(t)
+	n := New(true, url, nil)
+
+	n.RunFailed(testRef(), "claude run failed", time.Time{})
+	n.Close(2 * time.Second)
+
+	e := decodeEmbed(t, waitForCount(t, bodies, 1)[0])
+	if !strings.Contains(e.Description, "claude run failed") {
+		t.Errorf("expected the cause in the description, got %q", e.Description)
+	}
+	if !strings.Contains(e.Description, "issues/42") {
+		t.Errorf("expected the issue link in the description, got %q", e.Description)
+	}
+}
+
 // A label edit that failed leaves GitHub disagreeing with the store, which is
 // invisible unless it is reported.
 func TestLabelUpdateFailedNamesTheLabels(t *testing.T) {
 	url, bodies := stubWebhook(t)
 	n := New(true, url, nil)
 
-	n.LabelUpdateFailed("acme/widgets", 42, "run-1",
+	n.LabelUpdateFailed(testRef(),
 		[]string{"agent-failed"}, []string{"agent-working"}, errors.New("HTTP 404"))
 	n.Close(2 * time.Second)
 
