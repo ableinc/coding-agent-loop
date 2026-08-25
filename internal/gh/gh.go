@@ -22,7 +22,9 @@ import (
 type Client struct {
 	// Bin is the gh executable name or path.
 	Bin string
-	// DryRun suppresses every mutating call.
+	// DryRun suppresses every mutating call. Both --dry-run and --no-mutate
+	// set it; they differ in whether any work is done at all, not in whether
+	// GitHub is written to.
 	DryRun bool
 	// Log receives a line for each suppressed mutation. May be nil.
 	Log func(format string, args ...any)
@@ -440,7 +442,7 @@ func (c *Client) EditLabels(ctx context.Context, repo string, number int, add, r
 		return nil
 	}
 	if c.DryRun {
-		c.logf("dry-run: would edit labels on %s#%d (add: %s, remove: %s)",
+		c.logf("not mutating: would edit labels on %s#%d (add: %s, remove: %s)",
 			repo, number, labelList(add), labelList(remove))
 		return nil
 	}
@@ -569,7 +571,7 @@ func labelList(labels []string) string {
 func (c *Client) Comment(ctx context.Context, repo string, number int, body string) error {
 	args := []string{"issue", "comment", strconv.Itoa(number), "--repo", repo, "--body-file", "-"}
 	if c.DryRun {
-		c.logf("dry-run: would comment on %s#%d:\n%s", repo, number, body)
+		c.logf("not mutating: would comment on %s#%d:\n%s", repo, number, body)
 		return nil
 	}
 	_, err := c.run(ctx, body, args...)
@@ -588,7 +590,7 @@ func (c *Client) LinkPRToIssue(ctx context.Context, repo string, pr PullRequest,
 	}
 	body := fmt.Sprintf("Closes #%d\n\n%s", issue, strings.TrimSpace(pr.Body))
 	if c.DryRun {
-		c.logf("dry-run: would link %s#%d to issue #%d with body:\n%s", repo, pr.Number, issue, body)
+		c.logf("not mutating: would link %s#%d to issue #%d with body:\n%s", repo, pr.Number, issue, body)
 		return true, nil
 	}
 	_, err := c.run(ctx, body,
@@ -634,7 +636,7 @@ func (c *Client) CreatePR(ctx context.Context, opts PROptions) (string, error) {
 		args = append(args, "--draft")
 	}
 	if c.DryRun {
-		c.logf("dry-run: would run gh %s\nwith body:\n%s", strings.Join(args, " "), opts.Body)
+		c.logf("not mutating: would run gh %s\nwith body:\n%s", strings.Join(args, " "), opts.Body)
 		return "https://example.invalid/dry-run/pr", nil
 	}
 	out, err := c.run(ctx, opts.Body, args...)

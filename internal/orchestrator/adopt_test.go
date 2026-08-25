@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ableinc/coding-agent-loop/internal/claude"
 	"github.com/ableinc/coding-agent-loop/internal/config"
@@ -347,5 +348,151 @@ func TestADeliveredIssueLosesItsTriggerLabel(t *testing.T) {
 	}
 	if len(runs) != 0 {
 		t.Fatalf("a delivered issue should never be claimed, got %d run(s)", len(runs))
+	}
+}
+
+// Stopping the daemon mid-run used to be recorded as the issue's failure: a
+// public "the coding agent could not complete this issue" comment, a doubled
+// back-off, and a sidelined model — every time an operator pressed Ctrl+C.
+func TestShutdownMidRunIsNotTheIssuesFailure(t *testing.T) {
+	ctx := context.Background()
+	callLog := filepath.Join(t.TempDir(), "calls.txt")
+	st := openTestStore(t)
+	o := testOrchestrator(t, stubGH(t, callLog, nil), st)
+
+	cand := candidate{repo: "acme/widgets", number: 5, title: "Change your commit name"}
+	const runID = "run-1"
+	if err := st.CreateRun(ctx, store.Run{
+		ID: runID, Repo: cand.repo, Issue: cand.number, Attempt: 1,
+		Status: store.StatusWorking, StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly what execute returns when the run's context is cancelled.
+	o.handleFailure(ctx, o.log, cand, runID, 1,
+		errCanceled{fmt.Errorf("claude run failed: %w", claude.ErrCanceled)})
+
+	run, err := st.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != store.StatusCanceled {
+		t.Errorf("status = %q, want %q", run.Status, store.StatusCanceled)
+	}
+
+	hist, err := st.IssueHistory(ctx, cand.repo, cand.number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Failures != 0 {
+		t.Errorf("a shutdown must not count as a failure, got %d", hist.Failures)
+	}
+	if hist.Attempts != 0 {
+		t.Errorf("a shutdown must not consume an attempt, got %d", hist.Attempts)
+	}
+	if !o.nextAttemptAt(hist).IsZero() {
+		t.Error("a shutdown must not back the issue off")
+	}
+
+	calls := ghCalls(t, callLog)
+	if strings.Contains(calls, "issue comment") {
+		t.Fatalf("a shutdown must not leave a failure comment on the issue:\n%s", calls)
+	}
+	if strings.Contains(calls, "agent-failed") {
+		t.Fatalf("a shutdown must not label the issue as failed:\n%s", calls)
+	}
+}
+
+// The contrast: a genuine failure still reports itself fully.
+func TestARealFailureStillReportsItself(t *testing.T) {
+	ctx := context.Background()
+	callLog := filepath.Join(t.TempDir(), "calls.txt")
+	st := openTestStore(t)
+	o := testOrchestrator(t, stubGH(t, callLog, nil), st)
+
+	cand := candidate{repo: "acme/widgets", number: 5, title: "Change your commit name"}
+	const runID = "run-1"
+	if err := st.CreateRun(ctx, store.Run{
+		ID: runID, Repo: cand.repo, Issue: cand.number, Attempt: 1,
+		Status: store.StatusWorking, StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	o.handleFailure(ctx, o.log, cand, runID, 1, fmt.Errorf("claude run failed: something broke"))
+
+	hist, err := st.IssueHistory(ctx, cand.repo, cand.number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hist.Failures != 1 {
+		t.Errorf("a real failure should count, got %d", hist.Failures)
+	}
+	calls := ghCalls(t, callLog)
+	if !strings.Contains(calls, "issue comment") {
+		t.Fatalf("a real failure should be reported on the issue:\n%s", calls)
+	}
+}
+
+// A dry run that quietly spends subscription usage and rewrites a worktree is
+// not a dry run. This pins the property that makes the flag worth having.
+func TestDryRunSpendsNothingAndTouchesNothing(t *testing.T) {
+	ctx := context.Background()
+	callLog := filepath.Join(t.TempDir(), "calls.txt")
+
+	ghBin := stubGH(t, callLog, map[string]string{
+		"search issues": `[{"number":5,"title":"Change your commit name","url":"u",
+		  "repository":{"name":"widgets","nameWithOwner":"acme/widgets"},
+		  "labels":[{"name":"agent-ready"}],"isPullRequest":false,"state":"open"}]`,
+		"issue view": `{"number":5,"title":"Change your commit name","body":"please","url":"u",
+		  "state":"OPEN","labels":[{"name":"agent-ready"}],
+		  "comments":[
+		    {"author":{"login":"agent-bot"},"body":"<!-- coding-agent-loop:plan -->\n\n## Plan\n\ndo it\n\n---\n\nfooter"},
+		    {"author":{"login":"alice"},"body":"implement"}
+		  ]}`,
+		"pr list": `[]`,
+	})
+
+	st := openTestStore(t)
+	o := testOrchestrator(t, ghBin, st)
+	o.opts.Rehearse = true
+	// If anything reached for git or Claude, these paths would have to exist.
+	o.opts.Config.Workspace.ReposRoot = "/nonexistent/repos"
+	o.opts.Config.Workspace.Root = "/nonexistent/work"
+
+	if err := o.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing was claimed, no run was recorded, no plan was written back.
+	runs, err := st.ListRuns(ctx, "acme/widgets", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Errorf("a dry run must not record a run, got %d", len(runs))
+	}
+	if claims, err := st.ActiveClaims(ctx); err != nil {
+		t.Fatal(err)
+	} else if len(claims) != 0 {
+		t.Errorf("a dry run must not claim the issue, got %d claim(s)", len(claims))
+	}
+	if plan, err := st.LatestPlan(ctx, "acme/widgets", 5); err != nil {
+		t.Fatal(err)
+	} else if plan != "" {
+		t.Error("a dry run must not write to the store")
+	}
+
+	// Only read-only gh calls were made.
+	calls := ghCalls(t, callLog)
+	for _, forbidden := range []string{"issue comment", "issue edit", "pr create", "pr edit", "label create"} {
+		if strings.Contains(calls, forbidden) {
+			t.Errorf("a dry run must not mutate anything, saw %q:\n%s", forbidden, calls)
+		}
+	}
+	// And it still did the useful part: reporting the decision.
+	if !strings.Contains(calls, "issue view") || !strings.Contains(calls, "pr list") {
+		t.Errorf("a dry run should still evaluate the issue:\n%s", calls)
 	}
 }

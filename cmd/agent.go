@@ -34,6 +34,7 @@ type flags struct {
 	configPath string
 	once       bool
 	dryRun     bool
+	noMutate   bool
 	logLevel   string
 	noServer   bool
 	checkOnly  bool
@@ -52,7 +53,8 @@ review. It never merges anything.
 Usage:
   coding-agent-loop [flags]              start the daemon in the foreground
   coding-agent-loop --once               run one discovery pass, then exit
-  coding-agent-loop --once --dry-run     rehearse a pass without pushing/PRs/labels
+  coding-agent-loop --once --dry-run     report what one pass would do, free: no Claude run, no cost
+  coding-agent-loop --once --no-mutate   really run Claude (costs usage), but push/PR/label nothing
   coding-agent-loop --check              verify prerequisites (git, claude, gh, config) and exit
   coding-agent-loop --print-service      print the embedded systemd unit
   sudo coding-agent-loop --install       install, enable, and start the systemd unit
@@ -71,7 +73,8 @@ func main() {
 	}
 	flag.StringVar(&f.configPath, "config", "", "path to the configuration file (default: config.json next to the binary, falling back to the config.json embedded at build time)")
 	flag.BoolVar(&f.once, "once", false, "run a single discovery pass, then exit")
-	flag.BoolVar(&f.dryRun, "dry-run", false, "do everything except push branches, open PRs, or edit issues")
+	flag.BoolVar(&f.dryRun, "dry-run", false, "report what each issue would get and do none of it: no Claude run, no clone, no mutation, no cost")
+	flag.BoolVar(&f.noMutate, "no-mutate", false, "run Claude for real (this costs usage) but push nothing, open no PR, and edit no issue")
 	flag.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	flag.BoolVar(&f.noServer, "no-server", false, "do not start the control API")
 	flag.BoolVar(&f.checkOnly, "check", false, "run start-up checks and exit")
@@ -144,7 +147,8 @@ func run(f flags) error {
 		return err
 	}
 
-	ghClient := gh.New(cfg.GitHub.Binary, f.dryRun)
+	suppressMutations := f.dryRun || f.noMutate
+	ghClient := gh.New(cfg.GitHub.Binary, suppressMutations)
 	ghClient.Log = func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) }
 
 	if err := bootCheck(cfg, registry, ghClient, log); err != nil {
@@ -172,7 +176,7 @@ func run(f flags) error {
 		ReposRoot: cfg.Workspace.ReposRoot,
 		WorkRoot:  cfg.Workspace.Root,
 		GHBinary:  ghBinary,
-		DryRun:    f.dryRun,
+		DryRun:    suppressMutations,
 		Log:       func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) },
 	}
 	runner := &claude.Runner{Log: func(format string, args ...any) { log.Debug(fmt.Sprintf(format, args...)) }}
@@ -184,7 +188,7 @@ func run(f flags) error {
 	orch := orchestrator.New(orchestrator.Options{
 		Config: cfg, Store: st, Registry: registry,
 		GH: ghClient, Git: gitMgr, Runner: runner, Gate: gateway, Verify: verifier,
-		Logger: log, DryRun: f.dryRun, Discord: notifier,
+		Logger: log, DryRun: suppressMutations, Rehearse: f.dryRun, Discord: notifier,
 	})
 
 	// SIGINT/SIGTERM cancels the root context; the loop then drains in-flight
@@ -192,8 +196,13 @@ func run(f flags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if f.dryRun {
-		log.Warn("dry-run: no branch will be pushed, no PR opened, no issue edited")
+	switch {
+	case f.dryRun:
+		log.Warn("dry-run: reporting what each issue would get; " +
+			"Claude will not run, nothing will be cloned, and nothing will be mutated")
+	case f.noMutate:
+		log.Warn("no-mutate: Claude WILL run and this WILL use subscription usage; " +
+			"no branch will be pushed, no PR opened, no issue edited")
 	}
 
 	if f.once {
@@ -213,7 +222,7 @@ func run(f flags) error {
 		MaxConcurrentRepos: cfg.Run.MaxConcurrentRepos,
 		RetryBackoff:       cfg.Run.RetryBackoff.D(),
 		RetryBackoffMax:    cfg.Run.RetryBackoffMax.D(),
-		DryRun:             f.dryRun,
+		DryRun:             suppressMutations,
 	})
 
 	errCh := make(chan error, 2)

@@ -13,7 +13,7 @@ MODELS  ?= models.json
 EMBED_CONFIG := config.json
 EMBED_MODELS := models.json
 
-.PHONY: all help build build-check build-summary config check run once dry-run \
+.PHONY: all help build build-check build-summary config check run once dry-run no-mutate \
         install uninstall print-service \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
 
@@ -68,9 +68,13 @@ run: build
 once: build
 	$(BINARY) --config $(CONFIG) --once
 
-## dry-run: full pipeline, but never push, open a PR, or edit an issue
+## dry-run: report what one pass would do; runs no Claude and costs nothing
 dry-run: build
 	$(BINARY) --config $(CONFIG) --once --dry-run --log-level debug
+
+## no-mutate: full pipeline including a real (billed) Claude run, but never push, open a PR, or edit an issue
+no-mutate: build
+	$(BINARY) --config $(CONFIG) --once --no-mutate --log-level debug
 
 ## install: install + enable + start the systemd unit (requires root)
 install: build

@@ -541,3 +541,35 @@ func TestStatusPlannedIsTerminalButNotSuccessOrFailure(t *testing.T) {
 		t.Fatalf("a planned run must not count as a failure, got %d", hist.Failures)
 	}
 }
+
+// A run stopped from outside is nobody's fault. Counting it would back the
+// issue off for hours because someone restarted the daemon.
+func TestCancelledRunsAreNeitherAttemptsNorFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	for i, status := range []string{StatusCanceled, StatusFailed, StatusDeferred} {
+		id := fmt.Sprintf("run-%d", i)
+		if err := st.CreateRun(ctx, Run{
+			ID: id, Repo: "o/r", Issue: 7, Attempt: i + 1,
+			Status: StatusClaimed, StartedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.FailRun(ctx, id, status, "because"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hist, err := st.IssueHistory(ctx, "o/r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the genuinely failed run counts, on both axes.
+	if hist.Failures != 1 {
+		t.Errorf("Failures = %d, want 1 (only the failed run)", hist.Failures)
+	}
+	if hist.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1 (cancelled and deferred runs are not attempts)", hist.Attempts)
+	}
+}

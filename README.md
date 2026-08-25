@@ -96,7 +96,7 @@ make check
 ```sh
 cp config.example.json config.json   # then edit github.owners
 make build
-make dry-run                         # one pass; never pushes, never opens a PR
+make dry-run                         # one pass, free: reports what it would do, runs nothing
 make run                             # start the daemon
 make install                         # install as a system daemon
 sudo systemctl status coding-agent-loop.service # check status of process
@@ -126,13 +126,24 @@ All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `mak
 | ----------------- | ------------- | ------------------------------------------------------------------------ |
 | `--config`        | *(none)*      | path to the configuration file; if omitted, looks for `config.json` next to the binary, then falls back to the config embedded at build time — see [Embedded defaults](#embedded-defaults) |
 | `--once`          | off           | run a single discovery pass, then exit (no server)                       |
-| `--dry-run`       | off           | do everything except push branches, open PRs, or edit issues             |
+| `--dry-run`       | off           | report what each issue would get and do none of it — **no Claude run, no clone, no mutation, no cost** |
+| `--no-mutate`     | off           | really run Claude (**this uses subscription usage**) but push nothing, open no PR, and edit no issue |
 | `--log-level`     | `info`        | `debug`, `info`, `warn`, or `error`                                      |
 | `--no-server`     | off           | do not start the control API                                             |
 | `--check`         | off           | run start-up checks (binaries, auth, config) and exit                    |
 | `--install`       | off           | install + enable + start the systemd unit; **must run as root**          |
 | `--uninstall`     | off           | stop, disable, and remove everything `--install` created; **must run as root** |
 | `--print-service` | off           | print the embedded systemd unit to stdout and exit; no privileges needed |
+
+`--dry-run` and `--no-mutate` answer different questions and cost very different
+amounts. `--dry-run` is a rehearsal of the *decisions*: it fetches each issue,
+works out the phase, looks for a pull request that already covers it, picks the
+model, and prints that — in seconds, without claiming the issue, writing to the
+database, cloning anything, or spending a token. Use it to check that the loop
+would do what you expect. `--no-mutate` is a rehearsal of the *work*: Claude
+really runs, in a real worktree, and really costs usage; only the push, the PR,
+and the issue edits are suppressed. Use it to check what Claude actually
+produces.
 
 ## How work is selected
 
@@ -350,8 +361,8 @@ hardcoded in Go — this file is the only place to update one.
     {
       "id": "claude-haiku-4-5",
       "alias": "haiku",
-      "roles": ["triage"],
-      "priority": 1
+      "roles": ["triage", "implement"],
+      "priority": 3
     }
   ]
 }
@@ -363,6 +374,9 @@ hardcoded in Go — this file is the only place to update one.
 - `roles` — `plan` (writes the plan comment) and `implement` (does the work) each have their own
   ladder, selected independently per phase; a registry needs at least one model serving each or the
   loop refuses to start. `triage` is reserved for a future pre-pass and currently unused.
+  **Give every role at least two rungs.** A single-model ladder passes no `--fallback-model`, so a
+  momentarily overloaded model fails the run outright instead of falling through to the next one,
+  and the 30-minute cooldown has nowhere to send the retry.
 - `priority` — lower runs first within a role. The head of the priority-ordered list for a role
   becomes `--model`; the rest become `--fallback-model a,b,...`.
 - A model that fails or hits a limit is put on a 30-minute cooldown, so the next attempt starts

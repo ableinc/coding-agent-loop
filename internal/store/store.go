@@ -614,10 +614,14 @@ func (s *Store) InFlightRuns(ctx context.Context) ([]Run, error) {
 // whether to pick it up again, and how long to wait first.
 type IssueState struct {
 	// Attempts counts runs that actually got a chance at the issue. Runs the
-	// usage gate stopped are excluded: being rate-limited is not an attempt.
+	// usage gate stopped are excluded, and so are runs stopped from outside:
+	// neither being rate-limited nor being cancelled is an attempt.
 	Attempts int
-	// Failures counts runs that ended without delivering a PR. It is the
-	// exponent of the retry back-off.
+	// Failures counts runs that ended without delivering a PR through some
+	// fault of the issue or the agent working it. It is the exponent of the
+	// retry back-off, so runs stopped from outside — cancelled by an operator
+	// or by the daemon shutting down — are deliberately excluded: punishing an
+	// issue for a restart would back it off for hours over nothing.
 	Failures  int
 	Succeeded bool
 	Abandoned bool
@@ -633,15 +637,15 @@ func (s *Store) IssueHistory(ctx context.Context, repo string, issue int) (Issue
 	var st IssueState
 	var succeeded, abandoned, lastFailure int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(CASE WHEN status <> ? THEN 1 ELSE 0 END), 0),
+		`SELECT COALESCE(SUM(CASE WHEN status NOT IN (?, ?) THEN 1 ELSE 0 END), 0),
 		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
 		        COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0),
-		        COALESCE(SUM(CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END), 0),
-		        COALESCE(MAX(CASE WHEN status IN (?, ?, ?) THEN ended_at ELSE 0 END), 0)
+		        COALESCE(SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END), 0),
+		        COALESCE(MAX(CASE WHEN status IN (?, ?) THEN ended_at ELSE 0 END), 0)
 		 FROM runs WHERE repo = ? AND issue = ?`,
-		StatusDeferred, StatusPROpen, StatusAbandoned,
-		StatusFailed, StatusAbandoned, StatusCanceled,
-		StatusFailed, StatusAbandoned, StatusCanceled,
+		StatusDeferred, StatusCanceled, StatusPROpen, StatusAbandoned,
+		StatusFailed, StatusAbandoned,
+		StatusFailed, StatusAbandoned,
 		repo, issue).
 		Scan(&st.Attempts, &succeeded, &abandoned, &st.Failures, &lastFailure)
 	if err != nil {
