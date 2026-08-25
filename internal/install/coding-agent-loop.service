@@ -11,6 +11,20 @@ ExecStart=/opt/coding-agent-loop/bin/coding-agent-loop --config /opt/coding-agen
 Restart=on-failure
 RestartSec=30s
 
+# systemd's default PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,
+# which contains no language toolchain. A repository that tests itself fine from
+# a login shell then fails verification with "go: No such file or directory",
+# and the daemon has no way to know that is an environment problem rather than a
+# broken change. The usual install locations are added here; anything else
+# belongs in config.json under verify.env.
+Environment=PATH=/usr/local/go/bin:{{HOME}}/go/bin:{{HOME}}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Go writes its build and module caches under $HOME, which ProtectHome makes
+# read-only below. Point them somewhere the unit can actually write, or `go
+# test` fails on a permission error even once go itself is on PATH.
+Environment=GOCACHE={{HOME}}/.agent-loop/cache/go-build
+Environment=GOMODCACHE={{HOME}}/.agent-loop/cache/go-mod
+
 # SIGTERM makes the loop stop claiming and drain whatever is in flight, so give
 # it longer than one run timeout before killing it.
 KillSignal=SIGTERM

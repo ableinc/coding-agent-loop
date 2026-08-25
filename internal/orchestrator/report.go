@@ -52,6 +52,15 @@ func prBody(r prReport) string {
 			b.WriteString(out)
 			b.WriteString("\n```\n\n</details>\n\n")
 		}
+	case store.VerifyUnavailable:
+		fmt.Fprintf(&b, "**The tests could not be run** (`%s`) — this says nothing about the change "+
+			"below, only that the daemon's environment is missing something the command needs. "+
+			"Run it yourself before judging this PR.\n\n", r.Verify.Command)
+		if out := strings.TrimSpace(r.Verify.Output); out != "" {
+			b.WriteString("<details><summary>Output (tail)</summary>\n\n```\n")
+			b.WriteString(out)
+			b.WriteString("\n```\n\n</details>\n\n")
+		}
 	default:
 		b.WriteString("No test command was configured or detected for this repository, so nothing was run.\n\n")
 	}
@@ -85,6 +94,9 @@ func issueComment(prURL, runID string, v verify.Result) string {
 		fmt.Fprintf(&b, "Tests passed (`%s`).\n", v.Command)
 	case store.VerifyFailed:
 		fmt.Fprintf(&b, "Tests failed (`%s`) — see the PR for output.\n", v.Command)
+	case store.VerifyUnavailable:
+		fmt.Fprintf(&b, "The tests could not be run (`%s`) — the daemon's environment is missing "+
+			"something the command needs, so the change is unverified rather than broken.\n", v.Command)
 	default:
 		b.WriteString("No test command was detected for this repository.\n")
 	}
@@ -165,6 +177,8 @@ func prCommentComment(handled []gh.PRComment, summary, runID string, v verify.Re
 			fmt.Fprintf(&b, "Tests passed (`%s`).\n", v.Command)
 		case store.VerifyFailed:
 			fmt.Fprintf(&b, "Tests failed (`%s`).\n", v.Command)
+		case store.VerifyUnavailable:
+			fmt.Fprintf(&b, "Tests could not be run (`%s`) — missing toolchain, not a broken change.\n", v.Command)
 		default:
 			b.WriteString("No test command was detected for this repository.\n")
 		}

@@ -13,7 +13,7 @@ MODELS  ?= models.json
 EMBED_CONFIG := config.json
 EMBED_MODELS := models.json
 
-.PHONY: all help build build-check build-summary config check run once dry-run no-mutate \
+.PHONY: all help build build-check build-summary config embed-ready check run once dry-run no-mutate \
         install uninstall print-service \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
 
@@ -49,12 +49,24 @@ build-summary:
 		cat "$(EMBED_MODELS)"; \
 	fi
 
-build: build-check build-summary
+build: embed-ready build-check build-summary
 	go build -ldflags="-w -s" -o $(BINARY) ./cmd
 
 ## config: create config.json from config.example.json if it doesn't exist yet
 config:
 	@test -f $(CONFIG) && echo "$(CONFIG) already exists" || cp config.example.json $(CONFIG)
+
+# embed-ready: make sure the files go:embed compiles in actually exist.
+#
+# config.json is gitignored, so a fresh clone or a git worktree — which is
+# exactly what the agent builds every run in — has no config.json for
+# embedded.go to embed, and the whole module fails to compile with
+# "pattern config.json: no matching files found". Every target below that
+# compiles anything depends on this, so testing a clean checkout works.
+.PHONY: embed-ready
+embed-ready:
+	@test -f $(EMBED_CONFIG) || cp config.example.json $(EMBED_CONFIG)
+	@test -f $(EMBED_MODELS) || { echo "missing $(EMBED_MODELS), which has no example to copy from"; exit 1; }
 
 ## check: run start-up checks (binaries, auth, config) and exit
 check: build
@@ -99,15 +111,15 @@ print-service: build
 	$(BINARY) --print-service
 
 ## test: run the full test suite with the race detector
-test:
+test: embed-ready
 	go test -race $(PKG)
 
 ## coverage: run tests and print per-function coverage
-coverage:
+coverage: embed-ready
 	go test -race -coverprofile=coverage.out $(PKG)
 	go tool cover -func=coverage.out
 
-vet:
+vet: embed-ready
 	go vet $(PKG)
 
 fmt:
@@ -124,11 +136,11 @@ fmt-check:
 lint: vet fmt-check
 
 ## staticcheck: run staticcheck (must be installed: go install honnef.co/go/tools/cmd/staticcheck@latest)
-staticcheck:
+staticcheck: embed-ready
 	staticcheck $(PKG)
 
 ## vulcheck: run govulncheck (must be installed: go install golang.org/x/vuln/cmd/govulncheck@latest)
-vulcheck:
+vulcheck: embed-ready
 	govulncheck $(PKG)
 
 ## ci: everything CI should run — lint, then the full test suite

@@ -25,6 +25,7 @@ gh search issues --label agent-ready          gh search prs --author <bot>
 - [Quick start](#quick-start)
 - [CLI flags](#cli-flags)
 - [How work is selected](#how-work-is-selected)
+- [Verification](#verification)
 - [Lifecycle of one issue](#lifecycle-of-one-issue)
 - [Responding to PR comments](#responding-to-pr-comments)
 - [Configuration reference](#configuration-reference)
@@ -193,6 +194,37 @@ a `labels_failed` run event, and reported to Discord.
 Discovery is parallel across repositories; within one repository, work is serial (one issue in
 flight at a time), controlled by `run.max_concurrent_repos`.
 
+## Verification
+
+The test command is the repository's own, never a built-in assumption about it. `verify.commands`
+takes an explicit per-repo command; otherwise `verify.auto_detect` reads the worktree: a `Makefile`
+with a `test:` target wins (it is the repo's own opinion about how it is tested), then `go.mod`,
+then a `package.json` with a `test` script, then `Cargo.toml`, then `pyproject.toml`/`pytest.ini`/
+`tox.ini`. Nothing recognisable means nothing is run.
+
+Three outcomes are distinguished, because they mean different things to a reviewer:
+
+| Outcome       | Meaning                                                                            |
+| ------------- | ---------------------------------------------------------------------------------- |
+| `passed`      | the command ran and exited zero                                                     |
+| `failed`      | the command ran and exited non-zero — the change is suspect                         |
+| `unavailable` | the command could not be run at all — **the environment is wrong, not the change**  |
+| `skipped`     | no command was configured or detected                                               |
+
+`unavailable` exists because the two failure modes are easy to confuse and expensive to confuse.
+A daemon started by systemd inherits `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+— which contains no language toolchain — so a repository that tests itself perfectly well from a
+login shell fails with `make: go: No such file or directory`. Reporting that as "tests failed"
+blames the agent's code for the operator's `PATH`. The installed systemd unit sets a `PATH` covering
+the usual install locations, and `GOCACHE`/`GOMODCACHE` under `~/.agent-loop/cache` (the unit makes
+`$HOME` read-only, and Go's caches default to `$HOME`). Anything beyond that goes in `verify.env`.
+
+**Your repository must build from a clean checkout.** The agent works in a fresh `git worktree`, so
+anything gitignored is absent there. This repository learned that the hard way: `embedded.go` has
+`//go:embed config.json` while `config.json` is gitignored, so a clean checkout failed to compile
+with `pattern config.json: no matching files found` — every compiling `make` target now depends on
+`embed-ready`, which creates it from `config.example.json`.
+
 ## Lifecycle of one issue
 
 1. **Discover** — `gh search issues --label <label> --state open` scoped to `github.owners`, minus
@@ -223,7 +255,8 @@ flight at a time), controlled by `run.max_concurrent_repos`.
    queryable later via `GET /sessions`.
 6. **Verify** — the repository's own test command runs (auto-detected, or from `verify.commands`).
    A failing suite does **not** block the PR — it's a draft either way, and the failure is reported
-   in the PR body so a human sees it immediately.
+   in the PR body so a human sees it immediately. A command that could not be run at all is
+   reported separately from one that ran and failed (see [Verification](#verification)).
 7. **Deliver** — the remote is re-checked, then pushed; a draft PR is opened with `Closes #<n>`,
    verification result, model used, and cost; the issue is commented with the PR link;
    `agent-working` and `agent-planned` are swapped for `agent-done` or `agent-failed`.
@@ -334,7 +367,8 @@ This repository's own `config.json` is also **compiled into the binary** at buil
   },
   "verify": {
     "auto_detect": true,
-    "commands": {}
+    "commands": {},
+    "env": { "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" }
   },
   "server": {
     "addr": "127.0.0.1:8787"
@@ -383,6 +417,7 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `claude.credentials_path`                              | where the CLI's OAuth token lives, read for the advisory usage snapshot                                                            |
 | `verify.auto_detect`                                   | try `Makefile` → `go.mod` → `package.json` → `Cargo.toml` → `pyproject.toml`, in that order                                        |
 | `verify.commands`                                      | per-repo override, keyed `"owner/name": "shell command"`                                                                           |
+| `verify.env`                                           | extra environment for the test command — mainly `PATH`, so the daemon can find language toolchains (see [Verification](#verification)) |
 | `server.addr`                                          | control API bind address; keep loopback-only                                                                                       |
 | `store.path`                                           | SQLite database path                                                                                                               |
 | `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |

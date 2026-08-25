@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,7 +108,7 @@ func (r *Runner) Run(ctx context.Context, repo, worktree string) Result {
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)
 	cmd.Dir = worktree
-	cmd.Env = append(os.Environ(), "CI=true")
+	cmd.Env = r.env()
 	// Test suites fork freely (servers, containers, watchers); without this a
 	// timed-out suite leaves survivors holding the output pipe open.
 	proc.Isolate(cmd)
@@ -123,9 +124,72 @@ func (r *Runner) Run(ctx context.Context, repo, worktree string) Result {
 	case ctx.Err() != nil:
 		return Result{Status: store.VerifyFailed, Command: cmdline, Output: out, Err: ctx.Err()}
 	case err != nil:
+		// "The tests failed" and "the tests could not be run" are different
+		// facts, and only one of them is about the code under review.
+		if tool, missing := missingTool(cmd, out); missing {
+			return Result{
+				Status:  store.VerifyUnavailable,
+				Command: cmdline,
+				Output:  out,
+				Err:     fmt.Errorf("%q is not available to the daemon (PATH=%s): %w", tool, r.pathOf(), err),
+			}
+		}
 		return Result{Status: store.VerifyFailed, Command: cmdline, Output: out, Err: err}
 	}
 	return Result{Status: store.VerifyPassed, Command: cmdline, Output: out}
+}
+
+// notFound matches the way a shell, make, and the usual build tools all say
+// that something is not on PATH. Exit status 127 is the POSIX convention for
+// it, but the wrapper (make, npm, cargo) often swallows that and exits 1 or 2
+// with the message instead, so both are checked.
+var notFound = regexp.MustCompile(`(?i)([\w./+-]+): (?:command not found|No such file or directory|not found)`)
+
+// missingTool reports whether a command failed because something it needs is
+// not installed or not on the daemon's PATH, and names it when it can.
+func missingTool(cmd *exec.Cmd, output string) (string, bool) {
+	m := notFound.FindStringSubmatch(output)
+	name := ""
+	if len(m) > 1 {
+		name = filepath.Base(strings.TrimSpace(m[1]))
+	}
+	if name != "" {
+		return name, true
+	}
+	// No recognisable message, but 127 says it plainly enough on its own.
+	if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 127 {
+		return "a required command", true
+	}
+	return "", false
+}
+
+// env is the environment the test command runs in: the daemon's own, plus
+// CI=true, plus whatever the operator declared in verify.env.
+//
+// This matters more than it looks. A daemon started by systemd inherits a
+// minimal PATH that excludes every language toolchain installed outside
+// /usr/bin — Go under /usr/local/go/bin, anything under ~/go/bin or a version
+// manager — so a repository that tests itself perfectly well from a login
+// shell cannot be verified at all without saying where its tools live.
+func (r *Runner) env() []string {
+	env := append(os.Environ(), "CI=true")
+	for k, v := range r.Cfg.Env {
+		if k = strings.TrimSpace(k); k != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
+// pathOf reports the PATH the command was given, for error messages.
+func (r *Runner) pathOf() string {
+	path := os.Getenv("PATH")
+	for k, v := range r.Cfg.Env {
+		if strings.EqualFold(strings.TrimSpace(k), "PATH") {
+			path = v
+		}
+	}
+	return path
 }
 
 func tail(s string, n int) string {

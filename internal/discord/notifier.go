@@ -237,12 +237,16 @@ func (n *Notifier) VerifyResult(r RunRef, v verify.Result) {
 		what, color = "Verify failed", colorOrange
 	case store.VerifySkipped:
 		what, color = "Verify skipped", colorGray
+	case store.VerifyUnavailable:
+		// Yellow, not orange: this needs the operator's attention, but it is
+		// the daemon's environment that is wrong, not the agent's change.
+		what, color = "Verify could not run", colorYellow
 	}
 	fields := append(r.fields(), embedField{Name: "Status", Value: v.Status, Inline: true})
 	if v.Command != "" {
 		fields = append(fields, embedField{Name: "Command", Value: truncate(v.Command, 1000), Inline: false})
 	}
-	if v.Status == store.VerifyFailed {
+	if v.Status == store.VerifyFailed || v.Status == store.VerifyUnavailable {
 		if out := strings.TrimSpace(v.Output); out != "" {
 			fields = append(fields, embedField{Name: "Output (tail)", Value: codeBlock(tail(out, 900)), Inline: false})
 		}
