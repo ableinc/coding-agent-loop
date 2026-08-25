@@ -474,21 +474,24 @@ To enable it:
    }
    ```
 
-Once enabled, every one of these posts an embed. Run notifications lead with the issue's own title,
-linked, and carry the run ID and attempt number:
+Once enabled, every one of these posts an embed. Every run notification's title links straight to
+the GitHub issue, and carries an `Issue` field with the same link, the run ID, and attempt number —
+one click reaches the issue from any message, even ones (like a failure or a cancellation) that
+would otherwise show only its plain-text `owner/name#42`:
 
 - **Run claimed** — plus how many earlier attempts on that issue failed, when it is a retry.
 - **Claude finished** — model, session ID, turns, cost, tokens in/out, wall-clock duration.
 - **Verification** — passed, failed, or skipped, with the command and, on failure, the tail of the
   test output, so the channel says what broke without opening the PR.
-- **Draft PR opened** — link, model, session ID, cost, verification status, total run duration,
-  diffstat.
+- **Draft PR opened** — title links the PR (with the issue link kept in the `Issue` field), model,
+  session ID, cost, verification status, total run duration, diffstat.
 - **Run failed** — the cause and **when the next attempt is due** (retries are unbounded, so "when"
   is the useful number).
 - **Run abandoned** — a run that was skipped rather than attempted: the issue closed, lost its
   label, or is already covered by a PR.
 - **Run deferred** — a run the usage gate stopped. Neither an attempt nor a failure.
-- **Run cancelled** — `POST /runs/{id}/cancel`.
+- **Run cancelled** — `POST /runs/{id}/cancel`, linking the issue when the run's repo/issue could
+  be looked up.
 - **Label update failed** — the labels on GitHub now disagree with the store, and which edit was
   refused. Otherwise invisible.
 - **Model cooled down** — which model, until when, and why, so a run served from lower on the ladder

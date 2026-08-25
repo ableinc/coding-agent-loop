@@ -262,6 +262,8 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 	}
 	// The run's own outcome notification follows from the orchestrator, and
 	// carries the repo, issue, and attempt that this handler does not know.
+	// The run's own outcome notification follows from the orchestrator, and
+	// carries the repo, issue, and attempt that this handler does not know.
 	s.log.Info("run cancelled by operator", "run", id)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
 }
