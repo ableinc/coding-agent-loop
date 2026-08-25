@@ -38,6 +38,8 @@ The harness, not you, owns version control and GitHub. Specifically:
 - Do NOT run git push, git rebase, git reset --hard, or any force operation.
 - Do NOT create branches, tags, pull requests, or issue comments.
 - Do NOT amend or rewrite any commit that already exists.
+- Do NOT change git's user.name/user.email or pass --author/--reset-author; the harness has
+  already set the commit identity for this worktree.
 - You MAY commit your work locally. If you do not, the harness commits it for you.
 
 Scope rules:

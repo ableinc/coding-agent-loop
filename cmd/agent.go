@@ -173,11 +173,13 @@ func run(f flags) error {
 		ghBinary = abs
 	}
 	gitMgr := &gitpkg.Manager{
-		ReposRoot: cfg.Workspace.ReposRoot,
-		WorkRoot:  cfg.Workspace.Root,
-		GHBinary:  ghBinary,
-		DryRun:    suppressMutations,
-		Log:       func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) },
+		ReposRoot:   cfg.Workspace.ReposRoot,
+		WorkRoot:    cfg.Workspace.Root,
+		AuthorName:  cfg.Git.AuthorName,
+		AuthorEmail: cfg.Git.AuthorEmail,
+		GHBinary:    ghBinary,
+		DryRun:      suppressMutations,
+		Log:         func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) },
 	}
 	runner := &claude.Runner{Log: func(format string, args ...any) { log.Debug(fmt.Sprintf(format, args...)) }}
 	gateway := gate.New(st, cfg.Claude, func(format string, args ...any) { log.Info(fmt.Sprintf(format, args...)) })
