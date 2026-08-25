@@ -187,3 +187,114 @@ func TestNilResultHelpersDoNotPanic(t *testing.T) {
 		t.Fatal("nil-receiver helpers should be safe")
 	}
 }
+
+// The failure that actually happens in the field: Claude Code reports what went
+// wrong in its result event and exits non-zero with an empty stderr. Reporting
+// only the exit status produced "exit status 1 (stderr: )" on every real
+// failure, which says nothing at all.
+func TestRunSurfacesTheCLIsOwnErrorOnNonZeroExit(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":4,"terminal_reason":"max_tokens","result":"Credit balance is too low to continue."}'
+exit 1
+`)
+	_, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+	})
+	if err == nil {
+		t.Fatal("a non-zero exit must fail the run")
+	}
+	for _, want := range []string{
+		"Credit balance is too low", // what claude actually said
+		"error_during_execution",    // its subtype
+		"max_tokens",                // its terminal reason
+		"4 turn(s)",                 // how far it got
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+// An API-level failure carries a status code that says whether it is worth
+// retrying at all.
+func TestRunSurfacesAPIErrorStatus(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+echo '{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"overloaded"}'
+`)
+	_, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "529") {
+		t.Fatalf("the API error status should be surfaced, got %v", err)
+	}
+}
+
+// When there is genuinely nothing to report, say so and point at the transcript
+// rather than printing an empty parenthetical.
+func TestRunSaysWhenThereIsNothingToReport(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+exit 1
+`)
+	_, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "transcript") {
+		t.Fatalf("an empty failure should point at the transcript, got %v", err)
+	}
+	if strings.Contains(err.Error(), "stderr: )") {
+		t.Fatalf("the uninformative empty-stderr form is back: %v", err)
+	}
+}
+
+// A timeout and an operator shutdown both cancel the context, but they are not
+// the same event and must not be reported as one.
+func TestRunDistinguishesTimeoutFromCancellation(t *testing.T) {
+	script := `cat > /dev/null
+sleep 5
+`
+	t.Run("timeout", func(t *testing.T) {
+		_, err := (&Runner{}).Run(context.Background(), Options{
+			Binary: stubCLI(t, script), LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+			Timeout: 200 * time.Millisecond,
+		})
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("want ErrTimeout, got %v", err)
+		}
+		if errors.Is(err, ErrCanceled) {
+			t.Fatal("a timeout must not look like a cancellation")
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			cancel()
+		}()
+		_, err := (&Runner{}).Run(ctx, Options{
+			Binary: stubCLI(t, script), LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+		})
+		if !errors.Is(err, ErrCanceled) {
+			t.Fatalf("want ErrCanceled, got %v", err)
+		}
+	})
+}
+
+// A run that finished before the daemon began shutting down delivered real
+// work; it must not be thrown away just because the context ended after it.
+func TestRunKeepsAResultThatLandedBeforeCancellation(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+echo '`+successResult+`'
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	res, err := (&Runner{}).Run(ctx, Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+	})
+	cancel()
+	if err != nil {
+		t.Fatalf("a completed run must succeed: %v", err)
+	}
+	if res == nil || res.Result == "" {
+		t.Fatal("the result should be returned")
+	}
+}

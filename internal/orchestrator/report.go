@@ -63,8 +63,8 @@ func prBody(r prReport) string {
 	}
 
 	b.WriteString("---\n\n")
-	fmt.Fprintf(&b, "Opened automatically by coding-agent-loop (run `%s`, attempt %d, model `%s`, cost $%.4f",
-		r.RunID, r.Attempt, r.ModelID, r.CostUSD)
+	fmt.Fprintf(&b, "%s (run `%s`, attempt %d, model `%s`, cost $%.4f",
+		gh.ProvenanceMarker, r.RunID, r.Attempt, r.ModelID, r.CostUSD)
 	if r.SessionID != "" {
 		fmt.Fprintf(&b, ", session `%s`", r.SessionID)
 	}
@@ -88,6 +88,26 @@ func issueComment(prURL, runID string, v verify.Result) string {
 	default:
 		b.WriteString("No test command was detected for this repository.\n")
 	}
+	// The marker in this comment is what stops the issue being worked again, so
+	// the way back out has to be written where a human will read it.
+	b.WriteString("\nComment `implement` again if you want another attempt at this issue.\n")
+	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
+	return b.String()
+}
+
+// adoptedComment is left on the issue when a pull request that already covers
+// it is found. It carries the same marker as issueComment, because it plays the
+// same role for decidePhase — but it says plainly that the PR was found rather
+// than opened by this run, so nobody reads it as a second delivery.
+func adoptedComment(prURL, runID, state string) string {
+	var b strings.Builder
+	b.WriteString(markerPR)
+	b.WriteString("\n\n")
+	fmt.Fprintf(&b, "This issue is already covered by an existing pull request, so no new work was done: %s\n\n", prURL)
+	if st := strings.TrimSpace(state); st != "" {
+		fmt.Fprintf(&b, "That pull request is %s. ", strings.ToLower(st))
+	}
+	b.WriteString("Comment `implement` again if you want another attempt at this issue.\n")
 	fmt.Fprintf(&b, "\n<sub>coding-agent-loop run `%s`</sub>\n", runID)
 	return b.String()
 }

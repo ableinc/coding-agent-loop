@@ -164,6 +164,14 @@ func (r *Runner) logf(format string, args ...any) {
 // which usually indicates it was killed.
 var ErrNoResult = errors.New("claude produced no result event")
 
+// ErrCanceled means the run was stopped from outside — the daemon is shutting
+// down, or an operator cancelled it. It is not the issue's fault and must not
+// be reported as one.
+var ErrCanceled = errors.New("claude run canceled")
+
+// ErrTimeout means the run exceeded run.timeout and was killed.
+var ErrTimeout = errors.New("claude run timed out")
+
 // Run invokes Claude and returns the terminal result.
 //
 // A non-nil Result is returned even alongside an error whenever the CLI got far
@@ -240,20 +248,65 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Result, error) {
 		result.ExitCode = cmd.ProcessState.ExitCode()
 	}
 
-	switch {
-	case ctx.Err() != nil:
-		return result, fmt.Errorf("claude run aborted: %w", ctx.Err())
-	case waitErr != nil:
-		return result, fmt.Errorf("claude exited with error: %w (stderr: %s)", waitErr, tail(stderr.String(), 800))
-	case scanErr != nil:
-		return result, scanErr
-	case result == nil:
-		return nil, fmt.Errorf("%w (stderr: %s)", ErrNoResult, tail(stderr.String(), 800))
-	case result.IsError:
-		return result, fmt.Errorf("claude reported an error (subtype %q, terminal_reason %q): %s",
-			result.Subtype, result.TerminalReason, tail(result.Result, 800))
+	// A run that finished cleanly before the context ended is a success, even
+	// if the daemon has since begun shutting down: the work was done and paid
+	// for, and throwing it away would redo it.
+	if waitErr == nil && scanErr == nil && result != nil && !result.IsError {
+		return result, nil
 	}
-	return result, nil
+
+	// Whatever went wrong, say what the CLI itself reported. Claude Code writes
+	// its errors into the result event and exits non-zero with an empty stderr,
+	// so reporting only the exit status — as this used to — produced the
+	// uninformative "exit status 1 (stderr: )" on every real failure.
+	detail := diagnose(result, stderr.String())
+
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return result, fmt.Errorf("%w after %s%s", ErrTimeout, opts.Timeout, detail)
+	case errors.Is(ctx.Err(), context.Canceled):
+		return result, fmt.Errorf("%w%s", ErrCanceled, detail)
+	case waitErr != nil:
+		return result, fmt.Errorf("claude exited with error: %w%s", waitErr, detail)
+	case scanErr != nil:
+		return result, fmt.Errorf("%w%s", scanErr, detail)
+	case result == nil:
+		return nil, fmt.Errorf("%w%s", ErrNoResult, detail)
+	}
+	return result, fmt.Errorf("claude reported an error%s", detail)
+}
+
+// diagnose renders everything known about a failed run into one line, in
+// descending order of usefulness. It returns "" when there is genuinely nothing
+// to add, so callers can append it unconditionally.
+func diagnose(result *Result, stderr string) string {
+	var parts []string
+	if result != nil {
+		if result.Subtype != "" {
+			parts = append(parts, fmt.Sprintf("subtype %q", result.Subtype))
+		}
+		if result.TerminalReason != "" {
+			parts = append(parts, fmt.Sprintf("terminal_reason %q", result.TerminalReason))
+		}
+		if result.APIErrorStatus != nil {
+			parts = append(parts, fmt.Sprintf("api_error_status %d", *result.APIErrorStatus))
+		}
+		if result.NumTurns > 0 {
+			parts = append(parts, fmt.Sprintf("after %d turn(s)", result.NumTurns))
+		}
+		// The CLI's own message, which is where Claude Code actually explains
+		// itself: an invalid model, a bad API key, a tool permission refusal.
+		if msg := strings.TrimSpace(result.Result); msg != "" {
+			parts = append(parts, "claude said: "+tail(msg, 800))
+		}
+	}
+	if se := strings.TrimSpace(stderr); se != "" {
+		parts = append(parts, "stderr: "+tail(se, 800))
+	}
+	if len(parts) == 0 {
+		return " (claude reported nothing; see the run transcript)"
+	}
+	return " (" + strings.Join(parts, "; ") + ")"
 }
 
 // consume mirrors the stream to the transcript file while pulling out the

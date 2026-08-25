@@ -23,7 +23,9 @@ import (
 type Client struct {
 	// Bin is the gh executable name or path.
 	Bin string
-	// DryRun suppresses every mutating call.
+	// DryRun suppresses every mutating call. Both --dry-run and --no-mutate
+	// set it; they differ in whether any work is done at all, not in whether
+	// GitHub is written to.
 	DryRun bool
 	// Log receives a line for each suppressed mutation. May be nil.
 	Log func(format string, args ...any)
@@ -162,14 +164,20 @@ func (i Issue) HasLabel(name string) bool {
 // PullRequest is an open PR, used to avoid opening a second one for an issue,
 // and to view a PR the daemon is watching for review comments.
 type PullRequest struct {
-	Number      int    `json:"number"`
-	URL         string `json:"url"`
-	Body        string `json:"body"`
-	Title       string `json:"title"`
-	HeadRefName string `json:"headRefName"`
-	BaseRefName string `json:"baseRefName"`
-	State       string `json:"state"`
-	IsDraft     bool   `json:"isDraft"`
+	Number      int        `json:"number"`
+	URL         string     `json:"url"`
+	Body        string     `json:"body"`
+	Title       string     `json:"title"`
+	HeadRefName string     `json:"headRefName"`
+	BaseRefName string     `json:"baseRefName"`
+	State       string     `json:"state"`
+	IsDraft     bool       `json:"isDraft"`
+	MergedAt    *time.Time `json:"mergedAt"`
+}
+
+// Merged reports whether the PR was merged rather than merely closed.
+func (p PullRequest) Merged() bool {
+	return p.MergedAt != nil && !p.MergedAt.IsZero()
 }
 
 // Comment kinds a PRComment can come from. The kind decides which REST path
@@ -482,46 +490,126 @@ func parseGHTime(s string) time.Time {
 	return t
 }
 
-// ListOpenPRs returns the repo's open pull requests.
-func (c *Client) ListOpenPRs(ctx context.Context, repo string, limit int) ([]PullRequest, error) {
+// ListPRs returns the repo's pull requests in the given state ("open",
+// "closed", "merged", or "all").
+func (c *Client) ListPRs(ctx context.Context, repo, state string, limit int) ([]PullRequest, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	if state == "" {
+		state = "open"
+	}
 	var prs []PullRequest
 	err := c.runJSON(ctx, &prs,
-		"pr", "list", "--repo", repo, "--state", "open",
+		"pr", "list", "--repo", repo, "--state", state,
 		"--limit", strconv.Itoa(limit),
-		"--json", "number,url,body,title,headRefName,state")
+		"--json", "number,url,body,title,headRefName,state,isDraft,mergedAt")
 	if err != nil {
 		return nil, err
 	}
 	return prs, nil
 }
 
-// FindPRForIssue looks for an existing open PR that closes the issue or was
-// pushed to the branch we would use. Returns "" when there is none.
-func (c *Client) FindPRForIssue(ctx context.Context, repo string, issue int, branch string) (string, error) {
-	prs, err := c.ListOpenPRs(ctx, repo, 100)
+// FindPRForIssue looks for a pull request the harness has already opened for an
+// issue. It searches every state, not just open ones: a merged or closed PR is
+// still work that was delivered, and treating it as absent is what would make
+// the loop implement the same issue twice.
+//
+// branch is the branch this run would push to and branchPrefix is the
+// configured prefix; both are used because branchName derives its slug from the
+// issue title, so editing the title changes the exact branch name while the
+// "<prefix><number>" part stays put.
+//
+// The best match wins: open beats merged beats closed, so an adopting caller is
+// pointed at the PR a human would care about.
+func (c *Client) FindPRForIssue(ctx context.Context, repo string, issue int, branch, branchPrefix string) (PullRequest, bool, error) {
+	// Bounded, so a repository with a very long PR history could in principle
+	// hide an old agent PR past the end of the page. gh returns the newest
+	// first, and the harness's own PRs are recent by construction.
+	prs, err := c.ListPRs(ctx, repo, "all", 200)
 	if err != nil {
-		return "", err
+		return PullRequest{}, false, err
 	}
-	needles := []string{
-		fmt.Sprintf("closes #%d", issue),
-		fmt.Sprintf("fixes #%d", issue),
-		fmt.Sprintf("resolves #%d", issue),
-	}
+	var best PullRequest
+	found := false
 	for _, pr := range prs {
-		if branch != "" && strings.EqualFold(pr.HeadRefName, branch) {
-			return pr.URL, nil
+		if !prCoversIssue(pr, issue, branch, branchPrefix) {
+			continue
 		}
-		body := strings.ToLower(pr.Body)
-		for _, n := range needles {
-			if strings.Contains(body, n) {
-				return pr.URL, nil
-			}
+		if !found || prRank(pr) > prRank(best) {
+			best, found = pr, true
 		}
 	}
-	return "", nil
+	return best, found, nil
+}
+
+// prCoversIssue reports whether a PR is the harness's work on an issue.
+func prCoversIssue(pr PullRequest, issue int, branch, branchPrefix string) bool {
+	if branch != "" && strings.EqualFold(pr.HeadRefName, branch) {
+		return true
+	}
+	if branchPrefix != "" && matchesIssueBranch(pr.HeadRefName, branchPrefix, issue) {
+		return true
+	}
+	if PRLinksIssue(pr, issue) {
+		return true
+	}
+	// A PR the harness opened whose closing keyword a human edited away is
+	// still recognisable from its provenance footer plus the issue number the
+	// harness puts in every PR title.
+	//
+	// The title, not the body: an agent's summary can mention any number of
+	// issues in passing, and adopting on that would quietly close out an issue
+	// whose work was never done.
+	return strings.Contains(strings.ToLower(pr.Body), strings.ToLower(ProvenanceMarker)) &&
+		referencesIssue(pr.Title, issue)
+}
+
+// ProvenanceMarker is the phrase every harness-written PR body carries, so a PR
+// can be recognised as this harness's work even after a human has edited it.
+// The orchestrator's prBody writes it; nothing else should.
+const ProvenanceMarker = "Opened automatically by coding-agent-loop"
+
+// matchesIssueBranch reports whether head is the branch this harness would use
+// for an issue, ignoring the title slug. The boundary check matters: without it
+// "agent/issue-42-fix" would be read as covering issue 4.
+func matchesIssueBranch(head, prefix string, issue int) bool {
+	want := fmt.Sprintf("%s%d", prefix, issue)
+	if !strings.HasPrefix(strings.ToLower(head), strings.ToLower(want)) {
+		return false
+	}
+	rest := head[len(want):]
+	return rest == "" || strings.HasPrefix(rest, "-")
+}
+
+// referencesIssue reports whether s mentions "#<issue>" as a whole number, so
+// "#4" does not match text that only refers to "#42".
+func referencesIssue(s string, issue int) bool {
+	needle := fmt.Sprintf("#%d", issue)
+	for i := 0; ; {
+		j := strings.Index(s[i:], needle)
+		if j < 0 {
+			return false
+		}
+		end := i + j + len(needle)
+		if end == len(s) || s[end] < '0' || s[end] > '9' {
+			return true
+		}
+		i = end
+	}
+}
+
+// prRank orders matches by how much a human would care: open, then merged, then
+// closed-unmerged.
+func prRank(pr PullRequest) int {
+	switch {
+	case strings.EqualFold(pr.State, "OPEN"):
+		return 3
+	case pr.Merged() || strings.EqualFold(pr.State, "MERGED"):
+		return 2
+	default:
+		return 1
+	}
 }
 
 // --- mutating operations ----------------------------------------------------
@@ -541,7 +629,7 @@ func (c *Client) EditLabels(ctx context.Context, repo string, number int, add, r
 		return nil
 	}
 	if c.DryRun {
-		c.logf("dry-run: would edit labels on %s#%d (add: %s, remove: %s)",
+		c.logf("not mutating: would edit labels on %s#%d (add: %s, remove: %s)",
 			repo, number, labelList(add), labelList(remove))
 		return nil
 	}
@@ -670,7 +758,7 @@ func labelList(labels []string) string {
 func (c *Client) Comment(ctx context.Context, repo string, number int, body string) error {
 	args := []string{"issue", "comment", strconv.Itoa(number), "--repo", repo, "--body-file", "-"}
 	if c.DryRun {
-		c.logf("dry-run: would comment on %s#%d:\n%s", repo, number, body)
+		c.logf("not mutating: would comment on %s#%d:\n%s", repo, number, body)
 		return nil
 	}
 	_, err := c.run(ctx, body, args...)
@@ -701,6 +789,41 @@ func (c *Client) React(ctx context.Context, repo string, comment PRComment, cont
 	return err
 }
 
+// LinkPRToIssue makes a PR close its issue on merge, by prepending a "Closes
+// #<n>" line to its body. It is a no-op when the body already links the issue.
+//
+// The link matters beyond bookkeeping: without it merging the PR leaves the
+// issue open, and nothing downstream — including this harness's own PR
+// discovery — can tell that the work was delivered.
+func (c *Client) LinkPRToIssue(ctx context.Context, repo string, pr PullRequest, issue int) (bool, error) {
+	if PRLinksIssue(pr, issue) {
+		return false, nil
+	}
+	body := fmt.Sprintf("Closes #%d\n\n%s", issue, strings.TrimSpace(pr.Body))
+	if c.DryRun {
+		c.logf("not mutating: would link %s#%d to issue #%d with body:\n%s", repo, pr.Number, issue, body)
+		return true, nil
+	}
+	_, err := c.run(ctx, body,
+		"pr", "edit", strconv.Itoa(pr.Number), "--repo", repo, "--body-file", "-")
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// PRLinksIssue reports whether a PR body already carries a closing keyword for
+// the issue, which is what makes GitHub associate the two.
+func PRLinksIssue(pr PullRequest, issue int) bool {
+	body := strings.ToLower(pr.Body)
+	for _, verb := range []string{"closes", "fixes", "resolves"} {
+		if strings.Contains(body, fmt.Sprintf("%s #%d", verb, issue)) {
+			return true
+		}
+	}
+	return false
+}
+
 // PROptions describes the pull request to open.
 type PROptions struct {
 	Repo  string
@@ -724,7 +847,7 @@ func (c *Client) CreatePR(ctx context.Context, opts PROptions) (string, error) {
 		args = append(args, "--draft")
 	}
 	if c.DryRun {
-		c.logf("dry-run: would run gh %s\nwith body:\n%s", strings.Join(args, " "), opts.Body)
+		c.logf("not mutating: would run gh %s\nwith body:\n%s", strings.Join(args, " "), opts.Body)
 		return "https://example.invalid/dry-run/pr", nil
 	}
 	out, err := c.run(ctx, opts.Body, args...)

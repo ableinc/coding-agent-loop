@@ -278,9 +278,13 @@ func labelNames(labels []gh.Label) []string {
 	return out
 }
 
+// truncationSuffix marks a value that was cut short. extractPlan keys off it to
+// refuse to recover a plan that is missing its tail.
+const truncationSuffix = "...(truncated)"
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "\n\n...(truncated)"
+	return s[:n] + "\n\n" + truncationSuffix
 }
