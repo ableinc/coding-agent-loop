@@ -10,15 +10,22 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/static"
 
+	"github.com/ableinc/coding-agent-loop/internal/config"
 	"github.com/ableinc/coding-agent-loop/internal/discord"
 	"github.com/ableinc/coding-agent-loop/internal/gate"
+	"github.com/ableinc/coding-agent-loop/internal/models"
 	"github.com/ableinc/coding-agent-loop/internal/store"
+	"github.com/ableinc/coding-agent-loop/internal/web"
 )
 
 // Controller is the slice of the orchestrator the API needs. Keeping it an
@@ -27,40 +34,62 @@ import (
 type Controller interface {
 	Cancel(runID string) bool
 	ActiveRepos() []string
+	// Poll asks for a discovery pass now, reporting false if one is already
+	// queued.
+	Poll() bool
+}
+
+// Options are the Server's dependencies.
+type Options struct {
+	Addr     string
+	Store    *store.Store
+	Gate     *gate.Gate
+	Ctrl     Controller
+	Log      *slog.Logger
+	Discord  *discord.Notifier
+	Config   config.Config
+	Registry *models.Registry
 }
 
 // Server wraps the Fiber app.
 type Server struct {
-	app     *fiber.App
-	addr    string
-	store   *store.Store
-	gate    *gate.Gate
-	ctrl    Controller
-	log     *slog.Logger
-	start   time.Time
-	discord *discord.Notifier
+	app      *fiber.App
+	addr     string
+	store    *store.Store
+	gate     *gate.Gate
+	ctrl     Controller
+	log      *slog.Logger
+	start    time.Time
+	discord  *discord.Notifier
+	cfg      config.Config
+	registry *models.Registry
 }
 
 // New builds the API.
-func New(addr string, st *store.Store, g *gate.Gate, ctrl Controller, log *slog.Logger, d *discord.Notifier) *Server {
+func New(o Options) *Server {
+	log := o.Log
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{
-		app:     fiber.New(fiber.Config{AppName: "coding-agent-loop"}),
-		addr:    addr,
-		store:   st,
-		gate:    g,
-		ctrl:    ctrl,
-		log:     log,
-		start:   time.Now(),
-		discord: d,
+		app:      fiber.New(fiber.Config{AppName: "coding-agent-loop"}),
+		addr:     o.Addr,
+		store:    o.Store,
+		gate:     o.Gate,
+		ctrl:     o.Ctrl,
+		log:      log,
+		start:    time.Now(),
+		discord:  o.Discord,
+		cfg:      o.Config,
+		registry: o.Registry,
 	}
 	s.routes()
 	return s
 }
 
 func (s *Server) routes() {
+	s.app.Use(s.sameOrigin)
+
 	s.app.Get("/healthz", s.health)
 	s.app.Get("/status", s.status)
 	s.app.Get("/runs", s.listRuns)
@@ -70,6 +99,60 @@ func (s *Server) routes() {
 	s.app.Post("/pause", s.pause)
 	s.app.Post("/resume", s.resume)
 	s.app.Post("/runs/:id/cancel", s.cancelRun)
+	s.app.Get("/config", s.getConfig)
+	s.app.Get("/models", s.getModels)
+	s.app.Post("/poll", s.pollNow)
+
+	if s.cfg.Server.UI {
+		s.app.Get("/", func(c fiber.Ctx) error { return c.Redirect().Status(http.StatusFound).To("/ui/") })
+		s.app.Use("/ui", static.New("", static.Config{
+			FS:            web.Assets,
+			IndexNames:    []string{"index.html"},
+			CacheDuration: -1, // no stale console after an upgrade
+		}))
+	}
+}
+
+// sameOrigin rejects a mutating request whose Origin (or, lacking that,
+// Referer) header names a non-loopback host. A page loaded from any other
+// origin can still fire a simple cross-origin POST with no preflight, and
+// shipping a browser console here makes it worth closing that off. A request
+// with neither header — curl, a script, an operator's own tooling — is
+// unaffected: those are the documented way to drive this API and carry no
+// Origin at all.
+func (s *Server) sameOrigin(c fiber.Ctx) error {
+	if c.Method() == fiber.MethodGet || c.Method() == fiber.MethodHead {
+		return c.Next()
+	}
+	origin := c.Get(fiber.HeaderOrigin)
+	if origin == "" {
+		origin = c.Get(fiber.HeaderReferer)
+	}
+	if origin == "" {
+		return c.Next()
+	}
+	if !isLoopbackOrigin(origin, s.addr) {
+		return s.fail(c, http.StatusForbidden, errors.New("cross-origin request refused"))
+	}
+	return c.Next()
+}
+
+// isLoopbackOrigin reports whether origin (an Origin or Referer header value)
+// names localhost, a loopback IP, or the host this server itself is bound to.
+func isLoopbackOrigin(origin, addr string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	if addrHost, _, err := net.SplitHostPort(addr); err == nil && addrHost != "" && strings.EqualFold(addrHost, host) {
+		return true
+	}
+	return false
 }
 
 // Listen serves until ctx is cancelled, then shuts down gracefully.
@@ -266,6 +349,54 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 	// carries the repo, issue, and attempt that this handler does not know.
 	s.log.Info("run cancelled by operator", "run", id)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
+}
+
+// getConfig returns the daemon's configuration for the web console, with the
+// Discord webhook URL blanked: it is a secret, everything else here is not.
+func (s *Server) getConfig(c fiber.Ctx) error {
+	cfg := s.cfg
+	webhookSet := cfg.Discord.WebhookURL != ""
+	cfg.Discord.WebhookURL = ""
+	return c.JSON(fiber.Map{
+		"config":              cfg,
+		"discord_webhook_set": webhookSet,
+	})
+}
+
+// getModels reports the full model registry plus which models are currently
+// cooled down, so the console can show the plan/implement ladders with
+// sidelined models struck through rather than silently missing.
+func (s *Server) getModels(c fiber.Ctx) error {
+	if s.registry == nil {
+		return c.JSON(fiber.Map{"models": []models.Model{}, "cooled_down": []string{}, "plan": []models.Model{}, "implement": []models.Model{}})
+	}
+	cooled, err := s.store.CooledDownModels(c.Context())
+	if err != nil {
+		s.log.Warn("cooldown lookup failed", "error", err)
+		cooled = nil
+	}
+	cooledList := make([]string, 0, len(cooled))
+	for id := range cooled {
+		cooledList = append(cooledList, id)
+	}
+	return c.JSON(fiber.Map{
+		"models":      s.registry.Models,
+		"cooled_down": cooledList,
+		"plan":        s.registry.Ladder(models.RolePlan, cooled),
+		"implement":   s.registry.Ladder(models.RoleImplement, cooled),
+	})
+}
+
+// pollNow asks the orchestrator for a discovery pass right away, rather than
+// waiting for the next tick of github.poll_interval.
+func (s *Server) pollNow(c fiber.Ctx) error {
+	if s.ctrl == nil {
+		return s.fail(c, http.StatusServiceUnavailable, errors.New("no controller attached"))
+	}
+	if !s.ctrl.Poll() {
+		return s.fail(c, http.StatusConflict, errors.New("a discovery pass is already queued"))
+	}
+	return c.JSON(fiber.Map{"queued": true})
 }
 
 func (s *Server) fail(c fiber.Ctx, code int, err error) error {

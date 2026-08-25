@@ -68,6 +68,9 @@ type Orchestrator struct {
 	// botLogin caches the daemon's own GitHub login, used to scope PR
 	// discovery and to make sure the daemon never reacts to its own comments.
 	botLogin string
+
+	// poll carries operator-requested discovery passes in from Poll(), see Run.
+	poll chan struct{}
 }
 
 type repoMeta struct {
@@ -89,6 +92,7 @@ func New(opts Options) *Orchestrator {
 		activeRepos: map[string]bool{},
 		cancels:     map[string]context.CancelFunc{},
 		repoInfo:    map[string]repoMeta{},
+		poll:        make(chan struct{}, 1),
 	}
 }
 
@@ -116,7 +120,23 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			o.tick(ctx)
+		case <-o.poll:
+			o.log.Info("discovery pass requested by operator")
+			o.tick(ctx)
 		}
+	}
+}
+
+// Poll asks for a discovery pass as soon as Run's loop is next free, without
+// waiting for the regular poll interval. It reports false when a pass is
+// already queued, so an operator mashing the button in the web console does
+// not pile up redundant ticks.
+func (o *Orchestrator) Poll() bool {
+	select {
+	case o.poll <- struct{}{}:
+		return true
+	default:
+		return false
 	}
 }
 

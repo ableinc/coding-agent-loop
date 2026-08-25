@@ -34,6 +34,7 @@ gh search issues --label agent-ready          gh search prs --author <bot>
 - [Embedded defaults](#embedded-defaults)
 - [When it stops](#when-it-stops)
 - [Control API](#control-api)
+- [Web interface](#web-interface)
 - [Discord notifications](#discord-notifications)
 - [Safety boundaries](#safety-boundaries)
 - [Deploying with systemd](#deploying-with-systemd)
@@ -375,7 +376,8 @@ This repository's own `config.json` is also **compiled into the binary** at buil
     "env": { "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" }
   },
   "server": {
-    "addr": "127.0.0.1:8787"
+    "addr": "127.0.0.1:8787",
+    "ui": true
   },
   "store": {
     "path": "~/.agent-loop/state.db"
@@ -427,6 +429,7 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `verify.commands`                                      | per-repo override, keyed `"owner/name": "shell command"`                                                                           |
 | `verify.env`                                           | extra environment for the test command — mainly `PATH`, so the daemon can find language toolchains (see [Verification](#verification)) |
 | `server.addr`                                          | control API bind address; keep loopback-only                                                                                       |
+| `server.ui`                                            | mount the web interface at `/ui` (and redirect `/` to it); see [Web interface](#web-interface)                                     |
 | `store.path`                                           | SQLite database path                                                                                                               |
 | `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |
 | `discord.webhook_url`                                  | the channel's incoming webhook URL; **required** if `discord.enabled` is true                                                      |
@@ -548,8 +551,37 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
 | `GET /sessions?repo=&issue=&limit=` | Claude session IDs recorded per repo/issue, newest first     |
+| `GET /config`                | current configuration, with the Discord webhook URL redacted        |
+| `GET /models`                | the model registry plus the plan/implement ladders and which models are cooled down |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
 | `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
+| `POST /poll`                 | run a discovery pass now, instead of waiting for `github.poll_interval` |
+| `GET /`                      | redirects to `/ui/` when `server.ui` is enabled                     |
+| `GET /ui/`                   | the web interface (see [Web interface](#web-interface))            |
+
+Mutating routes (`POST`) reject a request whose `Origin` or `Referer` header names a non-loopback
+host, so a page loaded from another site cannot drive this API from a visitor's browser. A request
+with neither header — `curl`, scripts, anything hitting the API directly — is unaffected; that
+remains the documented way to use it.
+
+## Web interface
+
+A small browser console for the control API above, compiled into the binary via `go:embed` (see
+`internal/web`) — no separate install, no network access at runtime, no build tooling required.
+Open `http://127.0.0.1:8787/` (redirects to `/ui/`) once the daemon is running.
+
+It has five views: a **dashboard** (gate state, active claims, in-flight runs with a Cancel button,
+pause/resume, and a "Run discovery now" button), **runs** (filterable history with cost, tokens,
+verification outcome, and PR links), a **run detail** page (full metrics, event timeline, and a
+lazily-loaded transcript viewer — the transcript is not fetched until you ask for it, since it can
+run to megabytes), **sessions** (Claude session IDs per repo/issue, with copy-to-clipboard), and a
+read-only **config** view (current settings and the model ladders, with cooled-down models struck
+through). It polls `/status` every few seconds (configurable, pauses automatically when the tab is
+hidden) rather than holding a persistent connection.
+
+It shares the same posture as the rest of the control API: **loopback-only and unauthenticated by
+default.** Anything with local access to the port has full control, same as `curl`. Set
+`"server": {"ui": false}` to disable the mount entirely and keep only the JSON API.
 
 ## Discord notifications
 
@@ -741,6 +773,7 @@ account, or with the same `--config`) so it resolves the same account and config
 | `internal/verify`       | detect and run the repo's tests                                              |
 | `internal/orchestrator` | the loop, prompts, PR reports                                                |
 | `internal/server`       | Fiber v3 control API                                                         |
+| `internal/web`          | the browser console (`go:embed`), served by `internal/server` at `/ui`      |
 | `internal/proc`         | process-group isolation                                                      |
 | `internal/install`      | embedded systemd unit, `--install`/`--uninstall`                             |
 
