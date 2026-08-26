@@ -16,10 +16,32 @@ function showError(message) {
   }, 6000);
 }
 
+// Deliberately sessionStorage, not localStorage like cal.theme/cal.pollInterval
+// below: this is what makes closing the tab or browser log the operator out,
+// per the "session persisted only" requirement.
+const TOKEN_KEY = "cal.token";
+
+function getToken() {
+  return sessionStorage.getItem(TOKEN_KEY) || "";
+}
+function setToken(token) {
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+function clearToken() {
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+function authHeaders() {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function apiFetch(path, options) {
+  const opts = options ? { ...options } : {};
+  opts.headers = { ...authHeaders(), ...(opts.headers || {}) };
+
   let res;
   try {
-    res = await fetch(path, options);
+    res = await fetch(path, opts);
   } catch (err) {
     showError(`Network error calling ${path}: ${err.message}`);
     throw err;
@@ -32,6 +54,14 @@ async function apiFetch(path, options) {
     } catch {
       body = text;
     }
+  }
+  if (res.status === 401) {
+    clearToken();
+    lock();
+    const err = new Error("authentication required");
+    err.status = res.status;
+    err.body = body;
+    throw err;
   }
   if (!res.ok) {
     const message = (body && body.error) || res.statusText || `HTTP ${res.status}`;
@@ -283,6 +313,60 @@ document.addEventListener("visibilitychange", schedulePoll);
 
 const storedInterval = localStorage.getItem(POLL_KEY);
 if (storedInterval) pollSelect.value = storedInterval;
+
+// --- Lock screen ---------------------------------------------------------
+
+const lockScreen = document.getElementById("lock-screen");
+const lockForm = document.getElementById("lock-form");
+const lockPassword = document.getElementById("lock-password");
+const lockError = document.getElementById("lock-error");
+const lockBtn = document.getElementById("lock-btn");
+
+function showLockError(message) {
+  lockError.textContent = message;
+  lockError.hidden = false;
+}
+
+function lock() {
+  clearToken();
+  clearInterval(pollTimer);
+  document.body.classList.add("locked");
+  lockScreen.hidden = false;
+  lockPassword.value = "";
+  lockPassword.focus();
+}
+
+function unlock() {
+  document.body.classList.remove("locked");
+  lockScreen.hidden = true;
+  lockError.hidden = true;
+  schedulePoll();
+  refreshStatus();
+  currentRoute = parseHash();
+  renderRoute(currentRoute);
+}
+
+lockForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  lockError.hidden = true;
+  try {
+    const res = await api.post("/login", { password: lockPassword.value });
+    setToken(res.token);
+    unlock();
+  } catch (err) {
+    if (err.status === 429) showLockError("Too many attempts, wait a minute.");
+    else showLockError("Incorrect password.");
+  }
+});
+
+lockBtn.addEventListener("click", async () => {
+  try {
+    await api.post("/logout");
+  } catch {
+    // fall through to locking locally regardless
+  }
+  lock();
+});
 
 // --- Router ------------------------------------------------------------
 
@@ -656,7 +740,7 @@ async function renderRunDetail(id, silent) {
       loadBtn.disabled = true;
       loadBtn.textContent = "Loading…";
       try {
-        const res = await fetch(`/runs/${encodeURIComponent(id)}/log`);
+        const res = await fetch(`/runs/${encodeURIComponent(id)}/log`, { headers: authHeaders() });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         transcriptHolder.innerHTML = "";
@@ -814,7 +898,26 @@ function ladderTable(ladder, cooled) {
 
 // --- Boot --------------------------------------------------------------
 
-schedulePoll();
-refreshStatus();
-currentRoute = parseHash();
-renderRoute(currentRoute);
+async function boot() {
+  let auth = { required: false, authenticated: true };
+  try {
+    auth = await api.get("/auth");
+  } catch {
+    // treat an unreachable daemon like no auth requirement; refreshStatus
+    // below will report "Unreachable" on the status pill either way
+  }
+
+  lockBtn.hidden = !auth.required;
+
+  if (auth.required && !auth.authenticated) {
+    lock();
+    return;
+  }
+
+  schedulePoll();
+  refreshStatus();
+  currentRoute = parseHash();
+  renderRoute(currentRoute);
+}
+
+boot();

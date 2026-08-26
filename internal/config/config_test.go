@@ -261,3 +261,21 @@ func TestPRCommentsRejectsMentionWithoutAt(t *testing.T) {
 		t.Fatalf("want a mention validation error, got %v", err)
 	}
 }
+
+// The password field must exist on ServerConfig before DisallowUnknownFields
+// will let config.example.json carry it.
+func TestServerPasswordLoads(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"server":{"password":"s3cret"}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Password != "s3cret" {
+		t.Fatalf("server.password = %q, want %q", cfg.Server.Password, "s3cret")
+	}
+}
+
+func TestDefaultServerPasswordIsEmpty(t *testing.T) {
+	if got := Default().Server.Password; got != "" {
+		t.Fatalf("Default().Server.Password = %q, want empty (auth disabled by default)", got)
+	}
+}

@@ -406,6 +406,151 @@ func TestGetConfigRedactsWebhook(t *testing.T) {
 	}
 }
 
+func TestNoPasswordLeavesEveryRouteOpen(t *testing.T) {
+	s, _, _ := testServer(t) // config.Default() leaves server.password empty
+
+	for _, target := range []string{"/healthz", "/status", "/config", "/auth", "/ui/", "/ui/app.js"} {
+		if code, _ := do(t, s, http.MethodGet, target, nil); code == http.StatusUnauthorized {
+			t.Fatalf("GET %s with no password configured = 401, want it to stay open", target)
+		}
+	}
+}
+
+func withPassword(t *testing.T, password string) (*Server, *store.Store, *fakeController) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Server.Password = password
+	return testServerWithConfig(t, cfg)
+}
+
+func TestAuthRequiredForAPIRoutes(t *testing.T) {
+	s, _, _ := withPassword(t, "hunter2")
+
+	if code, _ := do(t, s, http.MethodGet, "/status", nil); code != http.StatusUnauthorized {
+		t.Fatalf("GET /status with no credential = %d, want 401", code)
+	}
+
+	for _, target := range []string{"/healthz", "/", "/ui/", "/ui/app.js"} {
+		if code, _ := do(t, s, http.MethodGet, target, nil); code == http.StatusUnauthorized {
+			t.Fatalf("GET %s should stay open even with a password configured, got 401", target)
+		}
+	}
+}
+
+func doAuthed(t *testing.T, s *Server, method, target, token string, body io.Reader) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, target, body)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := s.app.Test(req, fiberTimeout)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, target, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var decoded map[string]any
+	if len(raw) > 0 && raw[0] == '{' {
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("decode %s: %v (%s)", target, err, raw)
+		}
+	}
+	return resp.StatusCode, decoded
+}
+
+func TestLoginWrongPassword(t *testing.T) {
+	s, _, _ := withPassword(t, "hunter2")
+
+	code, body := do(t, s, http.MethodPost, "/login", strings.NewReader(`{"password":"nope"}`))
+	if code != http.StatusUnauthorized {
+		t.Fatalf("wrong password = %d, want 401", code)
+	}
+	if body["error"] == nil {
+		t.Fatalf("expected an error body, got %v", body)
+	}
+}
+
+func TestLoginAndUseToken(t *testing.T) {
+	s, _, _ := withPassword(t, "hunter2")
+
+	code, body := do(t, s, http.MethodPost, "/login", strings.NewReader(`{"password":"hunter2"}`))
+	if code != http.StatusOK {
+		t.Fatalf("correct password = %d, want 200: %v", code, body)
+	}
+	token, _ := body["token"].(string)
+	if token == "" {
+		t.Fatalf("login did not return a token: %v", body)
+	}
+
+	if code, _ := doAuthed(t, s, http.MethodGet, "/status", token, nil); code != http.StatusOK {
+		t.Fatalf("GET /status with session token = %d, want 200", code)
+	}
+
+	// The raw password is also accepted as a bearer credential, so scripted
+	// curl usage keeps working without a login round-trip.
+	if code, _ := doAuthed(t, s, http.MethodGet, "/status", "hunter2", nil); code != http.StatusOK {
+		t.Fatalf("GET /status with raw password as bearer = %d, want 200", code)
+	}
+
+	if code, _ := doAuthed(t, s, http.MethodPost, "/logout", token, nil); code != http.StatusOK {
+		t.Fatalf("logout = %d, want 200", code)
+	}
+	if code, _ := doAuthed(t, s, http.MethodGet, "/status", token, nil); code != http.StatusUnauthorized {
+		t.Fatalf("GET /status after logout with revoked token = %d, want 401", code)
+	}
+}
+
+func TestAuthStatusEndpoint(t *testing.T) {
+	s, _, _ := testServer(t)
+	code, body := do(t, s, http.MethodGet, "/auth", nil)
+	if code != http.StatusOK || body["required"] != false {
+		t.Fatalf("GET /auth with no password = %d %v, want required=false", code, body)
+	}
+
+	s2, _, _ := withPassword(t, "hunter2")
+	code, body = do(t, s2, http.MethodGet, "/auth", nil)
+	if code != http.StatusOK || body["required"] != true || body["authenticated"] != false {
+		t.Fatalf("GET /auth with password unauthenticated = %d %v", code, body)
+	}
+
+	code, body = doAuthed(t, s2, http.MethodGet, "/auth", "hunter2", nil)
+	if code != http.StatusOK || body["authenticated"] != true {
+		t.Fatalf("GET /auth with valid credential = %d %v, want authenticated=true", code, body)
+	}
+}
+
+func TestLoginThrottlesRepeatedFailures(t *testing.T) {
+	s, _, _ := withPassword(t, "hunter2")
+
+	var lastCode int
+	for i := 0; i < throttleMax+1; i++ {
+		lastCode, _ = do(t, s, http.MethodPost, "/login", strings.NewReader(`{"password":"nope"}`))
+	}
+	if lastCode != http.StatusTooManyRequests {
+		t.Fatalf("after %d failures, login = %d, want 429", throttleMax+1, lastCode)
+	}
+}
+
+func TestGetConfigRedactsPassword(t *testing.T) {
+	s, _, _ := withPassword(t, "hunter2")
+
+	code, body := doAuthed(t, s, http.MethodGet, "/config", "hunter2", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /config = %d", code)
+	}
+	if body["password_set"] != true {
+		t.Fatalf("password_set = %v, want true", body["password_set"])
+	}
+	cfgBody, _ := body["config"].(map[string]any)
+	serverCfg, _ := cfgBody["server"].(map[string]any)
+	if serverCfg["password"] != "" {
+		t.Fatalf("password leaked: %v", serverCfg["password"])
+	}
+}
+
 func TestPollNow(t *testing.T) {
 	s, _, ctrl := testServer(t)
 

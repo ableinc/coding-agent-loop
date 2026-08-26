@@ -377,7 +377,8 @@ This repository's own `config.json` is also **compiled into the binary** at buil
   },
   "server": {
     "addr": "127.0.0.1:8787",
-    "ui": true
+    "ui": true,
+    "password": ""
   },
   "store": {
     "path": "~/.agent-loop/state.db"
@@ -430,6 +431,7 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `verify.env`                                           | extra environment for the test command — mainly `PATH`, so the daemon can find language toolchains (see [Verification](#verification)) |
 | `server.addr`                                          | control API bind address; keep loopback-only                                                                                       |
 | `server.ui`                                            | mount the web interface at `/ui` (and redirect `/` to it); see [Web interface](#web-interface)                                     |
+| `server.password`                                      | optional password for the web console and control API; empty disables authentication; stored in plaintext, so keep `config.json` readable only by the daemon user |
 | `store.path`                                           | SQLite database path                                                                                                               |
 | `discord.enabled`                                      | turn on Discord status notifications (see [Discord notifications](#discord-notifications))                                         |
 | `discord.webhook_url`                                  | the channel's incoming webhook URL; **required** if `discord.enabled` is true                                                      |
@@ -546,12 +548,15 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | Route                        | Purpose                                                             |
 | ---------------------------- | ------------------------------------------------------------------- |
 | `GET /healthz`               | liveness                                                            |
+| `GET /auth`                  | whether `server.password` is set, and whether the caller's credential is currently valid |
+| `POST /login`                | exchange the configured password for a session token                |
+| `POST /logout`               | revoke the presented session token                                  |
 | `GET /status`                | gate state, in-flight runs, claims, model cooldowns, usage snapshot |
 | `GET /runs?limit=&repo=`     | recent runs with outcome, model, cost, PR link, created/started/ended timestamps; `kind` distinguishes an issue run from a PR-comment run |
 | `GET /runs/{id}`             | one run plus its event timeline                                     |
 | `GET /runs/{id}/log`         | the raw JSONL transcript of the Claude run                          |
 | `GET /sessions?repo=&issue=&limit=` | Claude session IDs recorded per repo/issue, newest first     |
-| `GET /config`                | current configuration, with the Discord webhook URL redacted        |
+| `GET /config`                | current configuration, with the Discord webhook URL and web console password redacted |
 | `GET /models`                | the model registry plus the plan/implement ladders and which models are cooled down |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
 | `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
@@ -563,6 +568,16 @@ Mutating routes (`POST`) reject a request whose `Origin` or `Referer` header nam
 host, so a page loaded from another site cannot drive this API from a visitor's browser. A request
 with neither header — `curl`, scripts, anything hitting the API directly — is unaffected; that
 remains the documented way to use it.
+
+When `server.password` is set, every route requires a credential **except** `GET /healthz`,
+`GET /auth`, `POST /login`, `GET /`, and everything under `GET /ui/*` (those must stay open for the
+lock screen itself to load). Send it as `Authorization: Bearer <value>`, where `<value>` is either
+the configured password itself or a token obtained from `POST /login` — both are accepted, so
+existing scripts keep working unchanged:
+
+```sh
+curl -H "Authorization: Bearer $PASSWORD" localhost:8787/status
+```
 
 ## Web interface
 
@@ -579,9 +594,15 @@ read-only **config** view (current settings and the model ladders, with cooled-d
 through). It polls `/status` every few seconds (configurable, pauses automatically when the tab is
 hidden) rather than holding a persistent connection.
 
-It shares the same posture as the rest of the control API: **loopback-only and unauthenticated by
+It shares the same posture as the rest of the control API: **loopback-first, and unauthenticated by
 default.** Anything with local access to the port has full control, same as `curl`. Set
 `"server": {"ui": false}` to disable the mount entirely and keep only the JSON API.
+
+Setting `server.password` puts a lock screen in front of the console. Unlocking stores a session
+token in the browser's `sessionStorage`, not a cookie and not `localStorage`, so closing the tab or
+browser logs you out; a daemon restart invalidates every outstanding session too, since tokens are
+only ever kept in memory. The password is not a substitute for binding to loopback — there is no
+TLS here, so a password sent over a non-loopback connection is sent in the clear.
 
 ## Discord notifications
 

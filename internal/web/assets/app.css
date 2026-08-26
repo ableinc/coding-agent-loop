@@ -474,6 +474,63 @@ tbody tr:hover {
   word-break: break-word;
 }
 
+.lock {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+
+.lock[hidden] {
+  display: none;
+}
+
+.lock-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 320px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 24px;
+}
+
+.lock-card h1 {
+  font-size: 18px;
+  text-align: center;
+  margin: 0 0 4px;
+}
+
+.lock-card input {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font: inherit;
+}
+
+.lock-error {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 0;
+}
+
+.lock-error[hidden] {
+  display: none;
+}
+
+body.locked .topbar,
+body.locked #app {
+  display: none;
+}
+
 .empty-state {
   color: var(--text-muted);
   padding: 24px;
