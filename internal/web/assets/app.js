@@ -464,7 +464,7 @@ async function renderDashboard(status) {
   const stats = el("div", { class: "stat-grid" }, [
     statTile("In-flight runs", String((status.in_flight || []).length)),
     statTile("Active repos", String((status.active_repos || []).length)),
-    statTile("Usage", status.usage && status.usage.available ? `${status.usage.percent.toFixed(0)}%` : "—"),
+    statTile("Usage", status.usage && status.usage.percent && status.usage.available ? `${status.usage.percent.toFixed(0)}%` : "—"),
     statTile("Spend (24h)", fmtUSD(spend24h)),
   ]);
   container.appendChild(stats);
