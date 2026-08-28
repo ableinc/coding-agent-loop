@@ -17,6 +17,17 @@ gh search issues --label agent-ready          gh search prs --author <bot>
    run the repo's tests ──▶ commit ──▶ push ──▶ gh pr create --draft   react 👀 ──▶ push ──▶ react 👍
 ```
 
+## Web Interface (optional)
+
+**Dashboard**
+
+![coding agent loop ui](./screenshots/coding-agent-loop-ui.png)
+
+
+**Runs**
+
+![coding agent loop ui 2](./screenshots/coding-agent-loop-ui-2.png)
+
 ## Table of contents
 
 - [What this is](#what-this-is)
