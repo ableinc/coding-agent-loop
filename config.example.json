@@ -61,7 +61,8 @@
   },
   "server": {
     "addr": "127.0.0.1:8787",
-    "ui": true
+    "ui": true,
+    "password": ""
   },
   "store": {
     "path": "~/.agent-loop/state.db"

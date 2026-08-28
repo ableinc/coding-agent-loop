@@ -30,3 +30,25 @@ func TestIndexReferencesOtherAssets(t *testing.T) {
 		}
 	}
 }
+
+// TestLockScreenPresent guards the password-lock UI (issue #13): the lock
+// screen markup must exist for auth.go's server.password gate to have
+// anything to show, and the session token must live in sessionStorage, not
+// localStorage, or "closing the tab logs you out" silently stops being true.
+func TestLockScreenPresent(t *testing.T) {
+	html, err := fs.ReadFile(Assets, "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), "lock-screen") {
+		t.Error("index.html does not contain the lock-screen element")
+	}
+
+	js, err := fs.ReadFile(Assets, "app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(js), "sessionStorage") {
+		t.Error("app.js does not use sessionStorage for the session token")
+	}
+}

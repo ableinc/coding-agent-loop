@@ -2,12 +2,14 @@
 //
 // An autonomous process that pushes branches and opens pull requests is
 // otherwise invisible, so this is how you see what it is doing and how you
-// stop it. It binds to loopback by default and has no authentication: it can
-// pause and cancel work, so it must not be exposed.
+// stop it. It binds to loopback by default and has no authentication unless
+// server.password is set: it can pause and cancel work, so it must not be
+// exposed.
 package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net"
@@ -63,6 +65,7 @@ type Server struct {
 	discord  *discord.Notifier
 	cfg      config.Config
 	registry *models.Registry
+	sessions *sessionStore
 }
 
 // New builds the API.
@@ -82,6 +85,7 @@ func New(o Options) *Server {
 		discord:  o.Discord,
 		cfg:      o.Config,
 		registry: o.Registry,
+		sessions: newSessionStore(),
 	}
 	s.routes()
 	return s
@@ -89,8 +93,12 @@ func New(o Options) *Server {
 
 func (s *Server) routes() {
 	s.app.Use(s.sameOrigin)
+	s.app.Use(s.requireAuth)
 
 	s.app.Get("/healthz", s.health)
+	s.app.Get("/auth", s.authStatus)
+	s.app.Post("/login", s.login)
+	s.app.Post("/logout", s.logout)
 	s.app.Get("/status", s.status)
 	s.app.Get("/runs", s.listRuns)
 	s.app.Get("/runs/:id", s.getRun)
@@ -153,6 +161,67 @@ func isLoopbackOrigin(origin, addr string) bool {
 		return true
 	}
 	return false
+}
+
+// unauthenticatedPath reports whether path may be reached without a credential even when
+// server.password is set: health probes, the login/auth endpoints
+// themselves, the redirect root, and the console's own static assets, which
+// must load in order to render the lock screen in front of them.
+func unauthenticatedPath(path string) bool {
+	switch path {
+	case "/healthz", "/auth", "/login", "/":
+		return true
+	}
+	return strings.HasPrefix(path, "/ui")
+}
+
+// requireAuth gates every route behind the configured password once one is
+// set. With no password configured it is a no-op, preserving today's open
+// behaviour.
+func (s *Server) requireAuth(c fiber.Ctx) error {
+	if !s.authEnabled() || unauthenticatedPath(c.Path()) {
+		return c.Next()
+	}
+	if s.authenticated(bearerToken(c)) {
+		return c.Next()
+	}
+	return s.fail(c, http.StatusUnauthorized, errors.New("authentication required"))
+}
+
+// authStatus tells the client whether a password is required at all, and
+// whether its currently stored credential (if any) still works — a client
+// that sends its stored token gets both answers from one call at boot.
+func (s *Server) authStatus(c fiber.Ctx) error {
+	required := s.authEnabled()
+	return c.JSON(fiber.Map{
+		"required":      required,
+		"authenticated": !required || s.authenticated(bearerToken(c)),
+	})
+}
+
+func (s *Server) login(c fiber.Ctx) error {
+	if s.sessions.throttled() {
+		return s.fail(c, http.StatusTooManyRequests, errors.New("too many attempts, wait a minute"))
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := c.Bind().Body(&body); err != nil {
+		return s.fail(c, http.StatusBadRequest, errors.New("invalid request body"))
+	}
+	configured := strings.TrimSpace(s.cfg.Server.Password)
+	if configured == "" || subtle.ConstantTimeCompare([]byte(body.Password), []byte(configured)) != 1 {
+		s.sessions.recordFailure()
+		s.log.Warn("web console login failed")
+		return s.fail(c, http.StatusUnauthorized, errors.New("incorrect password"))
+	}
+	token := s.sessions.issue()
+	return c.JSON(fiber.Map{"token": token, "expires_in_seconds": int(sessionTTL.Seconds())})
+}
+
+func (s *Server) logout(c fiber.Ctx) error {
+	s.sessions.revoke(bearerToken(c))
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 // Listen serves until ctx is cancelled, then shuts down gracefully.
@@ -352,14 +421,18 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 }
 
 // getConfig returns the daemon's configuration for the web console, with the
-// Discord webhook URL blanked: it is a secret, everything else here is not.
+// Discord webhook URL and web console password blanked: they are secrets,
+// everything else here is not.
 func (s *Server) getConfig(c fiber.Ctx) error {
 	cfg := s.cfg
 	webhookSet := cfg.Discord.WebhookURL != ""
 	cfg.Discord.WebhookURL = ""
+	passwordSet := s.authEnabled()
+	cfg.Server.Password = ""
 	return c.JSON(fiber.Map{
 		"config":              cfg,
 		"discord_webhook_set": webhookSet,
+		"password_set":        passwordSet,
 	})
 }
 

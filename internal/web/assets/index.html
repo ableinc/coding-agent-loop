@@ -7,6 +7,15 @@
   <link rel="stylesheet" href="app.css" />
 </head>
 <body>
+  <div id="lock-screen" class="lock" hidden>
+    <form id="lock-form" class="lock-card">
+      <h1>coding-agent-loop</h1>
+      <input id="lock-password" type="password" placeholder="Password" autocomplete="current-password" autofocus required />
+      <button type="submit" class="btn btn-primary">Unlock</button>
+      <p id="lock-error" class="lock-error" role="alert" hidden></p>
+    </form>
+  </div>
+
   <div id="error-banner" class="error-banner" role="alert" aria-live="assertive" hidden></div>
 
   <header class="topbar">
@@ -30,6 +39,7 @@
         <option value="0">Off</option>
       </select>
       <button id="theme-toggle-btn" class="btn btn-icon" type="button" aria-label="Toggle dark mode">&#9788;</button>
+      <button id="lock-btn" class="btn" type="button" hidden>Lock</button>
     </div>
   </header>
 

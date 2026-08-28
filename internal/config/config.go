@@ -175,9 +175,13 @@ type ServerConfig struct {
 	// Addr should stay on loopback: this API can pause and cancel work.
 	Addr string `json:"addr"`
 	// UI mounts the browser console at /ui (and redirects / to it). It shares
-	// the same loopback-only, no-authentication posture as the rest of the
-	// control API.
+	// the same loopback-only posture as the rest of the control API.
 	UI bool `json:"ui"`
+	// Password, when non-blank, requires it (or a session token obtained by
+	// submitting it) to use the control API and web console. Empty disables
+	// authentication, matching pre-#13 behaviour. Stored in plaintext here,
+	// so keep this file readable only by the daemon user.
+	Password string `json:"password"`
 }
 
 type StoreConfig struct {
