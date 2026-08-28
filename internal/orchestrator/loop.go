@@ -703,6 +703,7 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		SystemPrompt:   sysPrompt,
 		Model:          head.Ref(),
 		Fallbacks:      fallbacks,
+		Effort:         head.EffortFor(phase),
 		PermissionMode: permissionMode,
 		WorkDir:        worktree,
 		Env:            o.opts.Git.IdentityEnv(),

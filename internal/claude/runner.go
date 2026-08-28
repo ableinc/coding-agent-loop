@@ -135,6 +135,9 @@ type Options struct {
 	// `--fallback-model` list and may be empty.
 	Model     string
 	Fallbacks string
+	// Effort maps to `--effort` (low, medium, high, xhigh, max). Empty leaves
+	// it unset, so the CLI's own default applies.
+	Effort string
 	// PermissionMode maps to `--permission-mode`.
 	PermissionMode string
 	// WorkDir is the process cwd, i.e. the worktree.
@@ -203,6 +206,9 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	if opts.Fallbacks != "" {
 		args = append(args, "--fallback-model", opts.Fallbacks)
+	}
+	if opts.Effort != "" {
+		args = append(args, "--effort", opts.Effort)
 	}
 	if opts.PermissionMode != "" {
 		args = append(args, "--permission-mode", opts.PermissionMode)

@@ -27,9 +27,12 @@ gh search issues --label agent-ready          gh search prs --author <bot>
 - [How work is selected](#how-work-is-selected)
 - [Verification](#verification)
 - [Lifecycle of one issue](#lifecycle-of-one-issue)
+- [Prompts](#prompts)
+- [How Claude Code is invoked](#how-claude-code-is-invoked)
 - [Responding to PR comments](#responding-to-pr-comments)
 - [Configuration reference](#configuration-reference)
   - [config.json](#configjson)
+  - [Migrating config.json](#migrating-configjson)
   - [models.json](#modelsjson)
 - [Embedded defaults](#embedded-defaults)
 - [When it stops](#when-it-stops)
@@ -137,6 +140,7 @@ All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `mak
 | `--install`       | off           | install + enable + start the systemd unit; **must run as root**          |
 | `--uninstall`     | off           | stop, disable, and remove everything `--install` created; **must run as root** |
 | `--print-service` | off           | print the embedded systemd unit to stdout and exit; no privileges needed |
+| `--migrate-config` | off          | rewrite `--config` to the current `config.json` schema, in place; see [Migrating config.json](#migrating-configjson) |
 
 `--dry-run` and `--no-mutate` answer different questions and cost very different
 amounts. `--dry-run` is a rehearsal of the *decisions*: it fetches each issue,
@@ -277,6 +281,57 @@ issue is worked at all: remove `agent-ready` to stop the retries.
 
 A usage limit hit mid-run is recorded as `deferred` — neither an attempt nor a failure, so it
 neither extends the back-off nor drops the issue down the ladder.
+
+## Prompts
+
+All prompt text lives in `internal/orchestrator/prompt.go` — nowhere else. Each phase gets a
+system prompt (the harness's rules) and a task prompt (the actual issue/plan/comment content),
+built by one function apiece:
+
+| Function                | Used for                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------- |
+| `systemPrompt`           | system prompt for the implement run — hands over repo/branch/worktree, forbids git/GitHub mutation, states scope rules |
+| `planSystemPrompt`       | system prompt for the read-only plan run — same autonomy rules, but forbids edits entirely and defines what a plan must contain |
+| `prCommentSystemPrompt`  | system prompt for addressing PR review feedback — same rules as `systemPrompt`, reframed around a branch/PR that already exist |
+| `planTaskPrompt`         | task prompt for the plan run — the issue body/comments plus, on a re-plan, the previous plan and the human feedback that followed it |
+| `implementTaskPrompt`    | task prompt for the implement run — the issue plus the approved plan comment |
+| `prCommentTaskPrompt`    | task prompt for a PR-comment run — the triggering comment(s), thread context, and any review summaries |
+
+`issueContext` (also in `prompt.go`) renders the shared issue-body/comment block all the task
+prompts embed, truncating at `maxBodyChars`/`maxCommentChars`/`maxCommentsInclu` so a very long
+issue thread can't blow the prompt out.
+
+To change what the agent is told, edit the relevant function in `prompt.go` — `prompt_test.go`
+pins the exact wording of the harness rules (git/GitHub ownership, scope, autonomy), so a
+deliberate change there needs an updated test alongside it, not just an updated prompt.
+
+## How Claude Code is invoked
+
+Every run — plan, implement, or PR-comment — goes through the same headless invocation in
+`internal/claude/runner.go` (`Runner.Run`). The prompt is written to the CLI's stdin (so its
+length and quoting are never a shell concern); the system prompt is appended via a flag; the
+result is parsed from a streamed JSONL transcript:
+
+```sh
+claude --print --output-format stream-json --verbose --no-session-persistence \
+  --model <head of the role's models.json ladder> \
+  --fallback-model <the rest of that ladder, comma-separated> \
+  --effort <models.json "effort" for this model+role, if set> \
+  --permission-mode <plan | claude.permission_mode> \
+  --append-system-prompt <one of the prompts above> \
+  --add-dir <the worktree>
+  # + claude.extra_args, appended verbatim
+```
+
+with the task prompt piped in on stdin and `cwd` set to the worktree. `--output-format
+stream-json` is what makes each assistant/tool event available to the harness as it happens (used
+to renew the run's lease and to capture the session ID as soon as it's announced, before any
+result); `--no-session-persistence` keeps one run from leaking state into the next. The model and
+its fallbacks come from the priority-ordered `models.json` ladder for that phase's role (`plan` or
+`implement` — see [models.json](#modelsjson)); `--effort` is only passed when that model configures
+one for the role, otherwise the CLI's own default applies. The terminal `type: "result"` event
+(tokens used, cost, which model actually served the run, stop reason) is what gets recorded against
+the run in SQLite.
 
 ## Responding to PR comments
 
@@ -439,6 +494,24 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `git.author_email`                                     | commit author email to go with `git.author_name`; empty falls back to `coding-agent-loop@users.noreply.github.com`                |
 | `models_path`                                          | where to look for `models.json`; see [Embedded defaults](#embedded-defaults) for how the default value is resolved                 |
 
+### Migrating config.json
+
+`config.Load` parses with `DisallowUnknownFields`, so a `config.json` left over from an older
+release — missing a field the schema has since gained, or still carrying one it has since dropped
+— fails to load outright rather than starting with a guessed default. `--migrate-config` fixes
+that in place: it keeps every value the file already sets, adds any field the schema has gained
+since at its default, and drops (while reporting) any field the schema no longer has.
+
+```sh
+make migrate-config                              # migrates config.json
+CONFIG=/etc/coding-agent-loop/config.json make migrate-config
+bin/coding-agent-loop --config config.json --migrate-config              # same thing, directly
+bin/coding-agent-loop --config config.json --migrate-config --dry-run    # preview on stdout, write nothing
+```
+
+The original is saved alongside it as `config.json.bak` before anything is written. Paths (`~/...`)
+are left exactly as written — migrating never bakes an expanded, host-specific path into the file.
+
 ### models.json
 
 The ladder the loop climbs down when a model is rate-limited or fails. No model identifier is
@@ -450,19 +523,21 @@ hardcoded in Go — this file is the only place to update one.
     {
       "id": "claude-opus-5",
       "alias": "opus",
-      "roles": ["plan", "implement"],
-      "priority": 1
+      "roles": ["plan"],
+      "priority": 1,
+      "effort": { "plan": "high" }
     },
     {
       "id": "claude-sonnet-5",
       "alias": "sonnet",
       "roles": ["plan", "implement"],
-      "priority": 2
+      "priority": 2,
+      "effort": { "plan": "high", "implement": "medium" }
     },
     {
       "id": "claude-haiku-4-5",
       "alias": "haiku",
-      "roles": ["triage", "implement"],
+      "roles": ["implement"],
       "priority": 3
     }
   ]
@@ -474,12 +549,19 @@ hardcoded in Go — this file is the only place to update one.
 - `alias` is what's passed on the CLI.
 - `roles` — `plan` (writes the plan comment) and `implement` (does the work) each have their own
   ladder, selected independently per phase; a registry needs at least one model serving each or the
-  loop refuses to start. `triage` is reserved for a future pre-pass and currently unused.
+  loop refuses to start. These are the only two roles: the loop never spends a model call on
+  anything but planning and implementing — GitHub reads/writes (issues, comments, PRs) go straight
+  through the GitHub API, not through Claude.
   **Give every role at least two rungs.** A single-model ladder passes no `--fallback-model`, so a
   momentarily overloaded model fails the run outright instead of falling through to the next one,
   and the 30-minute cooldown has nowhere to send the retry.
 - `priority` — lower runs first within a role. The head of the priority-ordered list for a role
   becomes `--model`; the rest become `--fallback-model a,b,...`.
+- `effort` (optional) — maps a role this model serves to the CLI's `--effort` value:
+  `low`, `medium`, `high`, `xhigh`, or `max`. A role missing from the map runs without `--effort`,
+  i.e. the CLI's own default. A model can carry a different effort per role, since planning
+  (worth spending more reasoning on) and implementing the already-approved plan (more mechanical)
+  have different quality/cost tradeoffs.
 - A model that fails or hits a limit is put on a 30-minute cooldown, so the next attempt starts
   lower on the ladder. Retries also start one rung lower for every failure recorded on the issue,
   wrapping back to the head once the ladder has been walked, since retries are unbounded — a

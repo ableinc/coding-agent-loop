@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -31,16 +32,17 @@ import (
 )
 
 type flags struct {
-	configPath string
-	once       bool
-	dryRun     bool
-	noMutate   bool
-	logLevel   string
-	noServer   bool
-	checkOnly  bool
-	install    bool
-	uninstall  bool
-	printUnit  bool
+	configPath    string
+	once          bool
+	dryRun        bool
+	noMutate      bool
+	logLevel      string
+	noServer      bool
+	checkOnly     bool
+	install       bool
+	uninstall     bool
+	printUnit     bool
+	migrateConfig bool
 }
 
 const usageHeader = `coding-agent-loop — autonomous GitHub issue to draft PR agent
@@ -57,6 +59,7 @@ Usage:
   coding-agent-loop --once --no-mutate   really run Claude (costs usage), but push/PR/label nothing
   coding-agent-loop --check              verify prerequisites (git, claude, gh, config) and exit
   coding-agent-loop --print-service      print the embedded systemd unit
+  coding-agent-loop --migrate-config     bring config.json up to the current schema, in place
   sudo coding-agent-loop --install       install, enable, and start the systemd unit
   sudo coding-agent-loop --uninstall     stop, disable, and remove everything --install created
 
@@ -81,6 +84,7 @@ func main() {
 	flag.BoolVar(&f.install, "install", false, "install the systemd unit (embedded in this binary), enable it, and start it; must run as root")
 	flag.BoolVar(&f.uninstall, "uninstall", false, "stop, disable, and remove the systemd unit, /opt/coding-agent-loop, and any ~/.agent-loop or dedicated service user --install created; must run as root")
 	flag.BoolVar(&f.printUnit, "print-service", false, "print the systemd unit --install would write and exit")
+	flag.BoolVar(&f.migrateConfig, "migrate-config", false, "rewrite -config to the current config.json schema: keep every value already set, add new fields at their default, drop and report fields the schema no longer has; the original is saved as -config.bak first. Combine with -dry-run to preview on stdout instead of writing anything")
 	flag.Parse()
 
 	if f.printUnit {
@@ -115,14 +119,15 @@ func run(f flags) error {
 		})
 	}
 
-	configPath, allowConfigFallback := f.configPath, f.configPath == ""
-	if allowConfigFallback {
-		dir, err := execDir()
-		if err != nil {
-			return fmt.Errorf("resolve default config.json location: %w", err)
-		}
-		configPath = filepath.Join(dir, "config.json")
+	configPath, allowConfigFallback, err := resolveConfigPath(f.configPath)
+	if err != nil {
+		return err
 	}
+
+	if f.migrateConfig {
+		return migrateConfig(configPath, f.dryRun)
+	}
+
 	cfg, err := config.Load(configPath, allowConfigFallback)
 	if err != nil {
 		return err
@@ -271,6 +276,95 @@ func execDir() (string, error) {
 		return "", fmt.Errorf("resolve running binary path: %w", err)
 	}
 	return filepath.Dir(exe), nil
+}
+
+// resolveConfigPath applies --config's default: when unset, config.json next
+// to the running binary, falling back to the embedded copy if that's also
+// absent. allowFallback reports whether that fallback applies, mirroring
+// config.Load's allowEmbeddedFallback parameter.
+func resolveConfigPath(configFlag string) (path string, allowFallback bool, err error) {
+	if configFlag != "" {
+		return configFlag, false, nil
+	}
+	dir, err := execDir()
+	if err != nil {
+		return "", false, fmt.Errorf("resolve default config.json location: %w", err)
+	}
+	return filepath.Join(dir, "config.json"), true, nil
+}
+
+// migrateConfig rewrites the config.json at path to the current schema:
+// every value it already sets is kept, any field the schema has gained since
+// is added at its default, and any field the schema has since dropped is
+// reported and left out — unlike config.Load, which uses
+// DisallowUnknownFields and would reject exactly that file. dryRun prints the
+// migrated config to stdout instead of writing it.
+//
+// Unlike the rest of run(), this always requires an actual file at path: the
+// embedded config is fresh defaults with nothing to bring forward, so
+// falling back to it here would silently produce a no-op.
+func migrateConfig(path string, dryRun bool) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s does not exist — nothing to migrate (run `make config` to create one from config.example.json)", path)
+		}
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	result, err := config.Migrate(raw)
+	if err != nil {
+		return err
+	}
+
+	out, err := json.MarshalIndent(result.Config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal migrated config: %w", err)
+	}
+	out = append(out, '\n')
+
+	reportMigration(result)
+
+	if dryRun {
+		os.Stdout.Write(out)
+		return nil
+	}
+
+	backup := path + ".bak"
+	if err := os.WriteFile(backup, raw, 0o600); err != nil {
+		return fmt.Errorf("back up %s to %s: %w", path, backup, err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "coding-agent-loop: wrote %s (original saved as %s)\n", path, backup)
+
+	// Advisory only: an old file that was already broken stays broken until a
+	// human fixes it, but the migration itself — bringing it forward to the
+	// current shape — is done and worth keeping either way.
+	if verr := result.Config.Validate(); verr != nil {
+		fmt.Fprintf(os.Stderr, "coding-agent-loop: warning: migrated config does not pass validation: %v\n", verr)
+	}
+	return nil
+}
+
+func reportMigration(result config.MigrateResult) {
+	if len(result.Added) == 0 && len(result.Dropped) == 0 {
+		fmt.Fprintln(os.Stderr, "coding-agent-loop: config already matches the current schema, nothing to add or drop")
+		return
+	}
+	if len(result.Added) > 0 {
+		fmt.Fprintln(os.Stderr, "coding-agent-loop: added at default:")
+		for _, k := range result.Added {
+			fmt.Fprintf(os.Stderr, "  + %s\n", k)
+		}
+	}
+	if len(result.Dropped) > 0 {
+		fmt.Fprintln(os.Stderr, "coding-agent-loop: dropped (no longer part of the schema):")
+		for _, k := range result.Dropped {
+			fmt.Fprintf(os.Stderr, "  - %s\n", k)
+		}
+	}
 }
 
 func newLogger(level string) *slog.Logger {

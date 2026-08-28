@@ -14,7 +14,7 @@ EMBED_CONFIG := config.json
 EMBED_MODELS := models.json
 
 .PHONY: all help build build-check build-summary config embed-ready check run once dry-run no-mutate \
-        install uninstall print-service \
+        install uninstall print-service migrate-config \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
 
 all: build
@@ -109,6 +109,13 @@ uninstall:
 ## print-service: print the embedded systemd unit without installing anything
 print-service: build
 	$(BINARY) --print-service
+
+## migrate-config: bring CONFIG up to the current config.json schema — keeps
+## every value you've already set, adds new fields at their default, and
+## reports (without failing on) any field the schema has since dropped. The
+## original is saved alongside it as CONFIG.bak before anything is written.
+migrate-config: build
+	$(BINARY) --config $(CONFIG) --migrate-config
 
 ## test: run the full test suite with the race detector
 test: embed-ready

@@ -6,7 +6,10 @@
       "roles": [
         "plan"
       ],
-      "priority": 1
+      "priority": 1,
+      "effort": {
+        "plan": "high"
+      }
     },
     {
       "id": "claude-sonnet-5",
@@ -15,16 +18,11 @@
         "plan",
         "implement"
       ],
-      "priority": 2
-    },
-    {
-      "id": "claude-haiku-4-5",
-      "alias": "haiku",
-      "roles": [
-        "triage",
-        "implement"
-      ],
-      "priority": 3
+      "priority": 2,
+      "effort": {
+        "plan": "high",
+        "implement": "medium"
+      }
     }
   ]
 }

@@ -16,11 +16,22 @@ import (
 	embedded "github.com/ableinc/coding-agent-loop"
 )
 
-// Roles a model may be used for.
+// Roles a model may be used for. These are the only two phases that ever run
+// Claude — see internal/orchestrator/phase.go — so no other role exists.
+// GitHub operations (reading issues, posting comments, opening PRs) run
+// through internal/gh directly and never touch the model at all.
 const (
-	RoleTriage    = "triage"
 	RolePlan      = "plan"
 	RoleImplement = "implement"
+)
+
+// Effort levels accepted by the Claude Code CLI's `--effort` flag.
+const (
+	EffortLow    = "low"
+	EffortMedium = "medium"
+	EffortHigh   = "high"
+	EffortXHigh  = "xhigh"
+	EffortMax    = "max"
 )
 
 // Model is one entry in models.json.
@@ -35,6 +46,21 @@ type Model struct {
 	Roles []string `json:"roles"`
 	// Priority orders the ladder, lowest first.
 	Priority int `json:"priority"`
+	// Effort maps a role this model serves to the `--effort` value to use for
+	// it (low, medium, high, xhigh, max). A role missing from the map runs
+	// without --effort, i.e. the CLI's own default.
+	Effort map[string]string `json:"effort,omitempty"`
+}
+
+// EffortFor returns the --effort value configured for role, or "" if none is
+// set, in which case the CLI's own default applies.
+func (m Model) EffortFor(role string) string {
+	for r, e := range m.Effort {
+		if strings.EqualFold(r, role) {
+			return e
+		}
+	}
+	return ""
 }
 
 // Ref is what gets passed to the CLI: the alias when set, else the ID.
@@ -107,10 +133,24 @@ func (r *Registry) Validate() error {
 		seen[m.ID] = true
 		for _, role := range m.Roles {
 			switch strings.ToLower(role) {
-			case RoleTriage, RolePlan, RoleImplement:
+			case RolePlan, RoleImplement:
 			default:
-				return fmt.Errorf("models[%d] (%s): unknown role %q (want %q, %q, or %q)",
-					i, m.ID, role, RoleTriage, RolePlan, RoleImplement)
+				return fmt.Errorf("models[%d] (%s): unknown role %q (want %q or %q)",
+					i, m.ID, role, RolePlan, RoleImplement)
+			}
+		}
+		for role, effort := range m.Effort {
+			switch strings.ToLower(role) {
+			case RolePlan, RoleImplement:
+			default:
+				return fmt.Errorf("models[%d] (%s): effort set for unknown role %q (want %q or %q)",
+					i, m.ID, role, RolePlan, RoleImplement)
+			}
+			switch strings.ToLower(effort) {
+			case EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax:
+			default:
+				return fmt.Errorf("models[%d] (%s): unknown effort %q for role %q (want %q, %q, %q, %q, or %q)",
+					i, m.ID, effort, role, EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax)
 			}
 		}
 	}
