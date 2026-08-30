@@ -160,7 +160,7 @@ type Snapshot struct {
 	Percent     float64   `json:"percent,omitempty"`
 	Enabled     bool      `json:"enabled"`
 	Note        string    `json:"note,omitempty"`
-	CooldownEnd time.Time `json:"cooldown_end,omitempty"`
+	CooldownEnd time.Time `json:"cooldown_end"`
 }
 
 // Gate evaluates and records gating state.

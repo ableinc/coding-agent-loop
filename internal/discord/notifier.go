@@ -115,9 +115,7 @@ func (n *Notifier) post(e embed) {
 		return
 	}
 
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
+	n.wg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), postTimeout)
 		defer cancel()
 
@@ -137,7 +135,7 @@ func (n *Notifier) post(e embed) {
 		if resp.StatusCode >= 300 {
 			n.log("discord: webhook returned %d", resp.StatusCode)
 		}
-	}()
+	})
 }
 
 // postRun sends e to the webhook after making sure it carries a clickable

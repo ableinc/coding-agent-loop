@@ -238,12 +238,10 @@ func (o *Orchestrator) tick(ctx context.Context) {
 		capacity--
 
 		cand := candidate{repo: repo, number: r.Number, title: r.Title, url: r.URL}
-		o.wg.Add(1)
-		go func() {
-			defer o.wg.Done()
+		o.wg.Go(func() {
 			defer o.releaseRepo(cand.repo)
 			o.work(ctx, cand)
-		}()
+		})
 	}
 }
 

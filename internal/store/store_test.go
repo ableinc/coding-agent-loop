@@ -75,7 +75,7 @@ func TestConcurrentClaimsElectOneWinner(t *testing.T) {
 		wins int
 	)
 	start := make(chan struct{})
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -286,7 +286,7 @@ func TestGetRunNotFound(t *testing.T) {
 
 func TestMigrationsAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		st, err := Open(path)
 		if err != nil {
 			t.Fatalf("open %d: %v", i, err)

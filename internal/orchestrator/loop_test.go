@@ -245,7 +245,7 @@ func TestTaskPromptHandlesEmptyBody(t *testing.T) {
 
 func TestTaskPromptTrimsLongDiscussions(t *testing.T) {
 	issue := gh.Issue{Number: 1, Title: "t", Body: "b"}
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		issue.Comments = append(issue.Comments, gh.Comment{Author: gh.User{Login: "u"}, Body: "comment"})
 	}
 	p := implementTaskPrompt("acme/widgets", issue, "")

@@ -91,21 +91,21 @@ type Run struct {
 	PRURL     string
 	Status    string
 	// Kind is RunKindIssue or RunKindPRComment.
-	Kind         string
-	StartedAt    time.Time
-	EndedAt      time.Time
-	CostUSD      float64
-	TokensIn     int64
-	TokensOut    int64
+	Kind      string
+	StartedAt time.Time
+	EndedAt   time.Time
+	CostUSD   float64
+	TokensIn  int64
+	TokensOut int64
 	// TokensCacheRead and TokensCacheWrite are the split-out subset of
 	// TokensIn that was cache traffic rather than fresh input. See issue #18.
 	TokensCacheRead  int64
 	TokensCacheWrite int64
 	NumTurns         int
-	SessionID    string
-	VerifyStatus string
-	Error        string
-	LogPath      string
+	SessionID        string
+	VerifyStatus     string
+	Error            string
+	LogPath          string
 }
 
 // Gate is a reason the loop is not claiming new work.

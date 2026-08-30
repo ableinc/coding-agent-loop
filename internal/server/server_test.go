@@ -526,7 +526,7 @@ func TestLoginThrottlesRepeatedFailures(t *testing.T) {
 	s, _, _ := withPassword(t, "hunter2")
 
 	var lastCode int
-	for i := 0; i < throttleMax+1; i++ {
+	for range throttleMax + 1 {
 		lastCode, _ = do(t, s, http.MethodPost, "/login", strings.NewReader(`{"password":"nope"}`))
 	}
 	if lastCode != http.StatusTooManyRequests {

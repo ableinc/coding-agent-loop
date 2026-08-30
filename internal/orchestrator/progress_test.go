@@ -31,7 +31,7 @@ func TestProgressHeartbeatIsRateLimited(t *testing.T) {
 	if first != 1 {
 		t.Fatalf("the first event past the interval should report, got %d lines:\n%s", first, buf.String())
 	}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		p.observe("assistant", assistantEvent(t, "Bash"))
 	}
 	if got := strings.Count(buf.String(), "claude still working"); got != 1 {

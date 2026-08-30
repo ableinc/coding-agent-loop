@@ -34,7 +34,7 @@ func mentionsAgent(body, handle string) bool {
 		return false
 	}
 	inFence := false
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			inFence = !inFence
@@ -238,12 +238,10 @@ func (o *Orchestrator) tickPRComments(ctx context.Context, capacity int) int {
 		capacity--
 
 		cand := candidate{repo: repo, number: r.Number, title: pr.Title, url: pr.URL}
-		o.wg.Add(1)
-		go func() {
-			defer o.wg.Done()
+		o.wg.Go(func() {
 			defer o.releaseRepo(cand.repo)
 			o.workPRComments(ctx, cand, pr, pending)
-		}()
+		})
 	}
 	return capacity
 }

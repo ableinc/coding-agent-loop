@@ -112,7 +112,7 @@ func TestPRCommentSystemPromptForbidsCreatingPRs(t *testing.T) {
 func TestPRCommentTaskPromptCapsCommentCount(t *testing.T) {
 	pr := gh.PullRequest{Number: 12, Title: "Add retry logic"}
 	var comments []gh.PRComment
-	for i := 0; i < maxPRCommentsInclu+5; i++ {
+	for i := range maxPRCommentsInclu + 5 {
 		comments = append(comments, gh.PRComment{Author: "alice", Body: strings.Repeat("x", 10) + " " + string(rune('a'+i))})
 	}
 	p := prCommentTaskPrompt("acme/widgets", pr, comments, nil)
@@ -174,7 +174,7 @@ func TestImplementTaskPromptStaysBounded(t *testing.T) {
 		Title:  "A moderately complex feature request",
 		Body:   strings.Repeat("This is the issue body. ", 1000), // ~24K chars
 	}
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		body := strings.Repeat("Some discussion text. ", 200) // ~4.6K chars
 		if i%2 == 0 {
 			body = markerFailure + "\n\n" + body
