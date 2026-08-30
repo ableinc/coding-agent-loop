@@ -137,6 +137,17 @@ function fmtTokens(value) {
   return String(n);
 }
 
+// Splits tokens_in into fresh input vs. cache traffic: on an agentic run the
+// whole conversation prefix is re-read from cache every turn, so the total
+// alone makes usage look far higher than what actually drove a rate limit.
+function fmtTokensBreakdown(run) {
+  const total = fmtTokens(run.TokensIn);
+  const cacheRead = Number(run.TokensCacheRead) || 0;
+  const cacheWrite = Number(run.TokensCacheWrite) || 0;
+  const fresh = Number(run.TokensIn) - cacheRead - cacheWrite;
+  return `${total} in (${fmtTokens(fresh)} new · ${fmtTokens(cacheWrite)} written · ${fmtTokens(cacheRead)} cached)`;
+}
+
 const STATUS_KIND = {
   pr_open: "ok",
   addressed: "ok",
@@ -646,7 +657,7 @@ function runsTableBody(runs) {
         td("Model", r.ModelID || "—"),
         td("Attempt", String(r.Attempt ?? "—")),
         td("Cost", fmtUSD(r.CostUSD)),
-        td("Tokens", `${fmtTokens(r.TokensIn)} in / ${fmtTokens(r.TokensOut)} out`),
+        td("Tokens", `${fmtTokensBreakdown(r)} / ${fmtTokens(r.TokensOut)} out`),
         td("Verify", r.VerifyStatus || "—"),
         td("Duration", fmtDuration(r.StartedAt, r.EndedAt)),
         td("PR", prCell),
@@ -682,7 +693,7 @@ async function renderRunDetail(id, silent) {
     ["Branch", run.Branch || "—"],
     ["Session", run.SessionID || "—"],
     ["Cost", fmtUSD(run.CostUSD)],
-    ["Tokens in", fmtTokens(run.TokensIn)],
+    ["Tokens in", fmtTokensBreakdown(run)],
     ["Tokens out", fmtTokens(run.TokensOut)],
     ["Turns", run.NumTurns],
     ["Verify", run.VerifyStatus || "—"],

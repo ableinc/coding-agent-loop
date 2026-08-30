@@ -97,7 +97,11 @@ type Run struct {
 	CostUSD      float64
 	TokensIn     int64
 	TokensOut    int64
-	NumTurns     int
+	// TokensCacheRead and TokensCacheWrite are the split-out subset of
+	// TokensIn that was cache traffic rather than fresh input. See issue #18.
+	TokensCacheRead  int64
+	TokensCacheWrite int64
+	NumTurns         int
 	SessionID    string
 	VerifyStatus string
 	Error        string
@@ -298,6 +302,12 @@ var migrations = []string{
 		PRIMARY KEY (comment_kind, comment_id)
 	);
 	CREATE INDEX IF NOT EXISTS pr_comment_tasks_pr ON pr_comment_tasks(repo, pr);`,
+
+	// Splits the cache-heavy portion out of tokens_in so the dashboard can show
+	// how much of a run's reported usage was fresh input versus cache traffic,
+	// which is billed at a fraction and is not what drives a rate limit.
+	`ALTER TABLE runs ADD COLUMN tokens_cache_read  INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -449,15 +459,29 @@ func (s *Store) SetRunStatus(ctx context.Context, runID, status string) error {
 	return nil
 }
 
+// RunUsage is what one Claude invocation cost, passed to RecordUsage.
+type RunUsage struct {
+	ModelID    string
+	SessionID  string
+	CostUSD    float64
+	TokensIn   int64
+	TokensOut  int64
+	CacheRead  int64
+	CacheWrite int64
+	Turns      int
+}
+
 // RecordUsage stores what one Claude invocation cost.
-func (s *Store) RecordUsage(ctx context.Context, runID, modelID, sessionID string, cost float64, in, out int64, turns int) error {
+func (s *Store) RecordUsage(ctx context.Context, runID string, u RunUsage) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET
 			model_id   = CASE WHEN ? <> '' THEN ? ELSE model_id END,
 			session_id = CASE WHEN ? <> '' THEN ? ELSE session_id END,
-			cost_usd = ?, tokens_in = ?, tokens_out = ?, num_turns = ?
+			cost_usd = ?, tokens_in = ?, tokens_out = ?,
+			tokens_cache_read = ?, tokens_cache_write = ?, num_turns = ?
 		WHERE id = ?`,
-		modelID, modelID, sessionID, sessionID, cost, in, out, turns, runID)
+		u.ModelID, u.ModelID, u.SessionID, u.SessionID, u.CostUSD, u.TokensIn, u.TokensOut,
+		u.CacheRead, u.CacheWrite, u.Turns, runID)
 	if err != nil {
 		return fmt.Errorf("record usage for run %s: %w", runID, err)
 	}
@@ -577,14 +601,14 @@ var errNoRows = errors.New("not found")
 var ErrNotFound = errNoRows
 
 const runColumns = `id, repo, issue, attempt, model_id, branch, pr_url, status, kind, created_at, started_at, ended_at,
-	cost_usd, tokens_in, tokens_out, num_turns, session_id, verify_status, error, log_path`
+	cost_usd, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, num_turns, session_id, verify_status, error, log_path`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var created, started, ended int64
 	err := sc.Scan(&r.ID, &r.Repo, &r.Issue, &r.Attempt, &r.ModelID, &r.Branch, &r.PRURL, &r.Status, &r.Kind,
-		&created, &started, &ended, &r.CostUSD, &r.TokensIn, &r.TokensOut, &r.NumTurns, &r.SessionID,
-		&r.VerifyStatus, &r.Error, &r.LogPath)
+		&created, &started, &ended, &r.CostUSD, &r.TokensIn, &r.TokensOut, &r.TokensCacheRead, &r.TokensCacheWrite,
+		&r.NumTurns, &r.SessionID, &r.VerifyStatus, &r.Error, &r.LogPath)
 	if err != nil {
 		return r, err
 	}
