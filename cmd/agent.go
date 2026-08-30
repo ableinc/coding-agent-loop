@@ -41,6 +41,7 @@ type flags struct {
 	checkOnly     bool
 	install       bool
 	uninstall     bool
+	purge         bool
 	printUnit     bool
 	migrateConfig bool
 }
@@ -61,7 +62,8 @@ Usage:
   coding-agent-loop --print-service      print the embedded systemd unit
   coding-agent-loop --migrate-config     bring config.json up to the current schema, in place
   sudo coding-agent-loop --install       install, enable, and start the systemd unit
-  sudo coding-agent-loop --uninstall     stop, disable, and remove everything --install created
+  sudo coding-agent-loop --uninstall     stop, disable, and remove the service only
+  sudo coding-agent-loop --uninstall --purge   also delete workspace/logs/state data
 
 See README.md for configuration (config.json, models.json) and the control API.
 
@@ -82,10 +84,16 @@ func main() {
 	flag.BoolVar(&f.noServer, "no-server", false, "do not start the control API")
 	flag.BoolVar(&f.checkOnly, "check", false, "run start-up checks and exit")
 	flag.BoolVar(&f.install, "install", false, "install the systemd unit (embedded in this binary), enable it, and start it; must run as root")
-	flag.BoolVar(&f.uninstall, "uninstall", false, "stop, disable, and remove the systemd unit, /opt/coding-agent-loop, and any ~/.agent-loop or dedicated service user --install created; must run as root")
+	flag.BoolVar(&f.uninstall, "uninstall", false, "stop, disable, and remove the systemd unit and /opt/coding-agent-loop; leaves data in place unless --purge is also given; must run as root")
+	flag.BoolVar(&f.purge, "purge", false, "with --uninstall: also delete the service's data — workspace.root, workspace.repos_root, workspace.logs_root, store.path, claude.usage_cache_path, and the dedicated service account's home. Without it, --uninstall removes only the service and leaves all data in place")
 	flag.BoolVar(&f.printUnit, "print-service", false, "print the systemd unit --install would write and exit")
 	flag.BoolVar(&f.migrateConfig, "migrate-config", false, "rewrite -config to the current config.json schema: keep every value already set, add new fields at their default, drop and report fields the schema no longer has; the original is saved as -config.bak first. Combine with -dry-run to preview on stdout instead of writing anything")
 	flag.Parse()
+
+	if err := validateFlags(f); err != nil {
+		fmt.Fprintf(os.Stderr, "coding-agent-loop: %v\n", err)
+		os.Exit(1)
+	}
 
 	if f.printUnit {
 		unit, err := install.PreviewUnit()
@@ -103,6 +111,15 @@ func main() {
 	}
 }
 
+// validateFlags rejects flag combinations that parse individually but make
+// no sense together.
+func validateFlags(f flags) error {
+	if f.purge && !f.uninstall {
+		return fmt.Errorf("--purge only applies to --uninstall (try: sudo coding-agent-loop --uninstall --purge)")
+	}
+	return nil
+}
+
 func run(f flags) error {
 	log := newLogger(f.logLevel)
 
@@ -115,6 +132,7 @@ func run(f flags) error {
 	if f.uninstall {
 		return install.Uninstall(install.UninstallOptions{
 			ConfigPath: f.configPath,
+			Purge:      f.purge,
 			Log:        func(format string, args ...any) { log.Info(format, args...) },
 		})
 	}
