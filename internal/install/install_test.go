@@ -293,6 +293,97 @@ func TestLoadStatePathsFallsBackToDefaultsWhenNeitherConfigExists(t *testing.T) 
 	}
 }
 
+func TestApplyStatePathsRemovesWhenPurging(t *testing.T) {
+	home := t.TempDir()
+	work := filepath.Join(home, ".agent-loop", "work")
+	logs := filepath.Join(home, ".agent-loop", "logs")
+	state := filepath.Join(home, ".agent-loop", "state.db")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(installed, []byte(`{"workspace":{"root":"`+work+`","logs_root":"`+logs+`"},"store":{"path":"`+state+`"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := setInstalledConfigPathForTest(installed)
+	defer restore()
+
+	applyStatePaths(home, "", true, func(string, ...any) {})
+
+	for _, p := range []string{work, logs, state} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed after purge, stat err = %v", p, err)
+		}
+	}
+}
+
+func TestApplyStatePathsKeepsDataWhenNotPurging(t *testing.T) {
+	home := t.TempDir()
+	work := filepath.Join(home, ".agent-loop", "work")
+	logs := filepath.Join(home, ".agent-loop", "logs")
+	state := filepath.Join(home, ".agent-loop", "state.db")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(installed, []byte(`{"workspace":{"root":"`+work+`","logs_root":"`+logs+`"},"store":{"path":"`+state+`"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := setInstalledConfigPathForTest(installed)
+	defer restore()
+
+	logged := false
+	applyStatePaths(home, "", false, func(string, ...any) { logged = true })
+
+	for _, p := range []string{work, logs, state} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("expected %s to survive a non-purge uninstall, stat err = %v", p, err)
+		}
+	}
+	if !logged {
+		t.Error("expected applyStatePaths to log the retained paths")
+	}
+}
+
+func TestApplyStatePathsHonoursConfiguredPaths(t *testing.T) {
+	dataRoot := t.TempDir()
+	customWork := filepath.Join(dataRoot, "custom-work")
+	customState := filepath.Join(dataRoot, "custom-state.db")
+	if err := os.MkdirAll(customWork, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(customState, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(installed, []byte(`{"workspace":{"root":"`+customWork+`"},"store":{"path":"`+customState+`"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := setInstalledConfigPathForTest(installed)
+	defer restore()
+
+	applyStatePaths(t.TempDir(), "", true, func(string, ...any) {})
+
+	if _, err := os.Stat(customWork); !os.IsNotExist(err) {
+		t.Errorf("expected configured workspace root %s to be removed, stat err = %v", customWork, err)
+	}
+	if _, err := os.Stat(customState); !os.IsNotExist(err) {
+		t.Errorf("expected configured store path %s to be removed, stat err = %v", customState, err)
+	}
+}
+
 // setInstalledConfigPathForTest overrides the package-level installedConfigPath
 // for the duration of a test and returns a func to restore it.
 func setInstalledConfigPathForTest(path string) func() {

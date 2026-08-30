@@ -149,7 +149,8 @@ All flags on the built binary (`bin/coding-agent-loop`, or via `make run` / `mak
 | `--no-server`     | off           | do not start the control API                                             |
 | `--check`         | off           | run start-up checks (binaries, auth, config) and exit                    |
 | `--install`       | off           | install + enable + start the systemd unit; **must run as root**          |
-| `--uninstall`     | off           | stop, disable, and remove everything `--install` created; **must run as root** |
+| `--uninstall`     | off           | stop, disable, and remove the systemd unit and `/opt/coding-agent-loop`; **leaves all data in place**; **must run as root** |
+| `--purge`         | off           | only with `--uninstall`: also delete the configured workspace/logs/state paths and the dedicated service account's home |
 | `--print-service` | off           | print the embedded systemd unit to stdout and exit; no privileges needed |
 | `--migrate-config` | off          | rewrite `--config` to the current `config.json` schema, in place; see [Migrating config.json](#migrating-configjson) |
 
@@ -863,31 +864,43 @@ sudo systemctl restart coding-agent-loop
 curl localhost:8787/status            # gate/run state (from the host, not the service user)
 ```
 
-To remove everything `--install` created:
+To remove the service `--install` created, leaving all data in place:
 
 ```sh
 sudo bin/coding-agent-loop --uninstall   # or: make uninstall
 ```
 
-`--uninstall` (root required) reverses every step of `--install`:
+To remove the service *and* its data:
+
+```sh
+sudo bin/coding-agent-loop --uninstall --purge   # or: make purge
+```
+
+`--uninstall` (root required) always does this much:
 
 1. stops and disables `coding-agent-loop.service` (fine if it wasn't running);
-2. reads `workspace.root`, `workspace.repos_root`, `workspace.logs_root`, `store.path`, and
+2. removes `/etc/systemd/system/coding-agent-loop.service` and runs `systemctl daemon-reload`;
+3. removes `/opt/coding-agent-loop` entirely (binary and config).
+
+Only with `--purge` does it also:
+
+4. read `workspace.root`, `workspace.repos_root`, `workspace.logs_root`, `store.path`, and
    `claude.usage_cache_path` from `/opt/coding-agent-loop/config.json` (the copy that actually drove
    the running service — falling back to whatever `--config` points at, default `config.json`, if
    that copy is already gone, then to the compiled defaults under `~/.agent-loop` if neither is
-   found) and removes exactly those directories/files, resolved against the account the service ran
+   found) and remove exactly those directories/files, resolved against the account the service ran
    as — **not** `claude.credentials_path`, which is Claude Code's own login and predates this app's
    install;
-3. removes `/etc/systemd/system/coding-agent-loop.service` and runs `systemctl daemon-reload`;
-4. removes `/opt/coding-agent-loop` entirely (binary and config);
 5. if `--install` ever fell back to creating the dedicated `coding-agent-loop` system user (no
-   `$SUDO_USER` at install time), removes that account and its entire home (`userdel -r`) — safe
-   because that account and home exist solely for this service, and a superset of step 2 for
+   `$SUDO_USER` at install time), remove that account and its entire home (`userdel -r`) — safe
+   because that account and home exist solely for this service, and a superset of step 4 for
    anything under it.
 
+Without `--purge`, the configured state paths and (if applicable) the dedicated account/home are
+left untouched, and `--uninstall` logs each path it left behind.
+
 If you moved `workspace.root`/`workspace.repos_root`/`workspace.logs_root`/`store.path`/
-`claude.usage_cache_path` to non-default locations, step 2 follows your config there too — it does
+`claude.usage_cache_path` to non-default locations, step 4 follows your config there too — it does
 not assume `~/.agent-loop`. Run `--uninstall` the same way you ran `--install` (`sudo` from your own
 account, or with the same `--config`) so it resolves the same account and config `--install` used.
 

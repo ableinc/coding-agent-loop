@@ -14,7 +14,7 @@ EMBED_CONFIG := config.json
 EMBED_MODELS := models.json
 
 .PHONY: all help build build-check build-summary config embed-ready check run once dry-run no-mutate \
-        install uninstall print-service migrate-config \
+        install uninstall purge print-service migrate-config \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean \
 				ssh-add
 
@@ -93,7 +93,7 @@ no-mutate: build
 install: build
 	sudo $(BINARY) --install --config $(CONFIG)
 
-## uninstall: stop, disable, and remove everything `make install` created (requires root)
+## uninstall: stop, disable, and remove the service; leaves data in place (requires root)
 # Deliberately does not depend on `build`: uninstalling must work even without
 # a config.json/models.json in place, since removing a broken install is
 # exactly when those might be missing or invalid. If a binary from a previous
@@ -106,6 +106,14 @@ uninstall:
 		go build -ldflags="-w -s" -o $(BINARY) ./cmd; \
 	fi
 	sudo $(BINARY) --uninstall
+
+## purge: destructive — stop, disable, remove the service, and delete its workspace/logs/state data (requires root)
+purge:
+	@if [ ! -x "$(BINARY)" ]; then \
+		echo "no existing $(BINARY); building one (requires $(EMBED_CONFIG) and $(EMBED_MODELS) at the repo root, since go:embed compiles them in)"; \
+		go build -ldflags="-w -s" -o $(BINARY) ./cmd; \
+	fi
+	sudo $(BINARY) --uninstall --purge
 
 ## print-service: print the embedded systemd unit without installing anything
 print-service: build

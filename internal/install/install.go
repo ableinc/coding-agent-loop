@@ -277,18 +277,27 @@ type UninstallOptions struct {
 	// ConfigPath is consulted for workspace/store paths only when
 	// installedConfigPath does not exist. Optional.
 	ConfigPath string
-	Log        func(format string, args ...any)
+	// Purge, when true, also deletes the service's data: the configured
+	// state paths (workspace.root, workspace.repos_root, workspace.logs_root,
+	// store.path, claude.usage_cache_path) and, if Run ever created it, the
+	// dedicated service account and its home. When false, --uninstall removes
+	// only the service and leaves all of that data in place.
+	Purge bool
+	Log   func(format string, args ...any)
 }
 
-// Uninstall reverses Run: stops and disables the unit, removes the unit file
-// and /opt/coding-agent-loop, and removes exactly the state directories and
-// files the operator's config.json told the service to use — workspace.root,
-// workspace.repos_root, workspace.logs_root, store.path, and
-// claude.usage_cache_path — resolved against the account the service ran as,
-// the same way Run resolves it. It never touches claude.credentials_path:
-// that file is Claude Code's own login, not something this app created, and
-// other tools may depend on it surviving. It must run as root, since it
-// touches /etc, /opt, and the service account's files.
+// Uninstall reverses the service-installing part of Run unconditionally:
+// stops and disables the unit, removes the unit file, and removes
+// /opt/coding-agent-loop. When opts.Purge is set, it additionally removes the
+// state directories and files the operator's config.json told the service to
+// use — workspace.root, workspace.repos_root, workspace.logs_root,
+// store.path, and claude.usage_cache_path — resolved against the account the
+// service ran as, the same way Run resolves it, and (if Run ever created it)
+// the dedicated service account and its home. It never touches
+// claude.credentials_path under either flag: that file is Claude Code's own
+// login, not something this app created, and other tools may depend on it
+// surviving. It must run as root, since it touches /etc, /opt, and the
+// service account's files.
 func Uninstall(opts UninstallOptions) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("--uninstall must run as root (try: sudo %s --uninstall)", os.Args[0])
@@ -309,7 +318,7 @@ func Uninstall(opts UninstallOptions) error {
 	if err != nil {
 		log("could not resolve the service account; skipping its state directories", "error", err.Error())
 	} else {
-		removeConfiguredStatePaths(t.home, opts.ConfigPath, log)
+		applyStatePaths(t.home, opts.ConfigPath, opts.Purge, log)
 	}
 
 	if _, err := os.Stat(unitPath); err == nil {
@@ -331,11 +340,16 @@ func Uninstall(opts UninstallOptions) error {
 
 	// The dedicated fallback user, if Run ever created one: its entire home
 	// exists solely for this service, so the account and home go together.
-	// This is a superset of removeConfiguredStatePaths above when state paths
-	// live under that home (the common case), and also mops up anything else
-	// under it.
+	// This is a superset of applyStatePaths above when state paths live under
+	// that home (the common case), and also mops up anything else under it.
+	// Only removed when purging: userdel without -r would orphan the home to
+	// a dangling uid, and a later --install would recreate the account with a
+	// possibly different uid, leaving any retained data unreadable.
 	if _, err := user.Lookup(dedicatedUser); err == nil {
-		if _, lookErr := exec.LookPath("userdel"); lookErr != nil {
+		if !opts.Purge {
+			log("leaving service account and home in place, re-run with --uninstall --purge to remove them",
+				"user", dedicatedUser, "home", dedicatedHome)
+		} else if _, lookErr := exec.LookPath("userdel"); lookErr != nil {
 			log("userdel not available; remove the service user and its home manually",
 				"user", dedicatedUser, "home", dedicatedHome)
 		} else {
@@ -426,15 +440,51 @@ func expandHome(p, home string) string {
 	return p
 }
 
-// removeConfiguredStatePaths removes exactly the directories/file the
-// service's own config told it to use, resolved against home.
-func removeConfiguredStatePaths(home, fallbackConfigPath string, log func(string, ...any)) {
+// resolvedStatePaths returns the directories and files the service was
+// configured to write, resolved against home.
+func resolvedStatePaths(home, fallbackConfigPath string, log func(string, ...any)) (dirs, files []string) {
 	paths := loadStatePaths(fallbackConfigPath, log)
-	removeDir(expandHome(paths.Workspace.Root, home), log)
-	removeDir(expandHome(paths.Workspace.ReposRoot, home), log)
-	removeDir(expandHome(paths.Workspace.LogsRoot, home), log)
-	removeFile(expandHome(paths.Store.Path, home), log)
-	removeFile(expandHome(paths.Claude.UsageCachePath, home), log)
+	dirs = []string{
+		expandHome(paths.Workspace.Root, home),
+		expandHome(paths.Workspace.ReposRoot, home),
+		expandHome(paths.Workspace.LogsRoot, home),
+	}
+	files = []string{
+		expandHome(paths.Store.Path, home),
+		expandHome(paths.Claude.UsageCachePath, home),
+	}
+	return dirs, files
+}
+
+// applyStatePaths removes the configured state directories/files when purge
+// is set. Otherwise it leaves them in place and logs exactly what was
+// retained and how to remove it later.
+func applyStatePaths(home, fallbackConfigPath string, purge bool, log func(string, ...any)) {
+	dirs, files := resolvedStatePaths(home, fallbackConfigPath, log)
+	if !purge {
+		for _, d := range dirs {
+			logRetainedPath(d, log)
+		}
+		for _, f := range files {
+			logRetainedPath(f, log)
+		}
+		return
+	}
+	for _, d := range dirs {
+		removeDir(d, log)
+	}
+	for _, f := range files {
+		removeFile(f, log)
+	}
+}
+
+// logRetainedPath logs a state path left in place by a non-purge uninstall,
+// if it actually exists.
+func logRetainedPath(path string, log func(string, ...any)) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	log("data retained, re-run with --uninstall --purge to delete this data", "path", path)
 }
 
 func removeDir(dir string, log func(string, ...any)) {
