@@ -310,7 +310,13 @@ built by one function apiece:
 
 `issueContext` (also in `prompt.go`) renders the shared issue-body/comment block all the task
 prompts embed, truncating at `maxBodyChars`/`maxCommentChars`/`maxCommentsInclu` so a very long
-issue thread can't blow the prompt out.
+issue thread can't blow the prompt out. It also drops the harness's own comments (the plan, the
+PR announcement, failure notes — anything carrying the `<!-- coding-agent-loop:...` marker) and
+bare `implement` approvals before that window is applied: none of it is information the model
+needs re-sent to itself on every turn, and on a retry the failure notes are pure noise. Only
+genuine human discussion survives the filter. `prCommentTaskPrompt` caps at `maxPRCommentsInclu`,
+`maxDiffHunkChars`, and `maxReviewsInclu` for the same reason on the PR-comment path. See issue
+#18.
 
 To change what the agent is told, edit the relevant function in `prompt.go` — `prompt_test.go`
 pins the exact wording of the harness rules (git/GitHub ownership, scope, autonomy), so a
@@ -325,6 +331,8 @@ result is parsed from a streamed JSONL transcript:
 
 ```sh
 claude --print --output-format stream-json --verbose --no-session-persistence \
+  --strict-mcp-config --disable-slash-commands \
+  --exclude-dynamic-system-prompt-sections --autocompact 200000 \
   --model <head of the role's models.json ladder> \
   --fallback-model <the rest of that ladder, comma-separated> \
   --effort <models.json "effort" for this model+role, if set> \
@@ -343,6 +351,18 @@ its fallbacks come from the priority-ordered `models.json` ladder for that phase
 one for the role, otherwise the CLI's own default applies. The terminal `type: "result"` event
 (tokens used, cost, which model actually served the run, stop reason) is what gets recorded against
 the run in SQLite.
+
+The four flags on the second line are unconditional, baked-in defaults with no config knob (see
+issue #18): the daemon shells out with the operator's own environment, so without them every run
+would inherit that operator's ambient MCP servers and skills into the system prompt on every
+single turn. `--strict-mcp-config` loads zero MCP servers (the harness only needs the built-in
+file/bash tools); `--disable-slash-commands` drops the skills listing, which the harness never
+invokes anyway; `--exclude-dynamic-system-prompt-sections` moves per-machine sections (cwd, env,
+git status) out of the cached system prompt and into the first user message, improving
+prompt-cache reuse; `--autocompact 200000` bounds how large the conversation grows before
+compaction, which is what caps the per-turn cache-read cost on a long run. An operator who needs
+MCP in agent runs can still add `--mcp-config <file>` to `claude.extra_args`, which
+`--strict-mcp-config` honours.
 
 ## Responding to PR comments
 

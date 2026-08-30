@@ -470,12 +470,12 @@ func runSystemctl(log func(string, ...any), args ...string) error {
 }
 
 func argsString(args []string) string {
-	s := ""
+	var s strings.Builder
 	for i, a := range args {
 		if i > 0 {
-			s += " "
+			s.WriteString(" ")
 		}
-		s += a
+		s.WriteString(a)
 	}
-	return s
+	return s.String()
 }

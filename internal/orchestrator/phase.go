@@ -135,11 +135,11 @@ func extractPlan(body string) string {
 	if !isPlanComment(body) {
 		return ""
 	}
-	i := strings.Index(body, planHeader)
-	if i < 0 {
+	_, after, ok := strings.Cut(body, planHeader)
+	if !ok {
 		return ""
 	}
-	plan := body[i+len(planHeader):]
+	plan := after
 
 	// The footer is matched from the end: a plan may well contain its own
 	// horizontal rule, and only the last one is the comment's own.

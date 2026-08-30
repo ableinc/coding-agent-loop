@@ -8,10 +8,24 @@ import (
 )
 
 // maxCommentChars bounds how much issue discussion goes into the prompt.
+// Kept tight because this is paid on every turn of every run: see issue #18.
 const (
-	maxBodyChars     = 12000
-	maxCommentChars  = 2000
-	maxCommentsInclu = 12
+	maxBodyChars     = 6000
+	maxCommentChars  = 1200
+	maxCommentsInclu = 6
+
+	// maxPlanChars bounds the approved/previous plan carried into a prompt.
+	// truncate appends truncationSuffix, and extractPlan deliberately refuses
+	// to recover a plan ending in it, so this only bites on a runaway plan —
+	// comfortably above any real one (~5K tokens).
+	maxPlanChars = 20000
+
+	// maxPRCommentsInclu, maxDiffHunkChars and maxReviewsInclu bound
+	// prCommentTaskPrompt, which otherwise renders every pending comment and
+	// review with no cap at all.
+	maxPRCommentsInclu = 10
+	maxDiffHunkChars   = 800
+	maxReviewsInclu    = 3
 )
 
 // systemPrompt states the rules of the harness. It is deliberately short and
@@ -151,6 +165,12 @@ func prCommentTaskPrompt(repo string, pr gh.PullRequest, comments []gh.PRComment
 	}
 
 	b.WriteString("### Comments to address\n\n")
+	// Keep the most recent comments: a big review pass can leave dozens
+	// pending, and the newest ones are the ones still relevant.
+	if len(comments) > maxPRCommentsInclu {
+		fmt.Fprintf(&b, "(showing the last %d of %d comments)\n\n", maxPRCommentsInclu, len(comments))
+		comments = comments[len(comments)-maxPRCommentsInclu:]
+	}
 	for _, c := range comments {
 		author := c.Author
 		if author == "" {
@@ -165,7 +185,7 @@ func prCommentTaskPrompt(repo string, pr gh.PullRequest, comments []gh.PRComment
 			b.WriteString(":\n\n")
 			if c.DiffHunk != "" {
 				b.WriteString("```diff\n")
-				b.WriteString(truncate(c.DiffHunk, maxCommentChars))
+				b.WriteString(truncate(c.DiffHunk, maxDiffHunkChars))
 				b.WriteString("\n```\n\n")
 			}
 		}
@@ -173,6 +193,9 @@ func prCommentTaskPrompt(repo string, pr gh.PullRequest, comments []gh.PRComment
 
 	if len(reviews) > 0 {
 		b.WriteString("### Review summaries (context only)\n\n")
+		if len(reviews) > maxReviewsInclu {
+			reviews = reviews[len(reviews)-maxReviewsInclu:]
+		}
 		for _, r := range reviews {
 			fmt.Fprintf(&b, "%s\n\n", truncate(strings.TrimSpace(r), maxCommentChars))
 		}
@@ -205,9 +228,21 @@ func issueContext(repo string, issue gh.Issue) string {
 	}
 	fmt.Fprintf(&b, "### Description\n\n%s\n", truncate(body, maxBodyChars))
 
-	if len(issue.Comments) > 0 {
+	// The model does not need its own prior narration read back to it: the
+	// plan, the PR announcement, and every failure comment the harness itself
+	// wrote carry no information the "Approved plan" section doesn't already
+	// state, and on a retry they are pure noise. Bare approvals ("implement")
+	// carry nothing beyond that either. See issue #18.
+	var comments []gh.Comment
+	for _, c := range issue.Comments {
+		if isAgentComment(c.Body) || isApproval(c.Body) {
+			continue
+		}
+		comments = append(comments, c)
+	}
+
+	if len(comments) > 0 {
 		b.WriteString("\n### Discussion\n\n")
-		comments := issue.Comments
 		// Keep the most recent discussion: that is where the requirements
 		// usually get refined.
 		if len(comments) > maxCommentsInclu {
@@ -241,7 +276,7 @@ func planTaskPrompt(repo string, issue gh.Issue, previousPlan string) string {
 
 	if previousPlan != "" {
 		b.WriteString("\n### Previous plan\n\n")
-		b.WriteString(previousPlan)
+		b.WriteString(truncate(previousPlan, maxPlanChars))
 		b.WriteString("\n\nA reviewer replied with feedback (see the newest comment in the discussion above) " +
 			"instead of approving this plan. Revise the plan to address it; keep whatever still holds.\n")
 	}
@@ -262,7 +297,7 @@ func implementTaskPrompt(repo string, issue gh.Issue, plan string) string {
 		b.WriteString("\n### Approved plan\n\n")
 		b.WriteString("A human reviewed and approved the following plan. Follow it; deviate only where it is " +
 			"demonstrably wrong, and say so in your final summary.\n\n")
-		b.WriteString(plan)
+		b.WriteString(truncate(plan, maxPlanChars))
 		b.WriteString("\n")
 	}
 

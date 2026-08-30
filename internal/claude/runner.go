@@ -123,6 +123,32 @@ func (r *Result) TokensOut() int64 {
 	return r.Usage.OutputTokens
 }
 
+// FreshTokensIn is the input tokens actually processed fresh, excluding all
+// cache traffic — the number that predicts rate-limit pressure.
+func (r *Result) FreshTokensIn() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.Usage.InputTokens
+}
+
+// CacheWriteTokens is the input tokens written into the prompt cache.
+func (r *Result) CacheWriteTokens() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.Usage.CacheCreationInputTokens
+}
+
+// CacheReadTokens is the input tokens served from the prompt cache, billed at
+// a fraction of fresh input and not what drives a rate limit.
+func (r *Result) CacheReadTokens() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.Usage.CacheReadInputTokens
+}
+
 // Options configures one headless invocation.
 type Options struct {
 	// Binary is the claude executable.
@@ -200,6 +226,14 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Result, error) {
 		"--output-format", "stream-json",
 		"--verbose", // required alongside stream-json in print mode
 		"--no-session-persistence",
+		// Keep the per-turn system prompt to what the harness actually needs:
+		// no ambient MCP servers, no skills listing, dynamic sections moved out
+		// of the cached prefix, and a hard cap on how large the conversation
+		// grows before compaction. See issue #18.
+		"--strict-mcp-config",
+		"--disable-slash-commands",
+		"--exclude-dynamic-system-prompt-sections",
+		"--autocompact", "200000",
 	}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)

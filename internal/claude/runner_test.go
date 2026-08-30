@@ -194,6 +194,42 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 	}
 }
 
+// The harness must never load the operator's ambient MCP servers, skills, or
+// an unbounded conversation into every turn's system prompt — see issue #18.
+func TestRunPassesTokenReductionFlags(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+for a in "$@"; do printf '%s\n' "$a" >> "$ARGS_FILE"; done
+echo '`+successResult+`'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	res, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+		Env: []string{"ARGS_FILE=" + argsFile},
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected a result")
+	}
+	got, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("stub did not record args: %v", err)
+	}
+	args := string(got)
+	for _, want := range []string{
+		"--strict-mcp-config",
+		"--disable-slash-commands",
+		"--exclude-dynamic-system-prompt-sections",
+		"--autocompact",
+		"200000",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("invocation should include %q, got: %s", want, args)
+		}
+	}
+}
+
 func TestLogPathRequired(t *testing.T) {
 	if _, err := (&Runner{}).Run(context.Background(), Options{Binary: "true"}); err == nil {
 		t.Fatal("LogPath must be required so every run leaves a transcript")

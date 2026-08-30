@@ -34,7 +34,7 @@ func mentionsAgent(body, handle string) bool {
 		return false
 	}
 	inFence := false
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			inFence = !inFence
@@ -238,12 +238,10 @@ func (o *Orchestrator) tickPRComments(ctx context.Context, capacity int) int {
 		capacity--
 
 		cand := candidate{repo: repo, number: r.Number, title: pr.Title, url: pr.URL}
-		o.wg.Add(1)
-		go func() {
-			defer o.wg.Done()
+		o.wg.Go(func() {
 			defer o.releaseRepo(cand.repo)
 			o.workPRComments(ctx, cand, pr, pending)
-		}()
+		})
 	}
 	return capacity
 }
@@ -382,7 +380,7 @@ func (o *Orchestrator) executePRComments(ctx context.Context, log *slog.Logger, 
 	if err != nil {
 		return fmt.Errorf("select model: %w", err)
 	}
-	if err := o.opts.Store.RecordUsage(ctx, runID, head.ID, "", 0, 0, 0, 0); err != nil {
+	if err := o.opts.Store.RecordUsage(ctx, runID, store.RunUsage{ModelID: head.ID}); err != nil {
 		log.Warn("could not pre-record model", "error", err)
 	}
 	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusWorking); err != nil {
@@ -432,8 +430,16 @@ func (o *Orchestrator) executePRComments(ctx context.Context, log *slog.Logger, 
 		if m := result.PrimaryModel(); m != "" {
 			usedModel = m
 		}
-		if err := o.opts.Store.RecordUsage(ctx, runID, usedModel, result.SessionID,
-			result.TotalCostUSD, result.TokensIn(), result.TokensOut(), result.NumTurns); err != nil {
+		if err := o.opts.Store.RecordUsage(ctx, runID, store.RunUsage{
+			ModelID:    usedModel,
+			SessionID:  result.SessionID,
+			CostUSD:    result.TotalCostUSD,
+			TokensIn:   result.TokensIn(),
+			TokensOut:  result.TokensOut(),
+			CacheRead:  result.CacheReadTokens(),
+			CacheWrite: result.CacheWriteTokens(),
+			Turns:      result.NumTurns,
+		}); err != nil {
 			log.Warn("usage record failed", "error", err)
 		}
 		o.recordSession(ctx, log, cand, runID, result.SessionID, usedModel)
@@ -476,7 +482,8 @@ func (o *Orchestrator) executePRComments(ctx context.Context, log *slog.Logger, 
 		log.Warn("could not clear usage gate", "error", err)
 	}
 	o.opts.Discord.GateCleared()
-	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f", result.NumTurns, result.TotalCostUSD))
+	o.event(ctx, runID, "claude_done", fmt.Sprintf("turns=%d cost=$%.4f fresh_in=%d cached_in=%d out=%d",
+		result.NumTurns, result.TotalCostUSD, result.FreshTokensIn(), result.CacheReadTokens(), result.TokensOut()))
 
 	hasWork, err := o.opts.Git.HasWork(ctx, worktree, pr.HeadRefName)
 	if err != nil {

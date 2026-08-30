@@ -115,9 +115,7 @@ func (n *Notifier) post(e embed) {
 		return
 	}
 
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
+	n.wg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), postTimeout)
 		defer cancel()
 
@@ -137,7 +135,7 @@ func (n *Notifier) post(e embed) {
 		if resp.StatusCode >= 300 {
 			n.log("discord: webhook returned %d", resp.StatusCode)
 		}
-	}()
+	})
 }
 
 // postRun sends e to the webhook after making sure it carries a clickable
@@ -266,7 +264,8 @@ func (n *Notifier) ClaudeFinished(r RunRef, res *claude.Result, elapsed time.Dur
 			embedField{Name: "Model", Value: orNone(res.PrimaryModel()), Inline: true},
 			embedField{Name: "Turns", Value: fmt.Sprintf("%d", res.NumTurns), Inline: true},
 			embedField{Name: "Cost", Value: money(res.TotalCostUSD), Inline: true},
-			embedField{Name: "Tokens", Value: fmt.Sprintf("%d in / %d out", res.TokensIn(), res.TokensOut()), Inline: true},
+			embedField{Name: "Tokens", Value: fmt.Sprintf("%d in (%d new · %d written · %d cached) / %d out",
+				res.TokensIn(), res.FreshTokensIn(), res.CacheWriteTokens(), res.CacheReadTokens(), res.TokensOut()), Inline: true},
 			embedField{Name: "Duration", Value: humanDuration(elapsed), Inline: true},
 			embedField{Name: "Session", Value: orNone(res.SessionID), Inline: true},
 		),

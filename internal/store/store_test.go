@@ -75,7 +75,7 @@ func TestConcurrentClaimsElectOneWinner(t *testing.T) {
 		wins int
 	)
 	start := make(chan struct{})
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -151,7 +151,10 @@ func TestRunLifecycleAndHistory(t *testing.T) {
 	if err := st.CreateRun(ctx, run); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	if err := st.RecordUsage(ctx, "r1", "claude-opus-5", "sess", 0.25, 1200, 300, 4); err != nil {
+	if err := st.RecordUsage(ctx, "r1", RunUsage{
+		ModelID: "claude-opus-5", SessionID: "sess", CostUSD: 0.25,
+		TokensIn: 1200, TokensOut: 300, CacheRead: 900, CacheWrite: 100, Turns: 4,
+	}); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	if err := st.SetVerifyStatus(ctx, "r1", VerifyPassed); err != nil {
@@ -168,7 +171,8 @@ func TestRunLifecycleAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if got.CostUSD != 0.25 || got.TokensIn != 1200 || got.ModelID != "claude-opus-5" {
+	if got.CostUSD != 0.25 || got.TokensIn != 1200 || got.ModelID != "claude-opus-5" ||
+		got.TokensCacheRead != 900 || got.TokensCacheWrite != 100 {
 		t.Fatalf("usage not persisted: %+v", got)
 	}
 	if got.Status != StatusPROpen || got.EndedAt.IsZero() {
@@ -282,7 +286,7 @@ func TestGetRunNotFound(t *testing.T) {
 
 func TestMigrationsAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		st, err := Open(path)
 		if err != nil {
 			t.Fatalf("open %d: %v", i, err)
@@ -441,7 +445,7 @@ func TestSessionsAreRecordedAndLookedUpByIssue(t *testing.T) {
 		t.Fatalf("run session id = %q", run.SessionID)
 	}
 	// A result event with no session must not wipe what is already known.
-	if err := st.RecordUsage(ctx, "r1", "claude-opus-5", "", 0.1, 10, 5, 2); err != nil {
+	if err := st.RecordUsage(ctx, "r1", RunUsage{ModelID: "claude-opus-5", CostUSD: 0.1, TokensIn: 10, TokensOut: 5, Turns: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if run, _ := st.GetRun(ctx, "r1"); run.SessionID != "sess-abc" {
@@ -658,6 +662,39 @@ func TestMigrationAddsKindAndPRCommentTasks(t *testing.T) {
 	tasks, err := st2.PRCommentTasks(ctx, "o/r", 2)
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("pr comment task not preserved across reopen: %+v, err=%v", tasks, err)
+	}
+}
+
+func TestMigrationAddsCacheTokenColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 1, Status: StatusClaimed, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordUsage(ctx, "r1", RunUsage{
+		ModelID: "claude-opus-5", CostUSD: 0.1, TokensIn: 1000, TokensOut: 50,
+		CacheRead: 900, CacheWrite: 80, Turns: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// Reopening re-runs migrate(), exercising it against an already-migrated
+	// database, which must be a no-op rather than an error.
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+
+	got, err := st2.GetRun(ctx, "r1")
+	if err != nil || got.TokensCacheRead != 900 || got.TokensCacheWrite != 80 {
+		t.Fatalf("cache token columns not preserved across reopen: %+v, err=%v", got, err)
 	}
 }
 
