@@ -15,7 +15,8 @@ EMBED_MODELS := models.json
 
 .PHONY: all help build build-check build-summary config embed-ready check run once dry-run no-mutate \
         install uninstall print-service migrate-config \
-        test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean
+        test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean \
+				ssh-add
 
 all: build
 
@@ -158,3 +159,7 @@ tidy:
 
 clean:
 	rm -rf bin coverage.out
+
+ssh-add:
+	eval "$(ssh-agent -s)"
+	ssh-add ~/.ssh/github
