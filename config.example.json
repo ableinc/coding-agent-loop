@@ -5,6 +5,7 @@
     "done_label": "agent-done",
     "failed_label": "agent-failed",
     "plan_label": "agent-planned",
+    "human_planned_label": "human-planned",
     "owners": [
       "your-gh-username"
     ],

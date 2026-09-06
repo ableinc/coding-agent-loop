@@ -279,3 +279,9 @@ func TestDefaultServerPasswordIsEmpty(t *testing.T) {
 		t.Fatalf("Default().Server.Password = %q, want empty (auth disabled by default)", got)
 	}
 }
+
+func TestDefaultHumanPlannedLabel(t *testing.T) {
+	if got := Default().GitHub.HumanPlannedLabel; got != "human-planned" {
+		t.Fatalf("Default().GitHub.HumanPlannedLabel = %q, want %q", got, "human-planned")
+	}
+}

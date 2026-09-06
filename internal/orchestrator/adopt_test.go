@@ -435,6 +435,80 @@ func TestARealFailureStillReportsItself(t *testing.T) {
 	}
 }
 
+// An issue carrying both the trigger label and human-planned should have its
+// body adopted as the plan verbatim, with no Claude run: the plan already
+// exists, written by a person, so there is nothing to draft.
+func TestHumanPlannedIssueAdoptsPlanFromTheIssueBody(t *testing.T) {
+	ctx := context.Background()
+	callLog := filepath.Join(t.TempDir(), "calls.txt")
+	const plan = "1. Do the thing. 2. Verify it works."
+
+	ghBin := stubGH(t, callLog, map[string]string{
+		"search issues": `[{"number":5,"title":"Change your commit name","url":"u",
+		  "repository":{"name":"widgets","nameWithOwner":"acme/widgets"},
+		  "labels":[{"name":"agent-ready"},{"name":"human-planned"}],"isPullRequest":false,"state":"open"}]`,
+		"issue view": `{"number":5,"title":"Change your commit name","body":"` + plan + `","url":"u",
+		  "state":"OPEN","labels":[{"name":"agent-ready"},{"name":"human-planned"}],"comments":[]}`,
+		"pr list": `[]`,
+	})
+
+	st := openTestStore(t)
+	if err := testOrchestrator(t, ghBin, st).RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := ghCalls(t, callLog)
+	if strings.Contains(calls, "pr create") {
+		t.Fatalf("adopting a human plan must never open a pull request:\n%s", calls)
+	}
+	if !strings.Contains(calls, "issue comment") {
+		t.Fatalf("the human plan should be posted back as a plan comment:\n%s", calls)
+	}
+	if !strings.Contains(calls, "--add-label agent-planned") {
+		t.Fatalf("the issue should be labelled planned:\n%s", calls)
+	}
+
+	stored, err := st.LatestPlan(ctx, "acme/widgets", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != plan {
+		t.Fatalf("LatestPlan() = %q, want the issue body %q", stored, plan)
+	}
+}
+
+// human-planned without a body is a misconfiguration, not a silent fallback
+// to Claude-drafted planning: it must fail loudly so it goes through the
+// normal failure path.
+func TestHumanPlannedIssueWithEmptyBodyFails(t *testing.T) {
+	ctx := context.Background()
+	callLog := filepath.Join(t.TempDir(), "calls.txt")
+
+	ghBin := stubGH(t, callLog, map[string]string{
+		"search issues": `[{"number":5,"title":"Change your commit name","url":"u",
+		  "repository":{"name":"widgets","nameWithOwner":"acme/widgets"},
+		  "labels":[{"name":"agent-ready"},{"name":"human-planned"}],"isPullRequest":false,"state":"open"}]`,
+		"issue view": `{"number":5,"title":"Change your commit name","body":"   ","url":"u",
+		  "state":"OPEN","labels":[{"name":"agent-ready"},{"name":"human-planned"}],"comments":[]}`,
+		"pr list": `[]`,
+	})
+
+	st := openTestStore(t)
+	if err := testOrchestrator(t, ghBin, st).RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := ghCalls(t, callLog)
+	if !strings.Contains(calls, "agent-failed") {
+		t.Fatalf("an empty human-planned body should be reported as a failure:\n%s", calls)
+	}
+	if plan, err := st.LatestPlan(ctx, "acme/widgets", 5); err != nil {
+		t.Fatal(err)
+	} else if plan != "" {
+		t.Fatalf("no plan should be saved for an empty body, got %q", plan)
+	}
+}
+
 // A dry run that quietly spends subscription usage and rewrites a worktree is
 // not a dry run. This pins the property that makes the flag worth having.
 func TestDryRunSpendsNothingAndTouchesNothing(t *testing.T) {

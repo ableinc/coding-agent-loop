@@ -65,6 +65,10 @@ type GitHubConfig struct {
 	FailedLabel  string `json:"failed_label"`
 	// PlanLabel marks an issue that has a plan comment awaiting human approval.
 	PlanLabel string `json:"plan_label"`
+	// HumanPlannedLabel, when present alongside Label, tells the daemon the
+	// issue body already contains a human-authored plan: skip the Claude
+	// planning run and adopt the issue body as the plan verbatim.
+	HumanPlannedLabel string `json:"human_planned_label"`
 	// Owners scopes discovery. Empty means "every repo the token can see",
 	// which is broad — prefer naming the orgs/users you actually want.
 	Owners []string `json:"owners"`
@@ -208,14 +212,15 @@ func Default() Config {
 	return Config{
 		ModelsPath: "models.json",
 		GitHub: GitHubConfig{
-			Label:        "agent-ready",
-			WorkingLabel: "agent-working",
-			DoneLabel:    "agent-done",
-			FailedLabel:  "agent-failed",
-			PlanLabel:    "agent-planned",
-			SearchLimit:  50,
-			PollInterval: Duration(5 * time.Minute),
-			Binary:       "gh",
+			Label:             "agent-ready",
+			WorkingLabel:      "agent-working",
+			DoneLabel:         "agent-done",
+			FailedLabel:       "agent-failed",
+			PlanLabel:         "agent-planned",
+			HumanPlannedLabel: "human-planned",
+			SearchLimit:       50,
+			PollInterval:      Duration(5 * time.Minute),
+			Binary:            "gh",
 			PRComments: PRCommentsConfig{
 				Enabled:             true,
 				Mention:             "@coding-agent",

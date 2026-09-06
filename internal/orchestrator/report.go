@@ -226,3 +226,19 @@ func planComment(plan, runID, modelID string, costUSD float64) string {
 	fmt.Fprintf(&b, "<sub>coding-agent-loop run `%s`, model `%s`, cost $%.4f</sub>\n", runID, modelID, costUSD)
 	return b.String()
 }
+
+// humanPlanComment mirrors planComment for a plan that was written by a human
+// in the issue body rather than drafted by Claude: same marker and structure,
+// so extractPlan/decidePhase treat it identically, but no model/cost line.
+func humanPlanComment(plan, runID string) string {
+	var b strings.Builder
+	b.WriteString(markerPlan)
+	b.WriteString("\n\n## Plan\n\n")
+	b.WriteString(truncate(strings.TrimSpace(plan), maxPlanCommentChars))
+	b.WriteString("\n\n---\n\n")
+	b.WriteString("This plan was written by a human in the issue body, not drafted by the agent. ")
+	b.WriteString("Reply with exactly `implement` to approve this plan and start the change. ")
+	b.WriteString("Reply with anything else and the plan will be revised to address it.\n\n")
+	fmt.Fprintf(&b, "<sub>coding-agent-loop run `%s`</sub>\n", runID)
+	return b.String()
+}
