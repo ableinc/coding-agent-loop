@@ -182,6 +182,11 @@ input:focus-visible {
   padding: 6px 8px;
 }
 
+.row-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .select {
   border: 1px solid var(--border);
   background: var(--surface);

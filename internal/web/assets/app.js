@@ -576,6 +576,48 @@ function inFlightTable(runs) {
 
 // --- Runs list -------------------------------------------------------------
 
+const IN_FLIGHT_STATUSES = ["claimed", "working", "verifying", "pushed"];
+
+// stopAndDeleteRun cancels a run first if it's still in flight (cancellation
+// is async, so this doesn't wait on it reaching a terminal status) then
+// deletes it and everything about it from the database and disk.
+async function stopAndDeleteRun(run) {
+  if (!window.confirm("Delete this run permanently? This cannot be undone.")) return false;
+  if (IN_FLIGHT_STATUSES.includes(run.Status)) {
+    await api.post(`/runs/${encodeURIComponent(run.ID)}/cancel`);
+  }
+  await api.post(`/runs/${encodeURIComponent(run.ID)}/delete`);
+  return true;
+}
+
+function runActionButtons(run, onDeleted) {
+  const actions = el("div", { class: "row-actions" });
+  if (IN_FLIGHT_STATUSES.includes(run.Status)) {
+    const stopBtn = el("button", { class: "btn", type: "button", text: "Stop" });
+    stopBtn.addEventListener("click", async () => {
+      stopBtn.disabled = true;
+      try {
+        await api.post(`/runs/${encodeURIComponent(run.ID)}/cancel`);
+        await refreshStatus();
+      } finally {
+        stopBtn.disabled = false;
+      }
+    });
+    actions.appendChild(stopBtn);
+  }
+  const deleteBtn = el("button", { class: "btn btn-danger", type: "button", text: "Delete" });
+  deleteBtn.addEventListener("click", async () => {
+    deleteBtn.disabled = true;
+    try {
+      if (await stopAndDeleteRun(run)) await onDeleted();
+    } finally {
+      deleteBtn.disabled = false;
+    }
+  });
+  actions.appendChild(deleteBtn);
+  return actions;
+}
+
 let runsFilters = { repo: "", limit: 50, status: "", kind: "" };
 
 async function renderRuns(silent) {
@@ -636,7 +678,9 @@ async function renderRuns(silent) {
       el(
         "tr",
         {},
-        ["Repo", "Status", "Kind", "Model", "Attempt", "Cost", "Tokens", "Verify", "Duration", "PR"].map((h) => el("th", { text: h }))
+        ["Repo", "Status", "Kind", "Model", "Attempt", "Cost", "Tokens", "Verify", "Duration", "PR", "Actions"].map((h) =>
+          el("th", { text: h })
+        )
       ),
     ]),
   ]);
@@ -661,6 +705,7 @@ function runsTableBody(runs) {
         td("Verify", r.VerifyStatus || "—"),
         td("Duration", fmtDuration(r.StartedAt, r.EndedAt)),
         td("PR", prCell),
+        td("Actions", runActionButtons(r, () => renderRuns(false))),
       ])
     );
   }
@@ -683,6 +728,11 @@ async function renderRunDetail(id, silent) {
   container.appendChild(el("a", { class: "back-link", href: "#/runs", text: "← Back to runs" }));
   container.appendChild(
     el("h1", {}, [document.createTextNode(`${run.Repo}#${run.Issue} `), statusBadge(run.Status)])
+  );
+  container.appendChild(
+    runActionButtons(run, async () => {
+      window.location.hash = "#/runs";
+    })
   );
 
   const fields = [
