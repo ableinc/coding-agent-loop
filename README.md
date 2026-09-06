@@ -263,7 +263,9 @@ with `pattern config.json: no matching files found` — every compiling `make` t
    and posted as an issue comment naming the files and approach it would take. The issue gets the
    `agent-planned` label and the run ends there — no commit, no verify, no push, no PR. Any human
    reply that isn't exactly `implement` triggers another plan pass that revises it against that
-   feedback.
+   feedback. An issue that also carries `github.human_planned_label` skips this Claude run entirely:
+   the issue body itself is adopted as the plan verbatim (no clone, no worktree), posted and saved
+   the same way, so the only thing a human still has to do is reply `implement`.
 5. **Run Claude** (once approved) — `claude -p --output-format stream-json --permission-mode
    bypassPermissions`, scoped to the worktree, with a system prompt that hands over the issue and the
    approved plan and forbids git/GitHub mutation. The lease is renewed periodically while the run is
@@ -416,6 +418,7 @@ This repository's own `config.json` is also **compiled into the binary** at buil
     "done_label": "agent-done",
     "failed_label": "agent-failed",
     "plan_label": "agent-planned",
+    "human_planned_label": "human-planned",
     "owners": ["ableinc"],
     "exclude_repos": [],
     "search_limit": 50,
@@ -487,6 +490,7 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `github.label`                                         | trigger label; **must not be empty**, or every open issue would match                                                              |
 | `github.working_label` / `done_label` / `failed_label` | status labels the daemon swaps `label` for                                                                                         |
 | `github.plan_label`                                    | label added while a posted plan awaits an `implement` reply, removed once the change is delivered                                  |
+| `github.human_planned_label`                           | when present alongside `label`, the issue body is adopted as the plan verbatim instead of running Claude to draft one              |
 | `github.owners`                                        | users/orgs to search; **required, must list at least one non-blank entry** — the daemon refuses to start otherwise, so it can never fall back to scanning every repo the `gh` token can see |
 | `github.exclude_repos`                                 | `owner/name` repos to never touch, even if labelled                                                                                |
 | `github.search_limit`                                  | max issues fetched per discovery pass                                                                                              |

@@ -58,3 +58,15 @@ func TestPRCommentFailureCommentCarriesMarkerAndReason(t *testing.T) {
 		t.Fatalf("failure reply should carry the run id:\n%s", body)
 	}
 }
+
+func TestHumanPlanCommentRoundTripsThroughExtractPlan(t *testing.T) {
+	plan := "1. Do the thing.\n2. Verify it works."
+	body := humanPlanComment(plan, "run-3")
+	if !strings.Contains(body, markerPlan) {
+		t.Fatalf("human plan comment must carry the plan marker:\n%s", body)
+	}
+	got := extractPlan(body)
+	if got != plan {
+		t.Fatalf("extractPlan(humanPlanComment(...)) = %q, want %q", got, plan)
+	}
+}

@@ -631,6 +631,10 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		return errSkip{phaseReason}
 	}
 
+	if phase == phasePlan && issue.HasLabel(cfg.GitHub.HumanPlannedLabel) {
+		return o.adoptHumanPlan(ctx, log, cand, runID, issue, ref)
+	}
+
 	meta, err := o.repoMetadata(ctx, cand.repo)
 	if err != nil {
 		return fmt.Errorf("repo metadata: %w", err)
@@ -958,6 +962,37 @@ func (o *Orchestrator) adoptPR(ctx context.Context, log *slog.Logger, cand candi
 	o.opts.Discord.PRAdopted(cand.ref(runID, attempt), pr.URL, pr.State)
 	// No cleanup: adoption happens before anything is cloned or checked out,
 	// so there is no worktree, and no clone for `git worktree prune` to run in.
+	return nil
+}
+
+// adoptHumanPlan handles an issue carrying both the trigger label and
+// HumanPlannedLabel: the plan already exists in the issue body, written by a
+// person, so the Claude planning run is skipped entirely and the body is
+// posted and saved the same way a Claude-drafted plan would be. Notably this
+// never clones the repo, creates a worktree, or invokes the runner.
+func (o *Orchestrator) adoptHumanPlan(ctx context.Context, log *slog.Logger, cand candidate, runID string, issue gh.Issue, ref discord.RunRef) error {
+	cfg := o.opts.Config
+	plan := strings.TrimSpace(issue.Body)
+	if plan == "" {
+		return fmt.Errorf("issue carries the %q label but has an empty body, so there is no plan to adopt",
+			cfg.GitHub.HumanPlannedLabel)
+	}
+
+	log.Info("adopting a human-authored plan from the issue body")
+
+	if err := o.opts.GH.Comment(ctx, cand.repo, cand.number, humanPlanComment(plan, runID)); err != nil {
+		return fmt.Errorf("post plan comment: %w", err)
+	}
+	if err := o.opts.Store.SavePlan(ctx, cand.repo, cand.number, runID, plan); err != nil {
+		log.Warn("could not save plan", "error", err)
+	}
+	o.setLabels(ctx, log, ref,
+		[]string{cfg.GitHub.PlanLabel}, []string{cfg.GitHub.WorkingLabel})
+	if err := o.opts.Store.SetRunStatus(ctx, runID, store.StatusPlanned); err != nil {
+		log.Warn("status update failed", "error", err)
+	}
+	o.event(ctx, runID, "human_planned", "adopted plan from issue body")
+	o.opts.Discord.PlanPosted(ref, nil, 0)
 	return nil
 }
 
