@@ -595,6 +595,41 @@ func (s *Store) FailRun(ctx context.Context, runID, status, msg string) error {
 	return nil
 }
 
+// DeleteRun permanently removes a run and every trace of it in the database:
+// its events, its sessions rows, and the runs row itself. There is no undo.
+// There are no declared foreign keys between runs, events, and sessions, so
+// the cleanup is done manually inside one transaction rather than relying on
+// cascade.
+func (s *Store) DeleteRun(ctx context.Context, runID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete run %s: %w", runID, err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("delete run %s events: %w", runID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("delete run %s sessions: %w", runID, err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE id = ?`, runID)
+	if err != nil {
+		return fmt.Errorf("delete run %s: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete run %s: %w", runID, err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete run %s: %w", runID, err)
+	}
+	return nil
+}
+
 var errNoRows = errors.New("not found")
 
 // ErrNotFound is returned when a lookup finds nothing.

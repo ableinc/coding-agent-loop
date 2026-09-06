@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -248,6 +249,63 @@ func TestCancelRunWithNoStoreRowStillSucceeds(t *testing.T) {
 	}
 	if body["cancelled"] != true {
 		t.Fatalf("unexpected body: %v", body)
+	}
+}
+
+func TestDeleteRun(t *testing.T) {
+	s, st, ctrl := testServer(t)
+	ctx := t.Context()
+
+	logPath := filepath.Join(t.TempDir(), "run-1.jsonl")
+	if err := os.WriteFile(logPath, []byte(`{"type":"result"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateRun(ctx, store.Run{
+		ID: "run-1", Repo: "acme/widgets", Issue: 42, Attempt: 1,
+		Status: store.StatusPROpen, StartedAt: time.Now(), LogPath: logPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := do(t, s, http.MethodPost, "/runs/run-1/delete", nil)
+	if code != http.StatusOK || body["deleted"] != true {
+		t.Fatalf("delete = %d %v", code, body)
+	}
+	if len(ctrl.cancelled) != 0 {
+		t.Fatalf("a terminal run should not be cancelled before deletion: %v", ctrl.cancelled)
+	}
+	if _, err := st.GetRun(ctx, "run-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("run should be gone from the store, got %v", err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("transcript should be removed, stat err = %v", err)
+	}
+
+	if code, _ := do(t, s, http.MethodPost, "/runs/nope/delete", nil); code != http.StatusNotFound {
+		t.Fatalf("deleting an unknown run should 404, got %d", code)
+	}
+}
+
+func TestDeleteRunStopsInFlightRunFirst(t *testing.T) {
+	s, st, ctrl := testServer(t)
+	ctx := t.Context()
+
+	if err := st.CreateRun(ctx, store.Run{
+		ID: "run-1", Repo: "acme/widgets", Issue: 42, Attempt: 1,
+		Status: store.StatusWorking, StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := do(t, s, http.MethodPost, "/runs/run-1/delete", nil)
+	if code != http.StatusOK || body["deleted"] != true {
+		t.Fatalf("delete = %d %v", code, body)
+	}
+	if len(ctrl.cancelled) != 1 || ctrl.cancelled[0] != "run-1" {
+		t.Fatalf("in-flight run should be cancelled before deletion: %v", ctrl.cancelled)
+	}
+	if _, err := st.GetRun(ctx, "run-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("run should be gone from the store, got %v", err)
 	}
 }
 

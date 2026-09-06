@@ -107,6 +107,7 @@ func (s *Server) routes() {
 	s.app.Post("/pause", s.pause)
 	s.app.Post("/resume", s.resume)
 	s.app.Post("/runs/:id/cancel", s.cancelRun)
+	s.app.Post("/runs/:id/delete", s.deleteRun)
 	s.app.Get("/config", s.getConfig)
 	s.app.Get("/models", s.getModels)
 	s.app.Post("/poll", s.pollNow)
@@ -418,6 +419,37 @@ func (s *Server) cancelRun(c fiber.Ctx) error {
 	// carries the repo, issue, and attempt that this handler does not know.
 	s.log.Info("run cancelled by operator", "run", id)
 	return c.JSON(fiber.Map{"cancelled": true, "run": id})
+}
+
+// deleteRun permanently removes a run and every trace of it: its DB rows and
+// its on-disk transcript. If the run is still in flight, it is cancelled
+// first — cancellation is asynchronous, so the delete proceeds regardless of
+// whether the run has actually reached a terminal state yet.
+func (s *Server) deleteRun(c fiber.Ctx) error {
+	id := fiber.Params(c, "id", "")
+	run, err := s.store.GetRun(c.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		return s.fail(c, http.StatusNotFound, errors.New("no such run"))
+	}
+	if err != nil {
+		return s.fail(c, http.StatusInternalServerError, err)
+	}
+
+	if !store.IsTerminal(run.Status) && s.ctrl != nil {
+		s.ctrl.Cancel(id)
+	}
+
+	if err := s.store.DeleteRun(c.Context(), id); err != nil {
+		return s.fail(c, http.StatusInternalServerError, err)
+	}
+	if run.LogPath != "" {
+		if err := os.Remove(run.LogPath); err != nil && !os.IsNotExist(err) {
+			s.log.Warn("failed to remove run transcript", "run", id, "path", run.LogPath, "error", err)
+		}
+	}
+
+	s.log.Info("run deleted by operator", "run", id)
+	return c.JSON(fiber.Map{"deleted": true, "run": id})
 }
 
 // getConfig returns the daemon's configuration for the web console, with the

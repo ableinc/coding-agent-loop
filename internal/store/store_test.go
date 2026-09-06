@@ -284,6 +284,49 @@ func TestGetRunNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteRun(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+
+	if err := st.CreateRun(ctx, Run{ID: "r1", Repo: "o/r", Issue: 1, Status: StatusPROpen, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendEvent(ctx, "r1", "claimed", "attempt 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordSession(ctx, Session{SessionID: "sess-1", RunID: "r1", Repo: "o/r", Issue: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.DeleteRun(ctx, "r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.GetRun(ctx, "r1"); err != ErrNotFound {
+		t.Fatalf("run should be gone, got %v", err)
+	}
+	events, err := st.ListEvents(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events should be gone, got %+v", events)
+	}
+	sessions, err := st.ListSessions(ctx, "o/r", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("sessions should be gone, got %+v", sessions)
+	}
+}
+
+func TestDeleteRunNotFound(t *testing.T) {
+	if err := testStore(t).DeleteRun(context.Background(), "nope"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
 func TestMigrationsAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	for i := range 3 {
