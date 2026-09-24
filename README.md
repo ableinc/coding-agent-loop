@@ -874,7 +874,8 @@ Common operations once installed:
 ```sh
 sudo systemctl status coding-agent-loop      # is it running
 journalctl -u coding-agent-loop -f           # tail logs
-sudo systemctl stop coding-agent-loop        # drains in-flight work, then stops
+sudo systemctl stop coding-agent-loop        # drains in-flight work, then stops (or: make stop-service)
+sudo systemctl start coding-agent-loop       # (or: make start-service)
 sudo systemctl restart coding-agent-loop
 curl localhost:8787/status            # gate/run state (from the host, not the service user)
 ```

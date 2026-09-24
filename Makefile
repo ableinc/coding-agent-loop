@@ -3,6 +3,7 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './vendor/*')
 CONFIG  ?= config.json
 MODELS  ?= models.json
+SERVICE := coding-agent-loop.service
 
 # EMBED_CONFIG/EMBED_MODELS name the exact files go:embed compiles into the
 # binary (embedded.go at the repo root can only embed "config.json" and
@@ -14,7 +15,7 @@ EMBED_CONFIG := config.json
 EMBED_MODELS := models.json
 
 .PHONY: all help build build-check build-summary config embed-ready check run once dry-run no-mutate \
-        install uninstall purge print-service migrate-config \
+        install uninstall purge start-service stop-service print-service migrate-config \
         test coverage vet fmt fmt-check lint staticcheck vulcheck ci tidy clean \
 				ssh-add
 
@@ -114,6 +115,15 @@ purge:
 		go build -ldflags="-w -s" -o $(BINARY) ./cmd; \
 	fi
 	sudo $(BINARY) --uninstall --purge
+
+## stop-service: stop the running service; it stays enabled, so it still starts on boot (requires root)
+stop-service:
+	sudo systemctl stop $(SERVICE)
+
+## start-service: start the stopped service again (requires root)
+start-service:
+	sudo systemctl start $(SERVICE)
+	@systemctl is-active --quiet $(SERVICE) && echo "$(SERVICE) is running" || { echo "$(SERVICE) failed to start; see: journalctl -u $(SERVICE) -n 50"; exit 1; }
 
 ## print-service: print the embedded systemd unit without installing anything
 print-service: build
