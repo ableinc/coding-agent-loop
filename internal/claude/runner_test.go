@@ -230,6 +230,50 @@ echo '`+successResult+`'
 	}
 }
 
+func TestRunPassesToolsAndMaxTurns(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+for a in "$@"; do printf '%s\n' "$a" >> "$ARGS_FILE"; done
+echo '`+successResult+`'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	if _, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+		Env:   []string{"ARGS_FILE=" + argsFile},
+		Tools: []string{"Read", "Grep", "Glob"}, MaxTurns: 40,
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("stub did not record args: %v", err)
+	}
+	if args := string(got); !strings.Contains(args, "--tools\nRead,Grep,Glob\n") || !strings.Contains(args, "--max-turns\n40\n") {
+		t.Fatalf("want --tools Read,Grep,Glob and --max-turns 40, got: %s", args)
+	}
+}
+
+// Zero values leave the CLI's defaults alone: all tools, no turn cap.
+func TestRunOmitsToolsAndMaxTurnsWhenUnset(t *testing.T) {
+	bin := stubCLI(t, `cat > /dev/null
+for a in "$@"; do printf '%s\n' "$a" >> "$ARGS_FILE"; done
+echo '`+successResult+`'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	if _, err := (&Runner{}).Run(context.Background(), Options{
+		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
+		Env: []string{"ARGS_FILE=" + argsFile},
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("stub did not record args: %v", err)
+	}
+	if args := string(got); strings.Contains(args, "--tools") || strings.Contains(args, "--max-turns") {
+		t.Fatalf("unset Tools/MaxTurns must not reach the CLI, got: %s", args)
+	}
+}
+
 func TestLogPathRequired(t *testing.T) {
 	if _, err := (&Runner{}).Run(context.Background(), Options{Binary: "true"}); err == nil {
 		t.Fatal("LogPath must be required so every run leaves a transcript")

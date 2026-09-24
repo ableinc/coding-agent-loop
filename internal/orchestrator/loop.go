@@ -35,6 +35,12 @@ import (
 // modelCooldown is how long a model is sidelined after it fails a run.
 const modelCooldown = 30 * time.Minute
 
+// planTools is the only tool set a planning run gets: read and search. No
+// Agent tool, so it cannot fan out into subagents that each re-read the
+// repository from a cold start, and no Edit/Write/Bash, so it stays read-only
+// whatever claude.plan_permission_mode says.
+var planTools = []string{"Read", "Grep", "Glob"}
+
 // Options are the orchestrator's dependencies.
 type Options struct {
 	Config   config.Config
@@ -679,11 +685,15 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 	log.Info("starting claude", "phase", phase, "model", head.ID, "branch", branch, "attempt", attempt)
 
 	var prompt, sysPrompt, permissionMode string
+	var tools []string
+	maxTurns := cfg.Claude.MaxTurns
 	plan := o.approvedPlan(ctx, log, cand, runID, issue)
 	if phase == phasePlan {
 		prompt = planTaskPrompt(cand.repo, issue, plan)
 		sysPrompt = planSystemPrompt(cand.repo, worktree)
 		permissionMode = cfg.Claude.PlanPermissionMode
+		tools = planTools
+		maxTurns = cfg.Claude.PlanMaxTurns
 	} else {
 		if strings.TrimSpace(plan) == "" {
 			log.Warn("no approved plan could be found, implementing from the issue alone")
@@ -707,6 +717,8 @@ func (o *Orchestrator) execute(ctx context.Context, log *slog.Logger, cand candi
 		Fallbacks:      fallbacks,
 		Effort:         head.EffortFor(phase),
 		PermissionMode: permissionMode,
+		Tools:          tools,
+		MaxTurns:       maxTurns,
 		WorkDir:        worktree,
 		Env:            o.opts.Git.IdentityEnv(),
 		ExtraArgs:      cfg.Claude.ExtraArgs,

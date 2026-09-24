@@ -258,8 +258,8 @@ with `pattern config.json: no matching files found` — every compiling `make` t
    `git worktree` is added under `workspace.root` on a fresh `agent/issue-<n>` branch off the
    default branch. Both the plan and implement phases get this same worktree; the plan phase just
    never writes to it.
-4. **Plan** (skipped once approved) — `claude -p --permission-mode plan` (`claude.plan_permission_mode`)
-   is handed the issue and told to produce a plan, not a change. Its final message is saved to SQLite
+4. **Plan** (skipped once approved) — `claude -p --permission-mode dontAsk --tools Read,Grep,Glob
+   --max-turns 40` (`claude.plan_permission_mode`, `claude.plan_max_turns`) is handed the issue and told to produce a plan, not a change. Its final message is saved to SQLite
    and posted as an issue comment naming the files and approach it would take. The issue gets the
    `agent-planned` label and the run ends there — no commit, no verify, no push, no PR. Any human
    reply that isn't exactly `implement` triggers another plan pass that revises it against that
@@ -339,7 +339,9 @@ claude --print --output-format stream-json --verbose --no-session-persistence \
   --model <head of the role's models.json ladder> \
   --fallback-model <the rest of that ladder, comma-separated> \
   --effort <models.json "effort" for this model+role, if set> \
-  --permission-mode <plan | claude.permission_mode> \
+  --permission-mode <claude.plan_permission_mode | claude.permission_mode> \
+  --tools <Read,Grep,Glob on plan runs; omitted otherwise> \
+  --max-turns <claude.plan_max_turns | claude.max_turns, omitted when 0> \
   --append-system-prompt <one of the prompts above> \
   --add-dir <the worktree>
   # + claude.extra_args, appended verbatim
@@ -366,6 +368,17 @@ prompt-cache reuse; `--autocompact 200000` bounds how large the conversation gro
 compaction, which is what caps the per-turn cache-read cost on a long run. An operator who needs
 MCP in agent runs can still add `--mcp-config <file>` to `claude.extra_args`, which
 `--strict-mcp-config` honours.
+
+Plan runs are deliberately **not** run in the CLI's own plan mode (`--permission-mode plan`). Plan
+mode layers its own workflow on top of the harness's prompt — fan out into parallel Explore
+subagents, then a Plan subagent, then write a plan file and call `ExitPlanMode` — and every one of
+those subagents starts cold and re-reads the repository, so a single plan cost several full
+explorations. Instead a plan run gets `--tools Read,Grep,Glob` (hardcoded as `planTools` in
+`internal/orchestrator/loop.go`): no `Agent` tool, so no subagents, and no `Edit`/`Write`/`Bash`,
+so it is read-only whatever `claude.plan_permission_mode` says. `claude.plan_max_turns` (default
+40) caps how long it may explore; `claude.max_turns` (default 0, uncapped) does the same for
+implement and PR-comment runs. A run that hits its cap fails like any other failed run — failure
+comment, back-off, one rung down the ladder — and the failure names the CLI's `error_max_turns`.
 
 ## Responding to PR comments
 
@@ -453,7 +466,9 @@ This repository's own `config.json` is also **compiled into the binary** at buil
   "claude": {
     "binary": "claude",
     "permission_mode": "bypassPermissions",
-    "plan_permission_mode": "plan",
+    "plan_permission_mode": "dontAsk",
+    "max_turns": 0,
+    "plan_max_turns": 40,
     "extra_args": [],
     "usage_poll_interval": "15m",
     "usage_backoff": "15m",
@@ -514,7 +529,9 @@ This repository's own `config.json` is also **compiled into the binary** at buil
 | `run.verify_timeout`                                   | wall-clock limit for the test command                                                                                              |
 | `claude.binary`                                        | executable name/path for the Claude Code CLI                                                                                       |
 | `claude.permission_mode`                               | passed through as `--permission-mode` for the implement run                                                                        |
-| `claude.plan_permission_mode`                          | passed through as `--permission-mode` for the read-only planning run                                                               |
+| `claude.plan_permission_mode`                          | passed through as `--permission-mode` for the read-only planning run; default `dontAsk` — don't use `plan`, which spawns subagents (see [How Claude Code is invoked](#how-claude-code-is-invoked)) |
+| `claude.max_turns`                                     | `--max-turns` for implement and PR-comment runs; `0` (the default) means no cap                                                    |
+| `claude.plan_max_turns`                                | `--max-turns` for planning runs; default `40`, `0` means no cap                                                                    |
 | `claude.usage_poll_interval` / `usage_backoff`         | advisory OAuth usage poll cadence and 429 backoff; **must be ≥ 1m**                                                                |
 | `claude.credentials_path`                              | where the CLI's OAuth token lives, read for the advisory usage snapshot                                                            |
 | `verify.auto_detect`                                   | try `Makefile` → `go.mod` → `package.json` → `Cargo.toml` → `pyproject.toml`, in that order                                        |
@@ -557,24 +574,18 @@ hardcoded in Go — this file is the only place to update one.
 {
   "models": [
     {
-      "id": "claude-opus-5",
-      "alias": "opus",
-      "roles": ["plan"],
+      "id": "claude-opus-5-5",
+      "alias": "claude-opus-5-5",
+      "roles": ["plan", "implement"],
       "priority": 1,
-      "effort": { "plan": "high" }
+      "effort": { "plan": "medium", "implement": "medium" }
     },
     {
       "id": "claude-sonnet-5",
       "alias": "sonnet",
       "roles": ["plan", "implement"],
       "priority": 2,
-      "effort": { "plan": "high", "implement": "medium" }
-    },
-    {
-      "id": "claude-haiku-4-5",
-      "alias": "haiku",
-      "roles": ["implement"],
-      "priority": 3
+      "effort": { "plan": "medium", "implement": "medium" }
     }
   ]
 }

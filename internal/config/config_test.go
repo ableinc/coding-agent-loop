@@ -285,3 +285,39 @@ func TestDefaultHumanPlannedLabel(t *testing.T) {
 		t.Fatalf("Default().GitHub.HumanPlannedLabel = %q, want %q", got, "human-planned")
 	}
 }
+
+// Planning must not run in the CLI's plan mode, which fans out into subagents
+// that each re-read the repository, and must be turn-capped by default.
+func TestPlanRunDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Claude.PlanPermissionMode == "plan" {
+		t.Fatal("plan_permission_mode must not default to plan mode")
+	}
+	if cfg.Claude.PlanMaxTurns <= 0 {
+		t.Fatalf("plan_max_turns should default to a cap, got %d", cfg.Claude.PlanMaxTurns)
+	}
+	if cfg.Claude.MaxTurns != 0 {
+		t.Fatalf("max_turns should default to uncapped, got %d", cfg.Claude.MaxTurns)
+	}
+}
+
+func TestMaxTurnsOverlayFromConfig(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"github":{"owners":["acme"]},"claude":{"max_turns":120,"plan_max_turns":25}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Claude.MaxTurns != 120 || cfg.Claude.PlanMaxTurns != 25 {
+		t.Fatalf("max_turns=%d plan_max_turns=%d", cfg.Claude.MaxTurns, cfg.Claude.PlanMaxTurns)
+	}
+}
+
+func TestNegativeMaxTurnsIsRejected(t *testing.T) {
+	for _, body := range []string{
+		`{"github":{"owners":["acme"]},"claude":{"max_turns":-1}}`,
+		`{"github":{"owners":["acme"]},"claude":{"plan_max_turns":-1}}`,
+	} {
+		if _, err := Load(writeConfig(t, body), false); err == nil || !strings.Contains(err.Error(), "max_turns") {
+			t.Fatalf("want a max_turns validation error for %s, got %v", body, err)
+		}
+	}
+}

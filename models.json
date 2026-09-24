@@ -1,14 +1,16 @@
 {
   "models": [
     {
-      "id": "claude-opus-5",
-      "alias": "opus",
+      "id": "claude-opus-5-5",
+      "alias": "claude-opus-5-5",
       "roles": [
-        "plan"
+        "plan",
+        "implement"
       ],
       "priority": 1,
       "effort": {
-        "plan": "high"
+        "plan": "medium",
+        "implement": "medium"
       }
     },
     {
@@ -20,7 +22,7 @@
       ],
       "priority": 2,
       "effort": {
-        "plan": "high",
+        "plan": "medium",
         "implement": "medium"
       }
     }

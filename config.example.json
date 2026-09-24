@@ -46,7 +46,9 @@
   "claude": {
     "binary": "claude",
     "permission_mode": "bypassPermissions",
-    "plan_permission_mode": "plan",
+    "plan_permission_mode": "dontAsk",
+    "max_turns": 0,
+    "plan_max_turns": 40,
     "extra_args": [],
     "usage_poll_interval": "10m",
     "usage_backoff": "10m",

@@ -147,8 +147,15 @@ type ClaudeConfig struct {
 	PermissionMode string   `json:"permission_mode"`
 	ExtraArgs      []string `json:"extra_args"`
 	// PlanPermissionMode governs the read-only planning run, distinct from the
-	// implement run's PermissionMode.
+	// implement run's PermissionMode. Not "plan": the CLI's plan mode fans out
+	// into Explore/Plan subagents that each re-read the repository, which
+	// multiplied the cost of a single plan several times over.
 	PlanPermissionMode string `json:"plan_permission_mode"`
+	// MaxTurns caps the implement and PR-comment runs (`--max-turns`);
+	// PlanMaxTurns caps the planning run. 0 means no cap. A run that hits its
+	// cap fails and is retried like any other failure.
+	MaxTurns     int `json:"max_turns"`
+	PlanMaxTurns int `json:"plan_max_turns"`
 	// UsagePollInterval throttles the OAuth usage endpoint, which rate-limits
 	// hard. Do not lower this below a few minutes.
 	UsagePollInterval Duration `json:"usage_poll_interval"`
@@ -249,7 +256,8 @@ func Default() Config {
 		Claude: ClaudeConfig{
 			Binary:             "claude",
 			PermissionMode:     "bypassPermissions",
-			PlanPermissionMode: "plan",
+			PlanPermissionMode: "dontAsk",
+			PlanMaxTurns:       40,
 			UsagePollInterval:  Duration(15 * time.Minute),
 			UsageBackoff:       Duration(15 * time.Minute),
 			CredentialsPath:    "~/.claude/.credentials.json",
@@ -348,6 +356,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Claude.UsagePollInterval.D() < time.Minute {
 		return fmt.Errorf("claude.usage_poll_interval must be >= 1m: the usage endpoint rate-limits aggressively")
+	}
+	if c.Claude.MaxTurns < 0 {
+		return fmt.Errorf("claude.max_turns must be >= 0 (0 means no cap), got %d", c.Claude.MaxTurns)
+	}
+	if c.Claude.PlanMaxTurns < 0 {
+		return fmt.Errorf("claude.plan_max_turns must be >= 0 (0 means no cap), got %d", c.Claude.PlanMaxTurns)
 	}
 	if c.Store.Path == "" {
 		return fmt.Errorf("store.path must be set")
