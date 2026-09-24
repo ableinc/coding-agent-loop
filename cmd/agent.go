@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -248,6 +249,10 @@ func run(f flags) error {
 		RetryBackoff:       cfg.Run.RetryBackoff.D(),
 		RetryBackoffMax:    cfg.Run.RetryBackoffMax.D(),
 		DryRun:             suppressMutations,
+		Models:             registry.Models,
+		PlanLadder:         registry.Ladder(models.RolePlan, nil),
+		ImplementLadder:    registry.Ladder(models.RoleImplement, nil),
+		ModelsSource:       modelsSource(modelsPath, allowModelsFallback),
 	})
 
 	errCh := make(chan error, 2)
@@ -277,6 +282,16 @@ func run(f flags) error {
 	notifier.Close(3 * time.Second)
 
 	return err
+}
+
+// modelsSource says where the model registry was loaded from, mirroring
+// models.Load: a default models_path with no file next to the binary falls
+// back to the copy compiled into the binary.
+func modelsSource(path string, allowEmbeddedFallback bool) string {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) && allowEmbeddedFallback {
+		return "models.json embedded in the binary"
+	}
+	return path
 }
 
 // execDir returns the directory containing the running binary — resolved

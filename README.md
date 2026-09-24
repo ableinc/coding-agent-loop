@@ -777,7 +777,10 @@ would otherwise show only its plain-text `owner/name#42`:
 - **Usage gate** — closes (with reason and until-when) and clears.
 - **Pause / resume** — whenever `POST /pause` or `POST /resume` is called.
 - **Daemon start / stop** — startup states the trigger label, owners, poll interval, concurrency,
-  retry back-off, and whether it is a dry run; shutdown says graceful or crash. (Skipped for
+  retry back-off, and whether it is a dry run, plus every model `models.json` defines (with its
+  priority and roles), which file it was loaded from — one next to the binary, or the copy
+  embedded in it — and the priority-ordered plan and implement ladders with each rung's effort;
+  shutdown says graceful or crash. (Skipped for
   `--once` passes, which aren't really "the daemon.")
 
 A Discord outage, timeout, or rate-limit is logged and dropped — it never blocks, delays, or fails

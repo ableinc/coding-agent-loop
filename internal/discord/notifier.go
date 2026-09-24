@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ableinc/coding-agent-loop/internal/claude"
+	"github.com/ableinc/coding-agent-loop/internal/models"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 	"github.com/ableinc/coding-agent-loop/internal/verify"
 )
@@ -498,6 +499,15 @@ type DaemonInfo struct {
 	RetryBackoff       time.Duration
 	RetryBackoffMax    time.Duration
 	DryRun             bool
+
+	// Models is every model models.json defines; PlanLadder and
+	// ImplementLadder are the priority-ordered models each role will use.
+	// ModelsSource names the file they were loaded from, since a models.json
+	// next to the binary silently overrides the embedded one.
+	Models          []models.Model
+	PlanLadder      []models.Model
+	ImplementLadder []models.Model
+	ModelsSource    string
 }
 
 // DaemonStarted reports that the daemon process started, and how it is set up.
@@ -514,7 +524,48 @@ func (n *Notifier) DaemonStarted(info DaemonInfo) {
 	if info.DryRun {
 		fields = append(fields, embedField{Name: "Dry run", Value: "nothing will be pushed", Inline: true})
 	}
+	if len(info.Models) > 0 {
+		fields = append(fields,
+			embedField{Name: "Models defined", Value: modelList(info.Models, info.ModelsSource), Inline: false},
+			embedField{Name: "Plan models", Value: ladderList(info.PlanLadder, models.RolePlan), Inline: false},
+			embedField{Name: "Implement models", Value: ladderList(info.ImplementLadder, models.RoleImplement), Inline: false},
+		)
+	}
 	n.post(embed{Title: "coding-agent-loop started", Color: colorBlurple, Fields: fields})
+}
+
+// modelList renders every model models.json defines, with the roles it serves
+// and its priority, headed by the file it came from.
+func modelList(ms []models.Model, source string) string {
+	var b strings.Builder
+	if source != "" {
+		fmt.Fprintf(&b, "from `%s`\n", source)
+	}
+	for _, m := range ms {
+		roles := "all roles"
+		if len(m.Roles) > 0 {
+			roles = strings.Join(m.Roles, ", ")
+		}
+		fmt.Fprintf(&b, "`%s` · priority %d · %s\n", m.ID, m.Priority, roles)
+	}
+	return truncate(strings.TrimSpace(b.String()), 1024)
+}
+
+// ladderList renders one role's ladder in the order it is tried: the first
+// line is --model, the rest are its fallbacks.
+func ladderList(ladder []models.Model, role string) string {
+	if len(ladder) == 0 {
+		return "(none)"
+	}
+	var b strings.Builder
+	for i, m := range ladder {
+		fmt.Fprintf(&b, "%d. `%s` · priority %d", i+1, m.ID, m.Priority)
+		if e := m.EffortFor(role); e != "" {
+			fmt.Fprintf(&b, " · effort %s", e)
+		}
+		b.WriteString("\n")
+	}
+	return truncate(strings.TrimSpace(b.String()), 1024)
 }
 
 // DaemonStopped reports that the daemon process stopped, with reason such as

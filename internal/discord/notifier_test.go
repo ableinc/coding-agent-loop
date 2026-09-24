@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ableinc/coding-agent-loop/internal/claude"
+	"github.com/ableinc/coding-agent-loop/internal/models"
 	"github.com/ableinc/coding-agent-loop/internal/store"
 	"github.com/ableinc/coding-agent-loop/internal/verify"
 )
@@ -314,6 +315,9 @@ func TestLabelUpdateFailedNamesTheLabels(t *testing.T) {
 }
 
 func TestDaemonStartedDescribesTheConfiguration(t *testing.T) {
+	opus := models.Model{ID: "claude-opus-5-5", Roles: []string{"plan", "implement"}, Priority: 1,
+		Effort: map[string]string{"plan": "high", "implement": "medium"}}
+	sonnet := models.Model{ID: "claude-sonnet-5", Priority: 2}
 	url, bodies := stubWebhook(t)
 	n := New(true, url, nil)
 
@@ -321,6 +325,10 @@ func TestDaemonStartedDescribesTheConfiguration(t *testing.T) {
 		Worker: "host-1", Label: "agent-ready", Owners: []string{"ableinc"},
 		PollInterval: 5 * time.Minute, MaxConcurrentRepos: 3,
 		RetryBackoff: 15 * time.Minute, RetryBackoffMax: 24 * time.Hour,
+		Models:          []models.Model{opus, sonnet},
+		PlanLadder:      []models.Model{opus},
+		ImplementLadder: []models.Model{opus, sonnet},
+		ModelsSource:    "/opt/coding-agent-loop/models.json",
 	})
 	n.Close(2 * time.Second)
 
@@ -331,6 +339,12 @@ func TestDaemonStartedDescribesTheConfiguration(t *testing.T) {
 		"Owners":         "ableinc",
 		"Poll interval":  "5m0s",
 		"Retry back-off": "15m0s → 24h0m0s",
+		"Models defined": "from `/opt/coding-agent-loop/models.json`\n" +
+			"`claude-opus-5-5` · priority 1 · plan, implement\n" +
+			"`claude-sonnet-5` · priority 2 · all roles",
+		"Plan models": "1. `claude-opus-5-5` · priority 1 · effort high",
+		"Implement models": "1. `claude-opus-5-5` · priority 1 · effort medium\n" +
+			"2. `claude-sonnet-5` · priority 2",
 	} {
 		if got, ok := field(e, name); !ok || got != want {
 			t.Errorf("field %q = %q (present=%v), want %q", name, got, ok, want)
