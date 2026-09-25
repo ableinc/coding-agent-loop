@@ -230,7 +230,7 @@ echo '`+successResult+`'
 	}
 }
 
-func TestRunPassesToolsAndMaxTurns(t *testing.T) {
+func TestRunPassesMaxTurns(t *testing.T) {
 	bin := stubCLI(t, `cat > /dev/null
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGS_FILE"; done
 echo '`+successResult+`'
@@ -238,8 +238,8 @@ echo '`+successResult+`'
 	argsFile := filepath.Join(t.TempDir(), "args.txt")
 	if _, err := (&Runner{}).Run(context.Background(), Options{
 		Binary: bin, LogPath: filepath.Join(t.TempDir(), "run.jsonl"),
-		Env:   []string{"ARGS_FILE=" + argsFile},
-		Tools: []string{"Read", "Grep", "Glob"}, MaxTurns: 40,
+		Env:      []string{"ARGS_FILE=" + argsFile},
+		MaxTurns: 40,
 	}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -247,13 +247,13 @@ echo '`+successResult+`'
 	if err != nil {
 		t.Fatalf("stub did not record args: %v", err)
 	}
-	if args := string(got); !strings.Contains(args, "--tools\nRead,Grep,Glob\n") || !strings.Contains(args, "--max-turns\n40\n") {
-		t.Fatalf("want --tools Read,Grep,Glob and --max-turns 40, got: %s", args)
+	if args := string(got); !strings.Contains(args, "--max-turns\n40\n") {
+		t.Fatalf("want --max-turns 40, got: %s", args)
 	}
 }
 
-// Zero values leave the CLI's defaults alone: all tools, no turn cap.
-func TestRunOmitsToolsAndMaxTurnsWhenUnset(t *testing.T) {
+// Runs never restrict the tool set, and an unset MaxTurns leaves them uncapped.
+func TestRunNeverPassesToolsAndOmitsUnsetMaxTurns(t *testing.T) {
 	bin := stubCLI(t, `cat > /dev/null
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGS_FILE"; done
 echo '`+successResult+`'
@@ -270,7 +270,7 @@ echo '`+successResult+`'
 		t.Fatalf("stub did not record args: %v", err)
 	}
 	if args := string(got); strings.Contains(args, "--tools") || strings.Contains(args, "--max-turns") {
-		t.Fatalf("unset Tools/MaxTurns must not reach the CLI, got: %s", args)
+		t.Fatalf("--tools and an unset --max-turns must not reach the CLI, got: %s", args)
 	}
 }
 

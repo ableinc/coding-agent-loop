@@ -146,8 +146,9 @@ type ClaudeConfig struct {
 	Binary         string   `json:"binary"`
 	PermissionMode string   `json:"permission_mode"`
 	ExtraArgs      []string `json:"extra_args"`
-	// PlanPermissionMode governs the read-only planning run, distinct from the
-	// implement run's PermissionMode. Not "plan": the CLI's plan mode fans out
+	// PlanPermissionMode governs the planning run, distinct from the implement
+	// run's PermissionMode. Empty passes no --permission-mode, leaving the
+	// CLI's own default. Not "plan": the CLI's plan mode fans out
 	// into Explore/Plan subagents that each re-read the repository, which
 	// multiplied the cost of a single plan several times over.
 	PlanPermissionMode string `json:"plan_permission_mode"`
@@ -254,14 +255,13 @@ func Default() Config {
 			RetryBackoffMax:    Duration(24 * time.Hour),
 		},
 		Claude: ClaudeConfig{
-			Binary:             "claude",
-			PermissionMode:     "bypassPermissions",
-			PlanPermissionMode: "dontAsk",
-			PlanMaxTurns:       40,
-			UsagePollInterval:  Duration(15 * time.Minute),
-			UsageBackoff:       Duration(15 * time.Minute),
-			CredentialsPath:    "~/.claude/.credentials.json",
-			UsageCachePath:     "~/.agent-loop/usage-cache.json",
+			Binary:            "claude",
+			PermissionMode:    "bypassPermissions",
+			PlanMaxTurns:      40,
+			UsagePollInterval: Duration(15 * time.Minute),
+			UsageBackoff:      Duration(15 * time.Minute),
+			CredentialsPath:   "~/.claude/.credentials.json",
+			UsageCachePath:    "~/.agent-loop/usage-cache.json",
 		},
 		Verify:  VerifyConfig{AutoDetect: true, Commands: map[string]string{}},
 		Server:  ServerConfig{Addr: "127.0.0.1:8787", UI: true},

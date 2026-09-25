@@ -167,9 +167,6 @@ type Options struct {
 	Effort string
 	// PermissionMode maps to `--permission-mode`.
 	PermissionMode string
-	// Tools maps to `--tools`, restricting the run to these built-in tools.
-	// Nil leaves the CLI's full default set.
-	Tools []string
 	// MaxTurns maps to `--max-turns`. 0 leaves the run uncapped.
 	MaxTurns int
 	// WorkDir is the process cwd, i.e. the worktree.
@@ -252,9 +249,6 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	if opts.PermissionMode != "" {
 		args = append(args, "--permission-mode", opts.PermissionMode)
-	}
-	if opts.Tools != nil {
-		args = append(args, "--tools", strings.Join(opts.Tools, ","))
 	}
 	if opts.MaxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(opts.MaxTurns))
