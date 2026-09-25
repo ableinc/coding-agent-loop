@@ -152,6 +152,46 @@ func TestPauseAndResume(t *testing.T) {
 	}
 }
 
+func TestClearGate(t *testing.T) {
+	s, st, _ := testServer(t)
+	ctx := t.Context()
+
+	if err := st.SetGate(ctx, store.GateUsageLimit, time.Now().Add(time.Hour), "limit reached"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetGate(ctx, store.GateModelPrefix+"claude-opus-5", time.Now().Add(time.Hour), "cooldown"); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := do(t, s, http.MethodPost, "/gates/clear", strings.NewReader(`{"kind":"usage_limit"}`))
+	if code != http.StatusOK || body["cleared"] != true {
+		t.Fatalf("clear usage gate = %d %v", code, body)
+	}
+	_, status := do(t, s, http.MethodGet, "/status", nil)
+	if status["claiming_work"] != true {
+		t.Fatalf("clearing the usage gate should restore claiming: %v", status)
+	}
+
+	// Model cooldown kinds carry a colon; they must round-trip through the body.
+	if code, _ := do(t, s, http.MethodPost, "/gates/clear", strings.NewReader(`{"kind":"model:claude-opus-5"}`)); code != http.StatusOK {
+		t.Fatalf("clear model cooldown = %d", code)
+	}
+	gates, err := st.ActiveGates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gates) != 0 {
+		t.Fatalf("every gate should be cleared: %v", gates)
+	}
+
+	if code, _ := do(t, s, http.MethodPost, "/gates/clear", strings.NewReader(`{"kind":"usage_limit"}`)); code != http.StatusNotFound {
+		t.Fatalf("clearing an inactive gate = %d, want 404", code)
+	}
+	if code, _ := do(t, s, http.MethodPost, "/gates/clear", strings.NewReader(`{}`)); code != http.StatusBadRequest {
+		t.Fatalf("clearing without a kind = %d, want 400", code)
+	}
+}
+
 func TestRunsEndpoints(t *testing.T) {
 	s, st, _ := testServer(t)
 	ctx := t.Context()

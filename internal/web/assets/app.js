@@ -494,6 +494,7 @@ async function renderDashboard(status) {
             el("div", { class: "title" }, [gateBadge(g.blocking), document.createTextNode(" " + g.kind)]),
             el("div", { class: "muted", text: g.reason || "" }),
             el("div", { class: "muted", text: `until ${fmtTime(g.blocked_until)} (${fmtRelative(g.blocked_until)})` }),
+            gateClearButton(g),
           ])
         )
       )
@@ -515,6 +516,21 @@ async function renderDashboard(status) {
   } else {
     container.appendChild(inFlightTable(inFlight));
   }
+}
+
+function gateClearButton(g) {
+  const btn = el("button", { class: "btn btn-danger", type: "button", text: "Clear" });
+  btn.addEventListener("click", async () => {
+    if (!window.confirm(`Clear the "${g.kind}" gate now?`)) return;
+    btn.disabled = true;
+    try {
+      await api.post("/gates/clear", { kind: g.kind });
+      await refreshStatus();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return el("div", { class: "row-actions" }, [btn]);
 }
 
 function statTile(label, value) {

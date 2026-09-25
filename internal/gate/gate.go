@@ -282,6 +282,18 @@ func (g *Gate) Resume(ctx context.Context) error {
 	return g.store.ClearGate(ctx, store.GatePause)
 }
 
+// Clear reopens any one gate by kind — the operator override behind
+// POST /gates/clear. Clearing the usage gate also resets the backoff ladder,
+// the same as a successful run would.
+func (g *Gate) Clear(ctx context.Context, kind string) error {
+	if kind == store.GateUsageLimit {
+		g.mu.Lock()
+		g.backoffStep = 0
+		g.mu.Unlock()
+	}
+	return g.store.ClearGate(ctx, kind)
+}
+
 // Snapshot returns the last advisory usage reading.
 func (g *Gate) Snapshot() Snapshot {
 	g.mu.Lock()

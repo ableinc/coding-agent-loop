@@ -688,6 +688,7 @@ Loopback-only by default. It can pause and cancel work, so do not expose it.
 | `GET /config`                | current configuration, with the Discord webhook URL and web console password redacted |
 | `GET /models`                | the model registry plus the plan/implement ladders and which models are cooled down |
 | `POST /pause` `POST /resume` | stop / resume claiming new work                                     |
+| `POST /gates/clear`          | reopen one active gate now; body `{"kind": "usage_limit"}` (any kind from `/status`, including `model:<id>` cooldowns) |
 | `POST /runs/{id}/cancel`     | cancel an in-flight run                                             |
 | `POST /poll`                 | run a discovery pass now, instead of waiting for `github.poll_interval` |
 | `GET /`                      | redirects to `/ui/` when `server.ui` is enabled                     |
@@ -714,7 +715,7 @@ A small browser console for the control API above, compiled into the binary via 
 `internal/web`) — no separate install, no network access at runtime, no build tooling required.
 Open `http://127.0.0.1:8787/` (redirects to `/ui/`) once the daemon is running.
 
-It has five views: a **dashboard** (gate state, active claims, in-flight runs with a Cancel button,
+It has five views: a **dashboard** (gate state with a Clear button per gate, active claims, in-flight runs with a Cancel button,
 pause/resume, and a "Run discovery now" button), **runs** (filterable history with cost, tokens,
 verification outcome, and PR links), a **run detail** page (full metrics, event timeline, and a
 lazily-loaded transcript viewer — the transcript is not fetched until you ask for it, since it can

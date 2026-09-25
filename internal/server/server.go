@@ -106,6 +106,7 @@ func (s *Server) routes() {
 	s.app.Get("/sessions", s.listSessions)
 	s.app.Post("/pause", s.pause)
 	s.app.Post("/resume", s.resume)
+	s.app.Post("/gates/clear", s.clearGate)
 	s.app.Post("/runs/:id/cancel", s.cancelRun)
 	s.app.Post("/runs/:id/delete", s.deleteRun)
 	s.app.Get("/config", s.getConfig)
@@ -406,6 +407,44 @@ func (s *Server) resume(c fiber.Ctx) error {
 	s.log.Info("resumed by operator")
 	s.discord.Resumed()
 	return c.JSON(fiber.Map{"paused": false})
+}
+
+// clearGate reopens one active gate by kind. The kind travels in the body, not
+// the path, because model cooldown kinds ("model:<id>") carry a colon.
+func (s *Server) clearGate(c fiber.Ctx) error {
+	var body struct {
+		Kind string `json:"kind"`
+	}
+	if err := c.Bind().Body(&body); err != nil || body.Kind == "" {
+		return s.fail(c, http.StatusBadRequest, errors.New("kind is required"))
+	}
+
+	gates, err := s.store.ActiveGates(c.Context())
+	if err != nil {
+		return s.fail(c, http.StatusInternalServerError, err)
+	}
+	found := false
+	for _, g := range gates {
+		if g.Kind == body.Kind {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return s.fail(c, http.StatusNotFound, errors.New("no such active gate"))
+	}
+
+	if err := s.gate.Clear(c.Context(), body.Kind); err != nil {
+		return s.fail(c, http.StatusInternalServerError, err)
+	}
+	s.log.Info("gate cleared by operator", "kind", body.Kind)
+	switch body.Kind {
+	case store.GatePause:
+		s.discord.Resumed()
+	case store.GateUsageLimit:
+		s.discord.GateCleared()
+	}
+	return c.JSON(fiber.Map{"cleared": true, "kind": body.Kind})
 }
 
 func (s *Server) cancelRun(c fiber.Ctx) error {
