@@ -112,13 +112,17 @@ func (s *Server) authEnabled() bool {
 }
 
 // bearerToken extracts the credential from "Authorization: Bearer <value>".
+// The result is cloned: c.Get aliases a buffer fiber reuses across requests,
+// and sessionStore.valid writes the token back into its map (which replaces
+// the stored key), so an uncloned token would later mutate under the map and
+// the session would stop matching.
 func bearerToken(c fiber.Ctx) string {
 	auth := c.Get(fiber.HeaderAuthorization)
 	const prefix = "Bearer "
 	if !strings.HasPrefix(auth, prefix) {
 		return ""
 	}
-	return strings.TrimPrefix(auth, prefix)
+	return strings.Clone(strings.TrimPrefix(auth, prefix))
 }
 
 // authenticated reports whether token is either a live session or the
