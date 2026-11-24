@@ -136,13 +136,19 @@ print-service: build
 migrate-config: build
 	$(BINARY) --config $(CONFIG) --migrate-config
 
+# Go's race detector needs a 48-bit virtual address space on arm64, which stock Raspberry Pi
+# kernels (39- or 47-bit) don't provide. $(RACE) is -race where the detector can run and
+# empty elsewhere, so the tests still run there, just without it. Checked once, on first use.
+RACE = $(eval RACE := $(shell d=$$(mktemp -d); printf 'package main\nfunc main() {}\n' > $$d/m.go; \
+	GOFLAGS= GOWORK=off go run -race $$d/m.go >/dev/null 2>&1 && echo -race; rm -rf $$d))$(if $(RACE),,$(info Race detector unavailable on this machine; running tests without -race.))$(RACE)
+
 ## test: run the full test suite with the race detector
 test: embed-ready
-	go test -race $(PKG)
+	go test $(RACE) $(PKG)
 
 ## coverage: run tests and print per-function coverage
 coverage: embed-ready
-	go test -race -coverprofile=coverage.out $(PKG)
+	go test $(RACE) -coverprofile=coverage.out $(PKG)
 	go tool cover -func=coverage.out
 
 vet: embed-ready
